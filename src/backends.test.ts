@@ -1,0 +1,109 @@
+import { describe, it, expect, test } from 'bun:test';
+import { buildSpec, buildRunArgv, buildResumeArgv, getResumeToken, type Backend } from './backends.ts';
+
+describe('buildSpec', () => {
+  it('returns prompt with CONTRACT for claude', () => {
+    const spec = buildSpec('claude', 'test prompt');
+    expect(spec).toContain('test prompt');
+    expect(spec).toContain('DONE');
+  });
+
+  it('returns prompt with standards and CONTRACT for non-claude', () => {
+    const spec = buildSpec('cmd', 'test prompt');
+    expect(spec).toContain('test prompt');
+    expect(spec).toContain('BINDING STANDARDS');
+    expect(spec).toContain('DONE');
+  });
+});
+
+describe('buildRunArgv', () => {
+  it('builds claude argv with sonnet pinned', () => {
+    const argv = buildRunArgv('claude', 'spec', '/repo', 'sid123');
+    expect(argv).toEqual([
+      'claude', '-p', 'spec', '--session-id', 'sid123', '--model', 'sonnet',
+      '--dangerously-skip-permissions', '--add-dir', '/repo'
+    ]);
+  });
+
+  it('builds pi argv with provider and optional model', () => {
+    const argv = buildRunArgv('pi', 'spec', '/repo', 'sid123', 'gpt-4', 'openai');
+    expect(argv).toContain('--model');
+    expect(argv).toContain('gpt-4');
+    expect(argv).toContain('--provider');
+    expect(argv).toContain('openai');
+  });
+
+  it('builds cmd argv without model if not provided', () => {
+    const argv = buildRunArgv('cmd', 'spec', '/repo', 'sid123');
+    expect(argv).toEqual(['cmd', '-p', 'spec', '--yolo', '--skip-onboarding', '--add-dir', '/repo']);
+  });
+
+  it('builds opencode argv with optional model', () => {
+    const argv = buildRunArgv('opencode', 'spec', '/repo', 'sid123', 'gpt-4');
+    expect(argv).toContain('-m');
+    expect(argv).toContain('gpt-4');
+  });
+
+  it('builds pool argv', () => {
+    const argv = buildRunArgv('pool', 'spec', '/repo', 'sid123');
+    expect(argv).toEqual(['pool', 'exec', '-p', 'spec', '-d', '/repo', '--unsafe-auto-allow']);
+  });
+});
+
+describe('buildResumeArgv', () => {
+  it('builds claude resume argv with sonnet pinned', () => {
+    const argv = buildResumeArgv('claude', 'spec', '/repo', 'token123');
+    expect(argv).toEqual([
+      'claude', '-p', 'spec', '--resume', 'token123', '--model', 'sonnet',
+      '--dangerously-skip-permissions', '--add-dir', '/repo'
+    ]);
+  });
+
+  it('builds pi resume argv with token as session-id', () => {
+    const argv = buildResumeArgv('pi', 'spec', '/repo', 'token123');
+    expect(argv).toEqual(['pi', '-p', 'spec', '--session-id', 'token123', '--provider', 'google']);
+  });
+
+  it('builds opencode resume argv with token', () => {
+    const argv = buildResumeArgv('opencode', 'spec', '/repo', 'token123');
+    expect(argv).toEqual(['opencode', 'run', 'spec', '-s', 'token123', '--dir', '/repo']);
+  });
+});
+
+describe('getResumeToken', () => {
+  it('returns sid for claude', () => {
+    const token = getResumeToken('claude', 'my-session-id', '/path/to/log');
+    expect(token).toBe('my-session-id');
+  });
+
+  it('returns sid for pi', () => {
+    const token = getResumeToken('pi', 'my-session-id', '/path/to/log');
+    expect(token).toBe('my-session-id');
+  });
+
+  it('returns "last" for pool', () => {
+    const token = getResumeToken('pool', 'sid', '/path/to/log');
+    expect(token).toBe('last');
+  });
+
+  it('returns last ses_ match for opencode', () => {
+    const logPath = '/tmp/test.log';
+    require('fs').writeFileSync(logPath, 'session ses_abc123 started\nmore output\nses_xyz789 done');
+    const token = getResumeToken('opencode', 'sid', logPath);
+    expect(token).toBe('ses_xyz789');
+    require('fs').unlinkSync(logPath);
+  });
+
+  it('returns empty string for opencode when no match', () => {
+    const logPath = '/tmp/test.log';
+    require('fs').writeFileSync(logPath, 'no session token here');
+    const token = getResumeToken('opencode', 'sid', logPath);
+    expect(token).toBe('');
+    require('fs').unlinkSync(logPath);
+  });
+
+  it('returns empty string for cmd', () => {
+    const token = getResumeToken('cmd', 'sid', '/path/to/log');
+    expect(token).toBe('');
+  });
+});
