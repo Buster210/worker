@@ -1,5 +1,6 @@
 import { describe, it, expect, test } from 'bun:test';
 import { buildSpec, buildRunArgv, buildResumeArgv, getResumeToken, type Backend } from './backends.ts';
+import { handleDir } from './state.ts';
 
 describe('buildSpec', () => {
   it('returns prompt with CONTRACT for claude', () => {
@@ -25,17 +26,16 @@ describe('buildRunArgv', () => {
     ]);
   });
 
-  it('builds pi argv with provider and optional model', () => {
-    const argv = buildRunArgv('pi', 'spec', '/repo', 'sid123', 'gpt-4', 'openai');
-    expect(argv).toContain('--model');
-    expect(argv).toContain('gpt-4');
-    expect(argv).toContain('--provider');
-    expect(argv).toContain('openai');
+  it('builds omp argv with a per-job session dir and no model/provider', () => {
+    const argv = buildRunArgv('omp', 'spec', '/repo', 'sid123');
+    expect(argv).toEqual(['omp', '-p', 'spec', '--session-dir', handleDir('sid123', '/repo'), '--approval-mode=yolo']);
+    expect(argv).not.toContain('--model');
+    expect(argv).not.toContain('--provider');
   });
 
   it('builds cmd argv without model if not provided', () => {
     const argv = buildRunArgv('cmd', 'spec', '/repo', 'sid123');
-    expect(argv).toEqual(['cmd', '-p', 'spec', '--yolo', '--skip-onboarding', '--add-dir', '/repo']);
+    expect(argv).toEqual(['cmd', '-p', 'spec', '--yolo', '-t', '--skip-onboarding', '--add-dir', '/repo']);
   });
 
   it('builds opencode argv with optional model', () => {
@@ -59,9 +59,9 @@ describe('buildResumeArgv', () => {
     ]);
   });
 
-  it('builds pi resume argv with token as session-id', () => {
-    const argv = buildResumeArgv('pi', 'spec', '/repo', 'token123');
-    expect(argv).toEqual(['pi', '-p', 'spec', '--session-id', 'token123', '--provider', 'google']);
+  it('builds omp resume argv with the same session dir plus --continue', () => {
+    const argv = buildResumeArgv('omp', 'spec', '/repo', 'token123');
+    expect(argv).toEqual(['omp', '-p', 'spec', '--session-dir', handleDir('token123', '/repo'), '--continue', '--approval-mode=yolo']);
   });
 
   it('builds opencode resume argv with token', () => {
@@ -76,8 +76,8 @@ describe('getResumeToken', () => {
     expect(token).toBe('my-session-id');
   });
 
-  it('returns sid for pi', () => {
-    const token = getResumeToken('pi', 'my-session-id', '/path/to/log');
+  it('returns sid for omp', () => {
+    const token = getResumeToken('omp', 'my-session-id', '/path/to/log');
     expect(token).toBe('my-session-id');
   });
 

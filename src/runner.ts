@@ -1,5 +1,5 @@
 import { spawn, spawnSync, execSync } from 'child_process';
-import { createWriteStream, statSync, mkdirSync, writeFileSync, readFileSync, unlinkSync } from 'fs';
+import { createWriteStream, statSync, mkdirSync, writeFileSync, readFileSync, unlinkSync, realpathSync } from 'fs';
 import { updateJob, getJob, getAllRunningJobs, removeLock, logPath as workerLogPath, WORKERS_DIR, finalizeJob } from './state.ts';
 import type { Backend } from './backends.ts';
 import type { Job } from './state.ts';
@@ -41,9 +41,10 @@ export async function waitJob(handle: string): Promise<RunResult> {
 
 // On startup: mark any jobs still showing 'running' whose PIDs are dead as failed.
 // Prevents stale state after a server restart mid-job.
-const POLL_MS = 5_000;
 export const DEFAULT_TIMEOUT_MS = 600_000;
-const STUCK_THRESHOLD_MS = 30_000; // 30s for stopped job evaluation
+const POLL_INTERVAL_MS = 5_000;
+const LOG_FRESHNESS_THRESHOLD_MS = 30_000;
+const STALL_DETECTION_TIMEOUT_MS = 120_000;
 
 // Augmented PATH so backends are findable (MCP server env is stripped)
 const HOME = process.env.HOME ?? '';
@@ -101,7 +102,6 @@ function resolveStatus(backend: string, rc: number, logPath: string, timedOut: b
   if (timedOut) return 'timeout';
   try {
     const lines = readFileSync(logPath, 'utf8').trim().split('\n').filter(Boolean);
-    // Scan last ~10 non-empty lines upward from the end for sentinel markers
     const recent = lines.slice(-10);
     for (let i = recent.length - 1; i >= 0; i--) {
       const line = recent[i];
@@ -124,11 +124,9 @@ export function sweepStaleJobs() {
     // Handle orphaned stopped jobs: frozen pid reparented to init can't be reattached
     if (job.status === 'stopped') {
       if (!isProcessAlive(job.worker_pid, job.started)) {
-        // Process is dead, just mark as failed
         finalizeJob(job.handle, 'failed:server-restart');
         continue;
       }
-      // Process is still alive (frozen) - keep it as stopped
       continue;
     }
     
@@ -145,9 +143,6 @@ function killGroup(pid: number, sig: 'SIGTERM' | 'SIGKILL' | 'SIGSTOP' = 'SIGTER
   try { process.kill(-pid, sig); } catch {}
 }
 
-/**
- * Get the last mtime of the log file (within skew)
- */
 function getLogMtime(logPath: string): number {
   try {
     return statSync(logPath).mtimeMs;
@@ -164,7 +159,7 @@ function getLogMtime(logPath: string): number {
  * Caller must have already SIGSTOP'd the group.
  */
 function evalAfterStop(handle: string, pid: number, logPath: string): boolean {
-  const isMakingProgress = (Date.now() - getLogMtime(logPath)) < STUCK_THRESHOLD_MS;
+  const isMakingProgress = (Date.now() - getLogMtime(logPath)) < LOG_FRESHNESS_THRESHOLD_MS;
   let lastLine = '';
   let isFailed = false;
   try {
@@ -189,14 +184,10 @@ export function suspendAndEval(handle: string, pid: number, logPath: string): bo
   return evalAfterStop(handle, pid, logPath);
 }
 
-/**
- * Get the process start time in ISO format (macOS)
- */
 function getProcessStartTime(pid: number): string | null {
   try {
     const result = spawnSync('ps', ['-o', 'lstart=', '-p', String(pid)], { encoding: 'utf8' });
     if (result.status !== 0) return null;
-    // Parse the output and convert to ISO-like format
     const lstart = result.stdout.trim();
     // ps lstart format: "Tue Jun 10 21:00:00 2026"
     const date = new Date(lstart);
@@ -206,26 +197,33 @@ function getProcessStartTime(pid: number): string | null {
   }
 }
 
-/**
- * Check if a process is still alive and matches the expected start time
- * This guards against PID reuse
- */
 export function isProcessAlive(pid: number, started?: string): boolean {
   if (!pid) return false;
   try { process.kill(pid, 0); } catch { return false; }
   
-  // If no started time provided, just return true (alive)
   if (!started) return true;
   
-  // Check process start time matches job.started with small skew (within 1 minute)
   const procStart = getProcessStartTime(pid);
-  if (!procStart) return true; // Can't verify, assume alive
+  if (!procStart) return true;
   
   const jobStart = new Date(started);
   const procStartDate = new Date(procStart);
   const skewMs = Math.abs(procStartDate.getTime() - jobStart.getTime());
   
-  return skewMs < 60_000; // Within 1 minute skew
+  return skewMs < 60_000;
+}
+/**
+ * Composite activity signature: log size + git diff --stat + git status --porcelain.
+ * Changes in any component mean the worker is still producing output.
+ */
+function activitySig(repo: string, logPath: string): string {
+  let logSize = 0;
+  try { logSize = statSync(logPath).size; } catch {}
+  let gitDiff = '';
+  try { gitDiff = spawnSync('git', ['-C', repo, 'diff', '--stat'], { encoding: 'utf8', timeout: 2000 }).stdout ?? ''; } catch {}
+  let gitStatus = '';
+  try { gitStatus = spawnSync('git', ['-C', repo, 'status', '--porcelain'], { encoding: 'utf8', timeout: 2000 }).stdout ?? ''; } catch {}
+  return logSize + gitDiff + gitStatus;
 }
 
 export function launchAndWait(
@@ -264,18 +262,17 @@ export function launchAndWait(
       logStream.end();
       resolve({ rc: code, timedOut: timed, stopped: stoppedJob });
     };
+    let lastSig = '';
+    let lastSigChange = Date.now();
 
     const watchdog = setInterval(() => {
       if (settled) return;
       const now = Date.now();
 
-      // Hard cap
       if (now - startMs >= timeoutMs) {
         timedOut = true;
-        // On timeout, SIGSTOP the process group (freeze, don't kill)
         killGroup(proc.pid!, 'SIGSTOP');
 
-        // Give the SIGSTOP a moment to settle, then decide stop-vs-kill.
         setTimeout(() => {
           if (settled) return;
           stopped = evalAfterStop(handle, proc.pid!, logPath);
@@ -283,7 +280,18 @@ export function launchAndWait(
         }, 100);
         return;
       }
-    }, POLL_MS);
+      const sig = activitySig(repo, logPath);
+      if (sig !== lastSig) { lastSig = sig; lastSigChange = Date.now(); }
+      else if (Date.now() - lastSigChange >= STALL_DETECTION_TIMEOUT_MS) {
+        killGroup(proc.pid!, 'SIGSTOP');
+        setTimeout(() => {
+          if (settled) return;
+          stopped = evalAfterStop(handle, proc.pid!, logPath);
+          finish(124, true, stopped);
+        }, 100);
+        return;
+      }
+    }, POLL_INTERVAL_MS);
 
     proc.on('exit', (code, signal) => {
       rc = code ?? (signal ? 1 : 0);
@@ -329,7 +337,6 @@ export async function runClaudeTmux(
   sid: string,
   timeoutMs: number = DEFAULT_TIMEOUT_MS,
 ): Promise<RunResult> {
-  // tmux must be available
   try { execSync('which tmux', { stdio: 'ignore' }); }
   catch { throw new Error('claude_tmux backend requires tmux'); }
 
@@ -342,6 +349,29 @@ export async function runClaudeTmux(
   const launchf = `${wdir}/${sid}.launch.sh`;
   const logPath = workerLogPath(handle);
 
+  // Interactive claude (no -p) does NOT auto-skip the workspace trust dialog, so a fresh/untrusted
+  // repo would block the TUI on "Do you trust the files in this folder?". Pre-seed the trust state
+  // in ~/.claude.json so the session starts unattended. Best-effort: never fail the run on this.
+  // Claude keys trust off the *canonical* cwd (e.g. /var → /private/var on macOS), so seed the
+  // realpath; also seed the raw path so either resolution hits a trusted entry.
+  try {
+    const cfgPath = `${process.env.HOME}/.claude.json`;
+    const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'));
+    cfg.projects = cfg.projects ?? {};
+    let real = repo;
+    try { real = realpathSync(repo); } catch {}
+    for (const key of new Set([repo, real])) {
+      const proj = cfg.projects[key] ?? {};
+      cfg.projects[key] = {
+        ...proj,
+        hasTrustDialogAccepted: true,
+        hasCompletedProjectOnboarding: true,
+        projectOnboardingSeenCount: proj.projectOnboardingSeenCount ?? 1,
+      };
+    }
+    writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
+  } catch {}
+
   // Sentinel: Stop hook writes to donef
   writeFileSync(setf, JSON.stringify({
     hooks: { Stop: [{ matcher: '', hooks: [{ type: 'command', command: `printf 'stop\\n' >> '${donef}'` }] }] }
@@ -350,7 +380,6 @@ export async function runClaudeTmux(
   writeFileSync(donef, '');  // touch
   writeFileSync(launchf, `#!/usr/bin/env bash\nexec claude --settings "${setf}" --dangerously-skip-permissions --model sonnet "$(cat "${specf}")"`, { mode: 0o755 });
 
-  // Kill any existing session with same sid
   try { execSync(`tmux kill-session -t ${sid} 2>/dev/null`, { stdio: 'ignore' }); } catch {}
 
   const spawn = spawnSync('tmux', ['new-session', '-d', '-s', sid, '-x', '220', '-y', '50', '-c', repo, `bash "${launchf}"`], {
@@ -368,24 +397,20 @@ export async function runClaudeTmux(
   let stopped = false;
 
   while (Date.now() < deadline) {
-    // Check sentinel
     try {
       const content = readFileSync(donef, 'utf8');
       if (content.trim().length > 0) { stopped = true; break; }
     } catch {}
-    // Check if session still alive
     try { execSync(`tmux has-session -t ${sid} 2>/dev/null`, { stdio: 'ignore' }); }
     catch { stopped = true; break; }
     await Bun.sleep(1000);
   }
 
-  // Capture pane → log
   try {
     const pane = execSync(`tmux capture-pane -t ${sid} -p -S -200 2>/dev/null`, { encoding: 'utf8', env: workerEnv });
     writeFileSync(logPath, pane);
   } catch {}
 
-  // Kill session + clean up temp files
   try { execSync(`tmux kill-session -t ${sid} 2>/dev/null`, { stdio: 'ignore' }); } catch {}
   for (const f of [setf, specf, launchf, donef]) { try { unlinkSync(f); } catch {} }
 

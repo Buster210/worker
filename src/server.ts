@@ -23,7 +23,9 @@ function killJobHard(job: { handle: string; backend: string; worker_pid: number;
 
 function newHandle(backend: Backend): string {
   const id = randomUUID();
-  return (backend === 'claude' || backend === 'pi') ? id : `w-${id.slice(0, 8)}`;
+  // Only claude consumes a full --session-id; everything else (incl. omp, which keys
+  // resume off a per-job --session-dir) uses the short w- handle.
+  return backend === 'claude' ? id : `w-${id.slice(0, 8)}`;
 }
 
 function assertRepo(dir: string) {
@@ -36,9 +38,8 @@ function assertRepo(dir: string) {
 
 const server = new McpServer({ name: 'worker', version: '0.1.0' });
 
-// worker_ladder
 server.tool('worker_ladder',
-  'Run a coding task via the worker ladder (default). Auto-routes pool→pi→opencode→cmd→claude→claude_tmux. Use climb=true to escalate after a failed run.',
+  'Run a coding task via the worker ladder (default). Auto-routes omp→opencode→pool→cmd→claude→claude_tmux. Use climb=true to escalate after a failed run.',
   {
     sid: z.string().describe('Session ID ($CLAUDE_CODE_SESSION_ID)'),
     prompt: z.string().describe('Task spec'),
@@ -86,18 +87,17 @@ server.tool('worker_ladder',
   }
 );
 
-// worker_run
 server.tool('worker_run',
   'Run on a specific backend. Only when user explicitly names one.',
   {
-    backend: z.enum(['pool', 'pi', 'opencode', 'cmd', 'claude', 'claude_tmux']),
+    backend: z.enum(['pool', 'omp', 'opencode', 'cmd', 'claude', 'claude_tmux']),
     prompt: z.string(),
     model: z.string().optional(),
-    provider: z.string().optional().describe('Provider for pi backend (overrides PI_PROVIDER env)'),
     dir: z.string().describe('Repo directory (absolute path, required)'),
     timeout: z.number().optional(),
+    extraArgs: z.array(z.string()).optional().describe('Raw extra args forwarded to backend binary (-- passthrough)'),
   },
-  async ({ backend, prompt, model, provider, dir, timeout }) => {
+  async ({ backend, prompt, model, dir, timeout, extraArgs }) => {
     assertRepo(dir);
     const be = backend as Backend;
     const sid = randomUUID();
@@ -115,9 +115,9 @@ server.tool('worker_run',
       trackJob(handle, p);
       return { content: [{ type: 'text', text: JSON.stringify({ handle, status: 'running', lock_path: lockPath(handle, dir) }) }] };
     }
-    // For claude: model is pinned to sonnet, do not thread model parameter
-    const modelToUse = be === 'claude' ? undefined : model;
-    const argv = buildRunArgv(be, spec, dir, handle, modelToUse, provider);
+    // claude pins sonnet; omp ignores model entirely. Neither threads the model parameter.
+    const modelToUse = (be === 'claude' || be === 'omp') ? undefined : model;
+    const argv = buildRunArgv(be, spec, dir, handle, modelToUse, extraArgs);
     insertJob({ handle, backend: be, sid, repo: dir, model: modelToUse, task: prompt, log_path: lp });
     const initToken = be === 'opencode' ? '' : getResumeToken(be, handle, lp);
     const p = runWorker(argv, dir, handle, be, lp,
@@ -134,7 +134,6 @@ server.tool('worker_run',
   }
 );
 
-// worker_resume
 server.tool('worker_resume',
   'Resume a previous worker run.',
   {
@@ -142,8 +141,9 @@ server.tool('worker_resume',
     prompt: z.string(),
     dir: z.string().describe('Repo directory (absolute path, required)'),
     timeout: z.number().optional(),
+    extraArgs: z.array(z.string()).optional().describe('Raw extra args forwarded to backend binary (-- passthrough)'),
   },
-  async ({ handle, prompt, dir, timeout }) => {
+  async ({ handle, prompt, dir, timeout, extraArgs }) => {
     const job = getJob(handle);
     if (!job) throw new Error(`No job found for handle: ${handle}`);
     updateJob(handle, { kill_requested: false });
@@ -157,7 +157,7 @@ server.tool('worker_resume',
         const be = job.backend as Backend;
         const lp = workerLogPath(handle);
         const spec = buildSpec(be, prompt);
-        const argv = buildResumeArgv(be, spec, dir, job.resume_token);
+        const argv = buildResumeArgv(be, spec, dir, job.resume_token, undefined, extraArgs);
         const p = runWorker(argv, dir, handle, be, lp,
           job.resume_token, timeout ? timeout * 1000 : undefined);
         trackJob(handle, p);
@@ -212,7 +212,7 @@ server.tool('worker_resume',
     if (be === 'cmd') {
       spec = `A prior attempt already ran in this repo — inspect the working tree, determine what is already done, and complete only the remainder.\n\n` + spec;
     }
-    const argv = buildResumeArgv(be, spec, dir, job.resume_token);
+    const argv = buildResumeArgv(be, spec, dir, job.resume_token, undefined, extraArgs);
     const p = runWorker(argv, dir, handle, be, lp,
       job.resume_token, timeout ? timeout * 1000 : undefined);
     trackJob(handle, p);
@@ -220,7 +220,6 @@ server.tool('worker_resume',
   }
 );
 
-// worker_kill
 server.tool('worker_kill',
   'Kill a running worker by handle.',
   { handle: z.string() },
@@ -260,7 +259,6 @@ server.tool('worker_kill',
   }
 );
 
-// worker_status
 server.tool('worker_status',
   'Check status of a worker by handle.',
   { handle: z.string() },
@@ -276,12 +274,11 @@ server.tool('worker_status',
   }
 );
 
-// worker_doctor
 server.tool('worker_doctor',
   'Check which backends are available.',
   { backend: z.string().optional() },
   async ({ backend }) => {
-    const backends = backend ? [backend] : ['claude', 'pi', 'cmd', 'opencode', 'pool'];
+    const backends = backend ? [backend] : ['claude', 'omp', 'cmd', 'opencode', 'pool'];
     const lines = backends.map(be => {
       try {
         const ver = execSync(`${be} --version 2>/dev/null | head -1`, { encoding: 'utf8', env: workerEnv }).trim();
@@ -292,7 +289,6 @@ server.tool('worker_doctor',
   }
 );
 
-// worker_wait — block until a background job finishes, return final result
 server.tool('worker_wait',
   'Wait for a background worker job to complete and return its final result. Call after worker_ladder/worker_run.',
   {
@@ -313,7 +309,6 @@ server.tool('worker_wait',
   }
 );
 
-// worker_list
 server.tool('worker_list',
   'List recent worker jobs. Optionally filter by status.',
   {

@@ -11,7 +11,7 @@ export function ladderNext(sid: string, climb: boolean): { backend: Backend; tur
   if (lastIdx === -1) return { backend: LADDER[0], turn: turns + 1 };
 
   const nextIdx = climb ? lastIdx + 1 : lastIdx;
-  if (nextIdx >= LADDER.length) return null; // exhausted
+  if (nextIdx >= LADDER.length) return null;
 
   return { backend: LADDER[nextIdx], turn: turns + 1 };
 }
