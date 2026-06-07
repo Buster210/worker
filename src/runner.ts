@@ -50,6 +50,9 @@ const STALL_DETECTION_TIMEOUT_MS = 120_000;
 const HOME = process.env.HOME ?? '';
 export const workerEnv: NodeJS.ProcessEnv = {
   ...process.env,
+  // rc the backend shell sources for env + key-injecting wrappers (see backendShellArgv).
+  // Passed via env (not interpolated into the script) so its value can never be code-injected.
+  WORKER_RC: process.env.WORKER_RC ?? `${HOME}/.common`,
   PATH: [
     `${HOME}/.bun/bin`,
     `${HOME}/.local/bin`,
@@ -226,6 +229,21 @@ function activitySig(repo: string, logPath: string): string {
   return logSize + gitDiff + gitStatus;
 }
 
+// Wrap argv to run through a NON-INTERACTIVE shell that first sources the host's env-defining
+// rc, so backends inherit its env + per-launch auth wrappers (e.g. provider-key injectors) that
+// the stripped MCP server env lacks — WITHOUT any interactive cosmetics (prompt frameworks,
+// fastfetch banners, job-control setopts) that corrupt a headless, TTY-less worker's stdio. An
+// interactive shell (`-i`) into a pipe makes `[[ -o interactive ]]` guards fire with no terminal,
+// flooding the backend's channel; `-c` keeps the rc's own guards correctly skipping cosmetics.
+// The rc path arrives as $WORKER_RC in the spawn env (workerEnv) and the backend command as $0 +
+// argv — BOTH are data the shell expands at runtime, never text interpolated into the script
+// string, so neither can inject code (a WORKER_RC of `$(rm -rf ~)` is sourced as a filename, not
+// evaluated). Empty/missing WORKER_RC sources nothing. $0 honors a shell function of that name.
+function backendShellArgv(argv: string[]): string[] {
+  const shell = process.env.SHELL ?? '/bin/zsh';
+  return [shell, '-c', '[ -n "$WORKER_RC" ] && [ -f "$WORKER_RC" ] && . "$WORKER_RC"; "$0" "$@"', ...argv];
+}
+
 export function launchAndWait(
   argv: string[],
   repo: string,
@@ -236,7 +254,7 @@ export function launchAndWait(
 ): Promise<{ rc: number; timedOut: boolean; stopped: boolean }> {
   return new Promise((resolve) => {
     const logStream = createWriteStream(logPath, { flags: 'a' });
-    const [cmd, ...args] = argv;
+    const [cmd, ...args] = backendShellArgv(argv);
     const proc = spawn(cmd, args, {
       cwd: repo,
       env: workerEnv,
