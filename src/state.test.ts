@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from 'bun:test';
 import { rmSync, mkdirSync } from 'fs';
 import { join } from 'path';
-import { finalizeJob, insertJob, getJob, updateJob, WORKERS_DIR } from './state.ts';
+import { finalizeJob, insertJob, getJob, updateJob, workersDir } from './state.ts';
 
 describe('finalizeJob', () => {
   const testHandles: string[] = [];
@@ -9,7 +9,7 @@ describe('finalizeJob', () => {
   afterEach(() => {
     for (const handle of testHandles) {
       // Clean up job directory
-      const jobDir = join(WORKERS_DIR, 'finalizetest', handle);
+      const jobDir = join(workersDir(), 'finalizetest', handle);
       try { rmSync(jobDir, { recursive: true, force: true }); } catch {}
     }
     testHandles.length = 0;

@@ -1,6 +1,6 @@
 import { spawn, spawnSync, execSync } from 'child_process';
-import { createWriteStream, statSync, mkdirSync, writeFileSync, readFileSync, unlinkSync, realpathSync } from 'fs';
-import { updateJob, getJob, getAllRunningJobs, removeLock, logPath as workerLogPath, WORKERS_DIR, finalizeJob } from './state.ts';
+import { createWriteStream, statSync, mkdirSync, writeFileSync, readFileSync, unlinkSync, realpathSync, existsSync, copyFileSync, renameSync } from 'fs';
+import { updateJob, getJob, getAllRunningJobs, removeLock, logPath as workerLogPath, workersDir, finalizeJob } from './state.ts';
 import type { Backend } from './backends.ts';
 import type { Job } from './state.ts';
 
@@ -41,10 +41,16 @@ export async function waitJob(handle: string): Promise<RunResult> {
 
 // On startup: mark any jobs still showing 'running' whose PIDs are dead as failed.
 // Prevents stale state after a server restart mid-job.
-export const DEFAULT_TIMEOUT_MS = 600_000;
-const POLL_INTERVAL_MS = 5_000;
-const LOG_FRESHNESS_THRESHOLD_MS = 30_000;
-const STALL_DETECTION_TIMEOUT_MS = 120_000;
+// Timing knobs resolve from env at call time (defaults = production behavior), so tests
+// can drive fast timeout/stall paths per-case without touching production values.
+function envMs(key: string, def: number): number {
+  const v = Number(process.env[key]);
+  return Number.isFinite(v) && v > 0 ? v : def;
+}
+export function defaultTimeoutMs(): number { return envMs('WORKER_TIMEOUT_MS', 600_000); }
+function pollIntervalMs(): number { return envMs('WORKER_POLL_MS', 5_000); }
+function logFreshnessMs(): number { return envMs('WORKER_LOG_FRESH_MS', 30_000); }
+function stallTimeoutMs(): number { return envMs('WORKER_STALL_MS', 120_000); }
 
 // Augmented PATH so backends are findable (MCP server env is stripped)
 const HOME = process.env.HOME ?? '';
@@ -162,7 +168,7 @@ function getLogMtime(logPath: string): number {
  * Caller must have already SIGSTOP'd the group.
  */
 function evalAfterStop(handle: string, pid: number, logPath: string): boolean {
-  const isMakingProgress = (Date.now() - getLogMtime(logPath)) < LOG_FRESHNESS_THRESHOLD_MS;
+  const isMakingProgress = (Date.now() - getLogMtime(logPath)) < logFreshnessMs();
   let lastLine = '';
   let isFailed = false;
   try {
@@ -187,14 +193,24 @@ export function suspendAndEval(handle: string, pid: number, logPath: string): bo
   return evalAfterStop(handle, pid, logPath);
 }
 
+// ps `etime` = elapsed time since start, format [[dd-]hh:]mm:ss → seconds.
+// Elapsed (not wall-clock lstart) is timezone-independent: parsing lstart with `new Date()`
+// silently misreads the system-local string whenever the runtime TZ differs (e.g. TZ=UTC),
+// skewing the start by the offset and breaking the PID-reuse guard for every live process.
+export function parseEtimeSeconds(etime: string): number | null {
+  const m = etime.trim().match(/^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/);
+  if (!m) return null;
+  const [, dd, hh, mm, ss] = m;
+  return Number(dd ?? 0) * 86400 + Number(hh ?? 0) * 3600 + Number(mm) * 60 + Number(ss);
+}
+
 function getProcessStartTime(pid: number): string | null {
   try {
-    const result = spawnSync('ps', ['-o', 'lstart=', '-p', String(pid)], { encoding: 'utf8' });
+    const result = spawnSync('ps', ['-o', 'etime=', '-p', String(pid)], { encoding: 'utf8' });
     if (result.status !== 0) return null;
-    const lstart = result.stdout.trim();
-    // ps lstart format: "Tue Jun 10 21:00:00 2026"
-    const date = new Date(lstart);
-    return isNaN(date.getTime()) ? null : date.toISOString();
+    const elapsedSec = parseEtimeSeconds(result.stdout);
+    if (elapsedSec === null) return null;
+    return new Date(Date.now() - elapsedSec * 1000).toISOString();
   } catch {
     return null;
   }
@@ -216,17 +232,22 @@ export function isProcessAlive(pid: number, started?: string): boolean {
   return skewMs < 60_000;
 }
 /**
- * Composite activity signature: log size + git diff --stat + git status --porcelain.
- * Changes in any component mean the worker is still producing output.
+ * Composite activity signature, log-first. The log's mtime+size is the cheap primary signal:
+ * if it advanced since the last tick the worker is demonstrably alive, so we skip the two git
+ * probes entirely (the common case — backends stream to the log while working). Only when the
+ * log is idle do we pay for `git diff`/`status`, which still catch a worker mutating files
+ * without logging. Caller threads `lastLog` (the prior tick's log component) and stores the
+ * returned `log` for the next call.
  */
-function activitySig(repo: string, logPath: string): string {
-  let logSize = 0;
-  try { logSize = statSync(logPath).size; } catch {}
+export function activitySig(repo: string, logPath: string, lastLog: string): { sig: string; log: string } {
+  let log = '';
+  try { const st = statSync(logPath); log = `${st.mtimeMs}:${st.size}`; } catch {}
+  if (log && log !== lastLog) return { sig: log, log };
   let gitDiff = '';
   try { gitDiff = spawnSync('git', ['-C', repo, 'diff', '--stat'], { encoding: 'utf8', timeout: 2000 }).stdout ?? ''; } catch {}
   let gitStatus = '';
   try { gitStatus = spawnSync('git', ['-C', repo, 'status', '--porcelain'], { encoding: 'utf8', timeout: 2000 }).stdout ?? ''; } catch {}
-  return logSize + gitDiff + gitStatus;
+  return { sig: log + gitDiff + gitStatus, log };
 }
 
 // Wrap argv to run through a NON-INTERACTIVE shell that first sources the host's env-defining
@@ -250,7 +271,7 @@ export function launchAndWait(
   handle: string,
   backend: Backend,
   logPath: string,
-  timeoutMs: number = DEFAULT_TIMEOUT_MS,
+  timeoutMs: number = defaultTimeoutMs(),
 ): Promise<{ rc: number; timedOut: boolean; stopped: boolean }> {
   return new Promise((resolve) => {
     const logStream = createWriteStream(logPath, { flags: 'a' });
@@ -281,6 +302,7 @@ export function launchAndWait(
       resolve({ rc: code, timedOut: timed, stopped: stoppedJob });
     };
     let lastSig = '';
+    let lastLog = '';
     let lastSigChange = Date.now();
 
     const watchdog = setInterval(() => {
@@ -298,9 +320,10 @@ export function launchAndWait(
         }, 100);
         return;
       }
-      const sig = activitySig(repo, logPath);
+      const { sig, log } = activitySig(repo, logPath, lastLog);
+      lastLog = log;
       if (sig !== lastSig) { lastSig = sig; lastSigChange = Date.now(); }
-      else if (Date.now() - lastSigChange >= STALL_DETECTION_TIMEOUT_MS) {
+      else if (Date.now() - lastSigChange >= stallTimeoutMs()) {
         killGroup(proc.pid!, 'SIGSTOP');
         setTimeout(() => {
           if (settled) return;
@@ -309,7 +332,7 @@ export function launchAndWait(
         }, 100);
         return;
       }
-    }, POLL_INTERVAL_MS);
+    }, pollIntervalMs());
 
     proc.on('exit', (code, signal) => {
       rc = code ?? (signal ? 1 : 0);
@@ -348,17 +371,125 @@ export async function runWorker(
   };
 }
 
+/**
+ * Watch an already-running process we hold no child handle for (a SIGCONT'd resume), polling to
+ * completion. No spawn — the process exists; we only observe PID liveness against a re-armed
+ * deadline and a stall timer. Mirrors launchAndWait's watchdog: exited-on-its-own → finalize from
+ * log; deadline fired OR activity stalled (activitySig unchanged for stallTimeoutMs) → suspendAndEval
+ * (freeze to 'stopped' if still productive, else SIGKILL + terminal).
+ * started/resume_token come from the persisted job (set at insert, immutable for its lifetime).
+ */
+export function watchExisting(
+  handle: string,
+  pid: number,
+  repo: string,
+  logPath: string,
+  backend: Backend,
+  deadlineMs: number,
+): Promise<RunResult> {
+  const job = getJob(handle);
+  const started = job?.started;
+  const resumeToken = job?.resume_token ?? '';
+  const watchStart = Date.now();
+  let lastSig = '';
+  let lastLog = '';
+  let lastSigChange = watchStart;
+
+  return new Promise((resolve) => {
+    const mkResult = (status: string): RunResult => ({
+      status, exit_code: 0, backend, handle,
+      resume_token: resumeToken, repo, shortstat: '', log: logPath,
+    });
+    // Deadline or stall → suspend, then freeze ('stopped') if still productive or kill (terminal).
+    const suspend = () => {
+      if (suspendAndEval(handle, pid, logPath)) {
+        resolve(mkResult('stopped')); // suspendAndEval persisted 'stopped' + removed the lock
+      } else {
+        resolve(mkResult(finalizeJob(handle, resolveStatus(backend, 124, logPath, true))));
+      }
+    };
+    const check = () => {
+      // Process exited on its own → finalize from log.
+      if (!isProcessAlive(pid, started)) {
+        resolve(mkResult(finalizeJob(handle, resolveStatus(backend, 0, logPath, false))));
+        return;
+      }
+      // Re-armed deadline fired.
+      if (Date.now() - watchStart >= deadlineMs) { suspend(); return; }
+      // Activity stalled (no new log/diff for stallTimeoutMs) → treat like a fresh run's stall.
+      const { sig, log } = activitySig(repo, logPath, lastLog);
+      lastLog = log;
+      if (sig !== lastSig) { lastSig = sig; lastSigChange = Date.now(); }
+      else if (Date.now() - lastSigChange >= stallTimeoutMs()) { suspend(); return; }
+      setTimeout(check, pollIntervalMs());
+    };
+    check();
+  });
+}
+
+type TrustEntry = {
+  hasTrustDialogAccepted?: boolean;
+  hasCompletedProjectOnboarding?: boolean;
+  projectOnboardingSeenCount?: number;
+  [k: string]: unknown;
+};
+type ClaudeConfig = { projects?: Record<string, TrustEntry>; [k: string]: unknown };
+
+const CLAUDE_CFG = `${process.env.HOME}/.claude.json`;
+const CLAUDE_CFG_BAK = `${CLAUDE_CFG}.worker-bak`;
+
+// Interactive claude (no -p) blocks on the workspace trust dialog in a fresh/untrusted repo,
+// hanging the unattended TUI. No CLI flag bypasses it (trust is gated before settings are read,
+// hardened by CVE-2026-33068), so we pre-seed the trust state in ~/.claude.json. Claude keys
+// trust off the *canonical* cwd (/var -> /private/var on macOS), so seed both raw + realpath.
+// We deliberately never restore afterward: the trust flag is benign/idempotent, while
+// ~/.claude.json is a large file other claude processes write concurrently — a teardown restore
+// would clobber their writes. One-time backup + atomic write keep the mutation safe; flag stays set.
+function seedRepoTrust(repo: string): void {
+  let cfg: ClaudeConfig;
+  try { cfg = JSON.parse(readFileSync(CLAUDE_CFG, 'utf8')); }
+  catch { return; } // missing/corrupt config → skip seeding, never crash the run
+
+  const projects = cfg.projects ?? (cfg.projects = {});
+  let real = repo;
+  try { real = realpathSync(repo); } catch {}
+  const keys = [...new Set([repo, real])];
+
+  if (keys.every(k => projects[k]?.hasTrustDialogAccepted === true)) return;
+
+  if (!existsSync(CLAUDE_CFG_BAK)) {
+    try { copyFileSync(CLAUDE_CFG, CLAUDE_CFG_BAK); } catch {}
+  }
+
+  for (const key of keys) {
+    projects[key] = {
+      ...projects[key],
+      hasTrustDialogAccepted: true,
+      hasCompletedProjectOnboarding: true,
+      projectOnboardingSeenCount: projects[key]?.projectOnboardingSeenCount ?? 1,
+    };
+  }
+
+  const tmp = `${CLAUDE_CFG}.${process.pid}.tmp`;
+  try {
+    writeFileSync(tmp, JSON.stringify(cfg, null, 2));
+    renameSync(tmp, CLAUDE_CFG);
+  } catch {
+    try { unlinkSync(tmp); } catch {}
+  }
+}
+
 export async function runClaudeTmux(
   spec: string,
   repo: string,
   handle: string,
   sid: string,
-  timeoutMs: number = DEFAULT_TIMEOUT_MS,
+  timeoutMs: number = defaultTimeoutMs(),
 ): Promise<RunResult> {
   try { execSync('which tmux', { stdio: 'ignore' }); }
   catch { throw new Error('claude_tmux backend requires tmux'); }
 
-  const wdir = `${WORKERS_DIR}/tmux`;
+  const wdir = `${workersDir()}/tmux`;
   mkdirSync(wdir, { recursive: true });
 
   const setf    = `${wdir}/${sid}.settings.json`;
@@ -367,28 +498,7 @@ export async function runClaudeTmux(
   const launchf = `${wdir}/${sid}.launch.sh`;
   const logPath = workerLogPath(handle);
 
-  // Interactive claude (no -p) does NOT auto-skip the workspace trust dialog, so a fresh/untrusted
-  // repo would block the TUI on "Do you trust the files in this folder?". Pre-seed the trust state
-  // in ~/.claude.json so the session starts unattended. Best-effort: never fail the run on this.
-  // Claude keys trust off the *canonical* cwd (e.g. /var → /private/var on macOS), so seed the
-  // realpath; also seed the raw path so either resolution hits a trusted entry.
-  try {
-    const cfgPath = `${process.env.HOME}/.claude.json`;
-    const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'));
-    cfg.projects = cfg.projects ?? {};
-    let real = repo;
-    try { real = realpathSync(repo); } catch {}
-    for (const key of new Set([repo, real])) {
-      const proj = cfg.projects[key] ?? {};
-      cfg.projects[key] = {
-        ...proj,
-        hasTrustDialogAccepted: true,
-        hasCompletedProjectOnboarding: true,
-        projectOnboardingSeenCount: proj.projectOnboardingSeenCount ?? 1,
-      };
-    }
-    writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
-  } catch {}
+  seedRepoTrust(repo);
 
   // Sentinel: Stop hook writes to donef
   writeFileSync(setf, JSON.stringify({
@@ -425,7 +535,7 @@ export async function runClaudeTmux(
   }
 
   try {
-    const pane = execSync(`tmux capture-pane -t ${sid} -p -S -200 2>/dev/null`, { encoding: 'utf8', env: workerEnv });
+    const pane = execSync(`tmux capture-pane -t ${sid} -p -S -5000 2>/dev/null`, { encoding: 'utf8', env: workerEnv });
     writeFileSync(logPath, pane);
   } catch {}
 

@@ -1,7 +1,19 @@
 import { mkdirSync, readFileSync, writeFileSync, readdirSync, appendFileSync, unlinkSync, renameSync } from 'fs';
 import { join } from 'path';
 
-export const WORKERS_DIR = `${process.env.HOME}/.claude/workers`;
+// Resolved lazily (not a load-time const) so tests can point WORKER_STATE_DIR at a
+// throwaway dir per-case; the production default is unchanged. The dir tree is ensured
+// once per distinct path, so the hot path stays an env read + Set lookup.
+const _ensuredDirs = new Set<string>();
+export function workersDir(): string {
+  const dir = process.env.WORKER_STATE_DIR ?? `${process.env.HOME}/.claude/workers`;
+  if (!_ensuredDirs.has(dir)) {
+    mkdirSync(dir, { recursive: true });
+    mkdirSync(join(dir, 'ladder'), { recursive: true });
+    _ensuredDirs.add(dir);
+  }
+  return dir;
+}
 
 export function projectName(repo: string): string {
   const homePrefix = `${process.env.HOME}/`;
@@ -13,19 +25,17 @@ export function projectName(repo: string): string {
   if (rel === '') return 'root';
   return rel.replace(/\//g, '-');
 }
-const LADDER_DIR = join(WORKERS_DIR, 'ladder');
-mkdirSync(WORKERS_DIR, { recursive: true });
-mkdirSync(LADDER_DIR, { recursive: true });
 
 export function resolveHandleDir(handle: string): string | null {
   try {
-    const entries = readdirSync(WORKERS_DIR, { withFileTypes: true });
+    const root = workersDir();
+    const entries = readdirSync(root, { withFileTypes: true });
     for (const entry of entries) {
       if (entry.isDirectory() && entry.name !== 'ladder' && entry.name !== 'tmux') {
-        const jobPath = join(WORKERS_DIR, entry.name, handle, 'job.json');
+        const jobPath = join(root, entry.name, handle, 'job.json');
         try {
           readFileSync(jobPath, 'utf8');
-          return join(WORKERS_DIR, entry.name, handle);
+          return join(root, entry.name, handle);
         } catch {}
       }
     }
@@ -34,22 +44,22 @@ export function resolveHandleDir(handle: string): string | null {
 }
 
 export function handleDir(handle: string, repo?: string) {
-  if (repo) return join(WORKERS_DIR, projectName(repo), handle);
+  if (repo) return join(workersDir(), projectName(repo), handle);
   const resolved = resolveHandleDir(handle);
-  return resolved ?? join(WORKERS_DIR, handle);
+  return resolved ?? join(workersDir(), handle);
 }
 export function lockPath(handle: string, repo?: string) {
-  return join(handleDir(handle, repo) ?? join(WORKERS_DIR, handle), '.lock');
+  return join(handleDir(handle, repo), '.lock');
 }
 export function logPath(handle: string, repo?: string) {
-  return join(handleDir(handle, repo) ?? join(WORKERS_DIR, handle), 'run.log'); }
+  return join(handleDir(handle, repo), 'run.log'); }
 export function createLock(handle: string, repo?: string) { try { writeFileSync(lockPath(handle, repo ?? undefined), ''); } catch {} }
 export function removeLock(handle: string, repo?: string) { try { unlinkSync(lockPath(handle, repo ?? undefined)); } catch {} }
 
 function jobPathFn(handle: string, repo?: string): string {
-  return join(handleDir(handle, repo) ?? join(WORKERS_DIR, handle), 'job.json');
+  return join(handleDir(handle, repo), 'job.json');
 }
-export function ladderPath(sid: string)  { return join(LADDER_DIR, `${sid}.jsonl`); }
+export function ladderPath(sid: string)  { return join(workersDir(), 'ladder', `${sid}.jsonl`); }
 
 export type Job = {
   handle: string; backend: string; sid: string;
@@ -105,13 +115,14 @@ export function finalizeJob(handle: string, naturalStatus: string, extra?: Parti
 
 export function getAllRunningJobs(): Job[] {
   try {
-    return readdirSync(WORKERS_DIR, { withFileTypes: true })
+    const root = workersDir();
+    return readdirSync(root, { withFileTypes: true })
       .filter(d => d.isDirectory() && d.name !== 'ladder' && d.name !== 'tmux')
       .flatMap(d => {
         try {
-          return readdirSync(join(WORKERS_DIR, d.name), { withFileTypes: true })
+          return readdirSync(join(root, d.name), { withFileTypes: true })
             .filter(h => h.isDirectory())
-            .map(h => { try { return JSON.parse(readFileSync(join(WORKERS_DIR, d.name, h.name, 'job.json'), 'utf8')); } catch { return null; } });
+            .map(h => { try { return JSON.parse(readFileSync(join(root, d.name, h.name, 'job.json'), 'utf8')); } catch { return null; } });
         } catch { return []; }
       })
       .filter((j): j is Job => j?.status === 'running');
@@ -121,9 +132,10 @@ export function getAllRunningJobs(): Job[] {
 export function getRunningJobsForRepo(repo: string): Job[] {
   const project = projectName(repo);
   try {
-    return readdirSync(join(WORKERS_DIR, project), { withFileTypes: true })
+    const root = workersDir();
+    return readdirSync(join(root, project), { withFileTypes: true })
       .filter(h => h.isDirectory())
-      .map(h => { try { return JSON.parse(readFileSync(join(WORKERS_DIR, project, h.name, 'job.json'), 'utf8')); } catch { return null; } })
+      .map(h => { try { return JSON.parse(readFileSync(join(root, project, h.name, 'job.json'), 'utf8')); } catch { return null; } })
       .filter((j): j is Job => j && (j.status === 'running' || j.status === 'stopped'));
   } catch { return []; }
 }
