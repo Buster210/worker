@@ -1,7 +1,18 @@
-import { describe, it, expect, afterEach } from 'bun:test';
-import { rmSync, mkdirSync } from 'fs';
+import { describe, it, expect, afterEach, afterAll } from 'bun:test';
+import { rmSync, mkdirSync, readdirSync } from 'fs';
 import { join } from 'path';
-import { finalizeJob, insertJob, getJob, updateJob, workersDir } from './state.ts';
+import { tmpdir } from 'os';
+
+// Throwaway store set BEFORE importing state (resolution is lazy). Without this the tests would
+// read/write the real ~/.claude/workers and the cache test below would delete live job dirs.
+const STATE_DIR = join(tmpdir(), `wstate-state-${process.pid}`);
+process.env.WORKER_STATE_DIR = STATE_DIR;
+
+import { finalizeJob, insertJob, getJob, updateJob, workersDir, handleDir, resolveHandleDir } from './state.ts';
+
+afterAll(() => {
+  try { rmSync(STATE_DIR, { recursive: true, force: true }); } catch {}
+});
 
 describe('finalizeJob', () => {
   const testHandles: string[] = [];
@@ -65,5 +76,21 @@ describe('finalizeJob', () => {
     // Verify status persisted
     const persistedJob = getJob(handle);
     expect(persistedJob?.status).toBe('done');
+  });
+});
+
+describe('handleDir cache (#5)', () => {
+  it('resolves a known handle from cache, not a WORKERS_DIR walk', () => {
+    const handle = `cache-${process.pid}-${Date.now()}`;
+    insertJob({ handle, backend: 'cmd', sid: 't', repo: '/tmp/wcache-proj', log_path: 'x' });
+
+    // No-repo lookup hits the cache seeded by insertJob → the project-scoped dir, not the flat fallback.
+    const cachedDir = handleDir(handle);
+    expect(cachedDir).toBe(join(workersDir(), 'tmp-wcache-proj', handle));
+
+    // Wipe the on-disk job so a cold walk would find nothing...
+    rmSync(join(workersDir(), 'tmp-wcache-proj'), { recursive: true, force: true });
+    expect(resolveHandleDir(handle)).toBeNull();   // the scan now yields nothing
+    expect(handleDir(handle)).toBe(cachedDir);      // ...yet handleDir still returns it → served from cache
   });
 });

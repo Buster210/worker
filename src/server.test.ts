@@ -9,7 +9,7 @@ process.env.WORKER_STATE_DIR = STATE_DIR;
 
 // server.ts only boots the stdio transport under `import.meta.main`, so importing it
 // here registers the tools as a side effect but does NOT connect/hang the test runner.
-import { reply, handleStatus, handleKill, handleWait, handleResume } from './server.ts';
+import { reply, handleStatus, handleKill, handleWait, handleResume, handleList } from './server.ts';
 import { insertJob, updateJob, finalizeJob, getJob, logPath as stateLogPath } from './state.ts';
 
 const REPO = '/tmp/wserver-repo';
@@ -79,5 +79,22 @@ describe('handleWait', () => {
 describe('handleResume', () => {
   it('throws when the handle is unknown', () => {
     expect(() => handleResume({ handle: 'ghost', prompt: 'x', dir: REPO })).toThrow(/No job found/);
+  });
+});
+
+describe('handleList', () => {
+  it('finds nested <project>/<handle> jobs, strips backend, honors the status filter', () => {
+    const a = seedJob('done');
+    const b = seedJob('running');
+
+    const all = handleList({});
+    const found = all.map(j => j.handle);
+    expect(found).toContain(a);            // pre-fix one-level read returned [] for every nested job
+    expect(found).toContain(b);
+    expect(all.every(j => !('backend' in j))).toBe(true);
+
+    const running = handleList({ status: 'running' }).map(j => j.handle);
+    expect(running).toContain(b);
+    expect(running).not.toContain(a);
   });
 });

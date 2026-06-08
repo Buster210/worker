@@ -43,9 +43,23 @@ export function resolveHandleDir(handle: string): string | null {
   return null;
 }
 
-export function handleDir(handle: string, repo?: string) {
-  if (repo) return join(workersDir(), projectName(repo), handle);
+// handle→dir is immutable for a job's lifetime (a job dir never moves), so this needs no
+// invalidation. It exists to spare the no-repo callers (getJob/updateJob via jobPathFn) the
+// O(projects) readdirSync walk in resolveHandleDir on every lookup. Seeded whenever the repo is
+// known (insertJob's calls) and on a successful cold resolve; a fresh process starts empty and
+// repopulates via the scan fallback.
+const _handleDirCache = new Map<string, string>();
+
+export function handleDir(handle: string, repo?: string): string {
+  if (repo) {
+    const dir = join(workersDir(), projectName(repo), handle);
+    _handleDirCache.set(handle, dir);
+    return dir;
+  }
+  const cached = _handleDirCache.get(handle);
+  if (cached) return cached;
   const resolved = resolveHandleDir(handle);
+  if (resolved) _handleDirCache.set(handle, resolved);
   return resolved ?? join(workersDir(), handle);
 }
 export function lockPath(handle: string, repo?: string) {

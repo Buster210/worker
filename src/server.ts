@@ -232,9 +232,18 @@ export async function handleWait(args: { handle: string; timeout?: number }): Pr
 export function handleList(args: { status?: string; limit?: number }): Record<string, unknown>[] {
   const { status, limit = 20 } = args;
   const root = workersDir();
+  // Jobs nest as <root>/<project>/<handle>/job.json (see state.insertJob), so walk two levels —
+  // mirrors getAllRunningJobs. The old one-level read silently returned nothing for every job
+  // stored under the current layout.
   return readdirSync(root, { withFileTypes: true })
     .filter(d => d.isDirectory() && d.name !== 'ladder' && d.name !== 'tmux')
-    .map(d => { try { return JSON.parse(readFileSync(`${root}/${d.name}/job.json`, 'utf8')); } catch { return null; } })
+    .flatMap(project => {
+      try {
+        return readdirSync(`${root}/${project.name}`, { withFileTypes: true })
+          .filter(h => h.isDirectory())
+          .map(h => { try { return JSON.parse(readFileSync(`${root}/${project.name}/${h.name}/job.json`, 'utf8')); } catch { return null; } });
+      } catch { return []; }
+    })
     .filter((j): j is NonNullable<typeof j> => j !== null)
     .filter(j => !status || j.status === status)
     .sort((a, b) => (b.started ?? '').localeCompare(a.started ?? ''))
