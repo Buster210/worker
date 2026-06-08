@@ -36,10 +36,62 @@ function assertRepo(dir: string) {
   catch { throw new Error(`Not a git repo: ${dir}`); }
 }
 
-const server = new McpServer({ name: 'worker', version: '0.1.0' });
+// Orchestration contract shipped to every client on connect (MCP `initialize`
+// `instructions`). Folds in the former client-side worker-control skill so a bare
+// `add this MCP` is self-sufficient — no skill install required.
+const WORKER_INSTRUCTIONS = `# worker — delegate a coding task to a background agent
+
+These tools spawn autonomous coding agents that MUTATE a git repo, then run, kill,
+resume, and report on them. One task = one running worker.
+
+## Invariants (always)
+- \`worker_ladder\` is the DEFAULT — always use it; \`worker_run\` only when the user explicitly names a backend.
+- \`dir\` is REQUIRED on every call — absolute repo path. Server has no cwd; a relative or omitted path won't resolve.
+- git is GROUND TRUTH — read a worker's output with \`git -C <dir> diff\`, never the JSON log for file content.
+- ONE worker PER REPO at a time. Never start a second on a repo already running one (\`worker_ladder\`/\`worker_run\` kills the lingering one for you).
+- \`sid\` = the caller's session id (e.g. \$CLAUDE_CODE_SESSION_ID); it keys the ladder.
+
+## Lifecycle
+- Run tools are ASYNC: \`worker_ladder\`/\`worker_run\`/\`worker_resume\` return immediately as \`{ handle, status: "running", lock_path }\`; the agent keeps running in the background — poll/wait for the final status.
+- \`climb: true\` escalates \`worker_ladder\` to the next backend after a failed/weak run.
+
+## Status model — a job ends in ONE of these
+- \`done\` — completed cleanly.
+- \`failed[:reason]\` — the agent errored or produced nothing usable.
+- \`timeout\` — hit its deadline while NOT productively working → terminated, gone.
+- \`stopped\` — hit its deadline but WAS still productively working (fresh edits, no failure): the process is FROZEN via SIGSTOP, its lock removed, NOT dead. Usually recoverable, not lost — \`worker_resume\` thaws it (SIGCONT) and re-arms the timeout, rather than re-running from scratch.
+- \`killed\` — terminated by \`worker_kill\`.
+- \`exhausted\` — \`worker_ladder\` ran out of backends to climb to. Stop and report.
+
+## Recovering / continuing a run — worker_resume(handle, prompt, dir)
+- Thaws a \`stopped\` (frozen) worker and lets it finish; or re-attempts a \`failed\`/\`timeout\` one from its saved resume_token.
+- The \`cmd\` backend auto-prepends "a prior attempt already ran — inspect the tree and complete only the remainder," so resume won't redo finished work.
+
+## Wait for completion
+- PREFER bash lock-poll — do NOT block on \`worker_wait\`. The run returns \`lock_path\`; it exists while the worker runs and is REMOVED when done. Fire a background bash poller right after the run call — its exit IS the completion signal:
+    LOCK="<lock_path>"; while [ -f "\$LOCK" ]; do sleep 10; done
+- \`worker_wait(handle)\` is a blocking fallback only.
+
+## Drive loop
+1. \`worker_ladder(sid, prompt, dir)\` → \`{ handle, lock_path }\` (returns at once).
+2. Background bash-poll \`lock_path\` (do NOT block on \`worker_wait\`); lock removed = task complete.
+3. On completion run \`git -C <dir> diff\` and evaluate the work against the spec.
+4. Reviewer gate (mandatory): PASS → done · FAIL/timeout → re-call with \`climb: true\` · exhausted → report and stop.
+
+\`worker_status\` is for mid-flight diagnostics only — never the completion signal; the diff is ground truth.
+
+## Other tools
+- \`worker_kill(handle)\` — terminate a running worker.
+- \`worker_list(status?, limit?)\` — recent jobs.
+- \`worker_doctor(backend?)\` — which backends are installed/on PATH.`;
+
+const server = new McpServer(
+  { name: 'worker', version: '0.1.0' },
+  { instructions: WORKER_INSTRUCTIONS },
+);
 
 server.tool('worker_ladder',
-  'Run a coding task via the worker ladder (default). Auto-routes omp→opencode→pool→cmd→claude→claude_tmux. Use climb=true to escalate after a failed run.',
+  'DEFAULT way to run a coding task: spawns an autonomous agent that mutates the repo, auto-routing omp→opencode→pool→cmd→claude→claude_tmux. climb=true escalates to the next backend after a failed run. Async: returns { handle, status:"running", lock_path }; do NOT block on worker_wait — background bash-poll lock_path (removed = done), then read results with `git -C <dir> diff`.',
   {
     sid: z.string().describe('Session ID ($CLAUDE_CODE_SESSION_ID)'),
     prompt: z.string().describe('Task spec'),
@@ -88,14 +140,14 @@ server.tool('worker_ladder',
 );
 
 server.tool('worker_run',
-  'Run on a specific backend. Only when user explicitly names one.',
+  'Run a coding task on a SPECIFIC backend — only when the user explicitly names one; otherwise use worker_ladder. Spawns an autonomous agent that mutates the repo. Async: returns { handle, status:"running", lock_path }; read results via `git -C <dir> diff`.',
   {
     backend: z.enum(['pool', 'omp', 'opencode', 'cmd', 'claude', 'claude_tmux']),
     prompt: z.string(),
-    model: z.string().optional(),
+    model: z.string().optional().describe('Model override. IGNORED for claude and omp backends (they pin their own).'),
     dir: z.string().describe('Repo directory (absolute path, required)'),
-    timeout: z.number().optional(),
-    extraArgs: z.array(z.string()).optional().describe('Raw extra args forwarded to backend binary (-- passthrough)'),
+    timeout: z.number().optional().describe('Hard timeout seconds (default 600). On timeout a productively-working job is frozen as `stopped` and is resumable, not killed.'),
+    extraArgs: z.array(z.string()).optional().describe('Raw extra args forwarded verbatim to the backend binary (powerful: can alter permission mode etc.). Omit unless you know the backend CLI.'),
   },
   async ({ backend, prompt, model, dir, timeout, extraArgs }) => {
     assertRepo(dir);
