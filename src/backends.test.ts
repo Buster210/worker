@@ -9,6 +9,13 @@ describe('buildSpec', () => {
     expect(spec).toContain('DONE');
   });
 
+  it('returns prompt without STANDARDS for codex', () => {
+    const spec = buildSpec('codex', 'test prompt');
+    expect(spec).toContain('test prompt');
+    expect(spec).toContain('DONE');
+    expect(spec).not.toContain('BINDING STANDARDS');
+  });
+
   it('returns prompt with standards and CONTRACT for non-claude', () => {
     const spec = buildSpec('cmd', 'test prompt');
     expect(spec).toContain('test prompt');
@@ -48,6 +55,21 @@ describe('buildRunArgv', () => {
     const argv = buildRunArgv('pool', 'spec', '/repo', 'sid123');
     expect(argv).toEqual(['pool', 'exec', '-p', 'spec', '-d', '/repo', '--unsafe-auto-allow']);
   });
+
+  it('builds codex argv', () => {
+    const argv = buildRunArgv('codex', 'spec', '/repo', 'sid123');
+    expect(argv).toEqual([
+      'codex', 'exec', '--json', '--cd', '/repo', '--skip-git-repo-check',
+      '--dangerously-bypass-approvals-and-sandbox', 'spec'
+    ]);
+  });
+
+  it('builds codex argv with model', () => {
+    const argv = buildRunArgv('codex', 'spec', '/repo', 'sid123', 'o4-mini');
+    expect(argv).toContain('-m');
+    expect(argv).toContain('o4-mini');
+    expect(argv[argv.length - 1]).toBe('spec');
+  });
 });
 
 describe('buildResumeArgv', () => {
@@ -68,6 +90,14 @@ describe('buildResumeArgv', () => {
     const argv = buildResumeArgv('opencode', 'spec', '/repo', 'token123');
     expect(argv).toEqual(['opencode', 'run', 'spec', '-s', 'token123', '--dir', '/repo']);
   });
+
+  it('builds codex resume argv', () => {
+    const argv = buildResumeArgv('codex', 'spec', '/repo', 'token123');
+    expect(argv).toEqual([
+      'codex', 'exec', 'resume', '--last', '--json', '--skip-git-repo-check',
+      '--dangerously-bypass-approvals-and-sandbox', 'spec'
+    ]);
+  });
 });
 
 describe('getResumeToken', () => {
@@ -83,6 +113,11 @@ describe('getResumeToken', () => {
 
   it('returns "last" for pool', () => {
     const token = getResumeToken('pool', 'sid', '/path/to/log');
+    expect(token).toBe('last');
+  });
+
+  it('returns "last" for codex', () => {
+    const token = getResumeToken('codex', 'sid', '/path/to/log');
     expect(token).toBe('last');
   });
 

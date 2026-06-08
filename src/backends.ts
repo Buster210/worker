@@ -1,17 +1,17 @@
 import { readFileSync } from 'fs';
 import { handleDir } from './state.ts';
 
-export type Backend = 'pool' | 'omp' | 'opencode' | 'cmd' | 'claude' | 'claude_tmux';
+export type Backend = 'pool' | 'omp' | 'opencode' | 'cmd' | 'claude' | 'claude_tmux' | 'codex';
 
 export const LADDER: Backend[] = (
-  ['omp', 'opencode', 'pool', 'cmd', 'claude', 'claude_tmux'] as Backend[]
+  ['omp', 'opencode', 'pool', 'cmd', 'codex', 'claude', 'claude_tmux'] as Backend[]
 ).filter(be => process.env[`SKIP_${be}`] !== '1');
 
 const STANDARDS = `You are a coding worker. BINDING STANDARDS: priority correctness > security > clarity > performance > brevity. Make surgical, minimal changes — touch only what the task needs, no drive-by refactors. When changing code that already works, stay behaviorally lossless. Validate inputs at trust boundaries; never put secrets in code or logs. Match the surrounding code conventions; idiomatic to the language; prefer stdlib/maintained deps over hand-rolling.`;
 const CONTRACT = `\nMake only the changes the task requires. Stop when done. Final reply = ONE line: "DONE" or "FAILED:<reason>". Nothing else.`;
 
 export function buildSpec(backend: Backend, userPrompt: string): string {
-  if (backend === 'claude' || backend === 'claude_tmux') {
+  if (backend === 'claude' || backend === 'claude_tmux' || backend === 'codex') {
     return `${userPrompt}${CONTRACT}`;
   }
   return `${STANDARDS}\n\n${userPrompt}${CONTRACT}`;
@@ -31,6 +31,11 @@ export function buildRunArgv(backend: Backend, spec: string, repo: string, sid: 
       return ['opencode', 'run', spec, '--dir', repo, '--dangerously-skip-permissions', ...(model ? ['-m', model] : []), ...(extraArgs ?? [])];
     case 'pool':
       return ['pool', 'exec', '-p', spec, '-d', repo, '--unsafe-auto-allow', ...(extraArgs ?? [])];
+    case 'codex':
+      // codex makes its own session id; resume via `exec resume --last` cwd-filtered by spawn cwd.
+      // --json streams JSONL events so the log grows continuously — without it codex buffers all
+      // output to the end and the runner's stall-watchdog freezes the still-working job at 120s.
+      return ['codex', 'exec', '--json', '--cd', repo, '--skip-git-repo-check', '--dangerously-bypass-approvals-and-sandbox', ...(model ? ['-m', model] : []), spec];
     default:
       throw new Error(`Unknown backend: ${backend}`);
   }
@@ -49,6 +54,10 @@ export function buildResumeArgv(backend: Backend, spec: string, repo: string, to
       return ['pool', 'exec', '-p', spec, '-d', repo, '--unsafe-auto-allow', '--continue', token, ...(extraArgs ?? [])];
     case 'cmd':
       return ['cmd', '-p', spec, '--yolo', '-t', '--skip-onboarding', '--add-dir', repo, ...(model ? ['--model', model] : []), ...(extraArgs ?? [])];
+    case 'codex':
+      // `exec resume` has no --cd, relies on spawn cwd; always resumes last session.
+      // --json: stream events so the log keeps growing (see buildRunArgv) — avoids a false stall.
+      return ['codex', 'exec', 'resume', '--last', '--json', '--skip-git-repo-check', '--dangerously-bypass-approvals-and-sandbox', ...(model ? ['-m', model] : []), spec];
     default:
       throw new Error(`Unknown backend: ${backend}`);
   }
@@ -57,7 +66,7 @@ export function buildResumeArgv(backend: Backend, spec: string, repo: string, to
 export function getResumeToken(backend: Backend, sid: string, logPath: string): string {
   switch (backend) {
     case 'claude': case 'omp': return sid;
-    case 'pool': return 'last';
+    case 'pool': case 'codex': return 'last';
     case 'opencode': {
       try {
         const log = readFileSync(logPath, 'utf8');

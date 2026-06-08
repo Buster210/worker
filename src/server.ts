@@ -272,7 +272,7 @@ export function handleStatus(args: { handle: string }): Record<string, unknown> 
 }
 
 export function handleDoctor(args: { backend?: string }): string {
-  const backends = args.backend ? [args.backend] : ['claude', 'omp', 'cmd', 'opencode', 'pool'];
+  const backends = args.backend ? [args.backend] : ['claude', 'omp', 'cmd', 'opencode', 'pool', 'codex'];
   const lines = backends.map(be => {
     try {
       const ver = execSync(`${be} --version 2>/dev/null | head -1`, { encoding: 'utf8', env: workerEnv }).trim();
@@ -371,7 +371,7 @@ const server = new McpServer(
 );
 
 server.tool('worker_ladder',
-  `DEFAULT way to run a coding task: spawns an autonomous agent that mutates the repo, auto-routing omp→opencode→pool→cmd→claude→claude_tmux. Runs the FULL ladder itself — on failed/timeout/stall it resumes once then climbs to the next backend automatically, until one succeeds (done) or the ladder is exhausted. No caller action needed to climb. Async: returns { handle, status:"running", lock_path }; then background-run the report watcher (\`bun ${reportScript} <handle> <lock_path>\`) — its stdout is the outcome line + full git diff (completion signal + result in one). See MCP instructions.`,
+  `DEFAULT way to run a coding task: spawns an autonomous agent that mutates the repo, auto-routing omp→opencode→pool→cmd→codex→claude→claude_tmux. Runs the FULL ladder itself — on failed/timeout/stall it resumes once then climbs to the next backend automatically, until one succeeds (done) or the ladder is exhausted. No caller action needed to climb. Async: returns { handle, status:"running", lock_path }; then background-run the report watcher (\`bun ${reportScript} <handle> <lock_path>\`) — its stdout is the outcome line + full git diff (completion signal + result in one). See MCP instructions.`,
   {
     sid: z.string().describe('Session ID ($CLAUDE_CODE_SESSION_ID)'),
     prompt: z.string().describe('Task spec'),
@@ -384,7 +384,7 @@ server.tool('worker_ladder',
 server.tool('worker_run',
   `Run a coding task on a SPECIFIC backend — only when the user explicitly names one; otherwise use worker_ladder. Spawns an autonomous agent that mutates the repo. Async: returns { handle, status:"running", lock_path }; then background-run the report watcher (\`bun ${reportScript} <handle> <lock_path>\`) for the outcome line + git diff.`,
   {
-    backend: z.enum(['pool', 'omp', 'opencode', 'cmd', 'claude', 'claude_tmux']),
+    backend: z.enum(['pool', 'omp', 'opencode', 'cmd', 'claude', 'claude_tmux', 'codex']),
     prompt: z.string(),
     model: z.string().optional().describe('Model override. IGNORED for claude and omp backends (they pin their own).'),
     dir: z.string().describe('Repo directory (absolute path, required)'),
