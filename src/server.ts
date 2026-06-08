@@ -4,12 +4,12 @@ import { z } from 'zod';
 import { randomUUID } from 'crypto';
 import { readdirSync, readFileSync } from 'fs';
 import { join } from 'path';
-import { spawnSync, execSync } from 'child_process';
+import { spawnSync } from 'child_process';
 import { insertJob, getJob, updateJob, createLock, workersDir, lockPath, logPath as workerLogPath, finalizeJob, getRunningJobsForRepo, chainLockPath, createChainLock, removeChainLock } from './state.ts';
-import { buildSpec, buildRunArgv, buildResumeArgv, getResumeToken, LADDER, type Backend } from './backends.ts';
+import { buildSpec, buildRunArgv, buildResumeArgv, getResumeToken, LADDER, ALL_BACKENDS, type Backend } from './backends.ts';
 import {
   runWorker, runClaudeTmux, sweepStaleJobs, reapStoppedJobs, workerEnv,
-  isProcessAlive, resolveStatus, watchExisting, defaultTimeoutMs, type RunResult,
+  isProcessAlive, resolveStatus, watchExisting, defaultTimeoutMs, backendShellArgv, type RunResult,
 } from './runner.ts';
 import { recordLadder } from './ladder.ts';
 
@@ -99,7 +99,7 @@ export function handleLadder(args: { sid: string; prompt: string; dir: string; t
   const { sid, prompt, dir } = args;
   const timeoutMs = args.timeout ? args.timeout * 1000 : undefined;
 
-  if (LADDER.length === 0) return { status: 'exhausted', worker: null, note: 'no backends available' };
+  if (LADDER.length === 0) return { status: 'exhausted', worker: null, note: 'no workers available' };
 
   createChainLock(sid);
   // Launch the first rung now so its handle is the stable key returned to the caller.
@@ -272,14 +272,18 @@ export function handleStatus(args: { handle: string }): Record<string, unknown> 
 }
 
 export function handleDoctor(args: { backend?: string }): string {
-  const backends = args.backend ? [args.backend] : ['claude', 'omp', 'cmd', 'opencode', 'pool', 'codex'];
-  const lines = backends.map(be => {
-    try {
-      const ver = execSync(`${be} --version 2>/dev/null | head -1`, { encoding: 'utf8', env: workerEnv }).trim();
-      return `DOCTOR|${be}|OK ${ver}`;
-    } catch { return `DOCTOR|${be}|MISSING (not on PATH)`; }
+  // claude_tmux is claude-in-tmux, not a probeable binary — exclude it from the default sweep.
+  const backends = args.backend ? [args.backend] : ALL_BACKENDS.filter(be => be !== 'claude_tmux');
+  // Probe each backend exactly as the runner launches it — via backendShellArgv, which sources
+  // WORKER_RC so shell-function backends (omp/cmd/pool/opencode) resolve, not just PATH binaries.
+  // A non-zero exit or spawn error means that backend is down. Surface only the failures: backend
+  // names are an implementation detail, so on full health we report nothing identifying.
+  const down = backends.filter(be => {
+    const [cmd, ...probeArgs] = backendShellArgv([be, '--version']);
+    const r = spawnSync(cmd, probeArgs, { stdio: 'ignore', env: workerEnv, timeout: 10_000 });
+    return r.status !== 0 || r.error != null;
   });
-  return lines.join('\n');
+  return down.length === 0 ? 'All workers operational.' : `Not operational: ${down.join(', ')}`;
 }
 
 export function handleList(args: { status?: string; limit?: number }): Record<string, unknown>[] {
@@ -317,7 +321,7 @@ These tools spawn autonomous coding agents that MUTATE a git repo, then run, kil
 resume, and report on them. One task = one running worker.
 
 ## Invariants (always)
-- \`worker_ladder\` is the DEFAULT — always use it; \`worker_run\` only when the user explicitly names a backend.
+- \`worker_ladder\` is the DEFAULT — always use it; \`worker_run\` only when the user explicitly names a specific worker.
 - \`dir\` is REQUIRED on every call — absolute repo path. Server has no cwd; a relative or omitted path won't resolve.
 - git is GROUND TRUTH — read a worker's output with \`git -C <dir> diff\`, never the JSON log for file content.
 - ONE worker PER REPO at a time. Never start a second on a repo already running one (\`worker_ladder\`/\`worker_run\` kills the lingering one for you).
@@ -325,7 +329,7 @@ resume, and report on them. One task = one running worker.
 
 ## Lifecycle
 - Run tools are ASYNC: \`worker_ladder\`/\`worker_run\`/\`worker_resume\` return immediately as \`{ handle, status: "running", lock_path }\`; the agent keeps running in the background.
-- \`worker_ladder\` AUTO-CLIMBS: on failed/timeout/stall it resumes the same backend once then advances to the next backend itself, until one succeeds (\`done\`) or the ladder is \`exhausted\`. No caller action to climb. Its \`lock_path\` spans the whole chain (removed only when the ladder terminates); the returned \`handle\` is the first rung's handle. For completion + results, run the report watcher (see Completion) — it emits the outcome and diff in one bundle.
+- \`worker_ladder\` AUTO-CLIMBS: on failed/timeout/stall it resumes the same worker once then advances to the next worker itself, until one succeeds (\`done\`) or the ladder is \`exhausted\`. No caller action to climb. Its \`lock_path\` spans the whole chain (removed only when the ladder terminates); the returned \`handle\` is the first rung's handle. For completion + results, run the report watcher (see Completion) — it emits the outcome and diff in one bundle.
 
 ## Status model — a job ends in ONE of these
 - \`done\` — completed cleanly.
@@ -333,11 +337,11 @@ resume, and report on them. One task = one running worker.
 - \`timeout\` — hit its deadline or stalled AND had self-declared failure (last log line FAILED) → SIGKILL, terminal. \`worker_resume\` re-attempts fresh from the token.
 - \`stopped\` — hit its deadline or stalled while still ALIVE and not self-failed: the process is FROZEN via SIGSTOP, its lock removed, NOT dead. The default outcome of a non-completing live job — we freeze rather than kill so no work is lost on a guess. Recoverable — \`worker_resume\` thaws it (SIGCONT) and re-arms the timeout, rather than re-running from scratch. Left unresumed past the reap window (\`WORKER_REAP_MS\`, default 15min) it's auto-killed and finalized \`timeout\` so it stops holding memory.
 - \`killed\` — terminated by \`worker_kill\`.
-- \`exhausted\` — \`worker_ladder\` ran out of backends to climb to. Stop and report.
+- \`exhausted\` — \`worker_ladder\` ran out of workers to try. Stop and report.
 
 ## Recovering / continuing a run — worker_resume(handle, prompt, dir)
 - Thaws a \`stopped\` (frozen) worker and lets it finish; or re-attempts a \`failed\`/\`timeout\` one from its saved resume_token.
-- The \`cmd\` backend auto-prepends "a prior attempt already ran — inspect the tree and complete only the remainder," so resume won't redo finished work.
+- On resume the worker is told "a prior attempt already ran — inspect the tree and complete only the remainder," so it won't redo finished work.
 
 ## Completion — run the report watcher (do this instead of polling by hand)
 - Right after a run/ladder call, launch the watcher in the BACKGROUND (non-blocking). It polls the lock and, when the job terminates, prints ONE status-aware bundle to stdout — the same diff you'd otherwise fetch yourself, front-loaded:
@@ -354,7 +358,7 @@ resume, and report on them. One task = one running worker.
 3. Act on line 1 of its output:
    - \`completed\` → reviewer-gate the diff against the spec (mandatory).
    - \`failed\` / \`timeout\` → inspect the diff; \`worker_resume\` to re-attempt, or report.
-   - \`exhausted\` → the ladder already auto-resumed + climbed every backend and none succeeded → report and stop.
+   - \`exhausted\` → the ladder already auto-resumed + tried every worker and none succeeded → report and stop.
    - \`stopped\` → \`worker_resume\` to finish (frozen, work preserved).
    - \`killed\` → stop.
 
@@ -363,7 +367,7 @@ resume, and report on them. One task = one running worker.
 ## Other tools
 - \`worker_kill(handle)\` — terminate a running worker.
 - \`worker_list(status?, limit?)\` — recent jobs.
-- \`worker_doctor(backend?)\` — which backends are installed/on PATH.`;
+- \`worker_doctor(backend?)\` — health check; names only the workers that aren't operational.`;
 
 const server = new McpServer(
   { name: 'worker', version: '0.1.0' },
@@ -371,7 +375,7 @@ const server = new McpServer(
 );
 
 server.tool('worker_ladder',
-  `DEFAULT way to run a coding task: spawns an autonomous agent that mutates the repo, auto-routing omp→opencode→pool→cmd→codex→claude→claude_tmux. Runs the FULL ladder itself — on failed/timeout/stall it resumes once then climbs to the next backend automatically, until one succeeds (done) or the ladder is exhausted. No caller action needed to climb. Async: returns { handle, status:"running", lock_path }; then background-run the report watcher (\`bun ${reportScript} <handle> <lock_path>\`) — its stdout is the outcome line + full git diff (completion signal + result in one). See MCP instructions.`,
+  `DEFAULT way to run a coding task: spawns an autonomous agent that mutates the repo, auto-selecting a capable worker. Runs the FULL ladder itself — on failed/timeout/stall it resumes once then advances to the next worker automatically, until one succeeds (done) or the ladder is exhausted. No caller action needed to climb. Async: returns { handle, status:"running", lock_path }; then background-run the report watcher (\`bun ${reportScript} <handle> <lock_path>\`) — its stdout is the outcome line + full git diff (completion signal + result in one). See MCP instructions.`,
   {
     sid: z.string().describe('Session ID ($CLAUDE_CODE_SESSION_ID)'),
     prompt: z.string().describe('Task spec'),
@@ -382,16 +386,19 @@ server.tool('worker_ladder',
 );
 
 server.tool('worker_run',
-  `Run a coding task on a SPECIFIC backend — only when the user explicitly names one; otherwise use worker_ladder. Spawns an autonomous agent that mutates the repo. Async: returns { handle, status:"running", lock_path }; then background-run the report watcher (\`bun ${reportScript} <handle> <lock_path>\`) for the outcome line + git diff.`,
+  `Run a coding task on a SPECIFIC worker — only when the user explicitly names one; otherwise use worker_ladder. Spawns an autonomous agent that mutates the repo. Async: returns { handle, status:"running", lock_path }; then background-run the report watcher (\`bun ${reportScript} <handle> <lock_path>\`) for the outcome line + git diff.`,
   {
-    backend: z.enum(['pool', 'omp', 'opencode', 'cmd', 'claude', 'claude_tmux', 'codex']),
+    backend: z.string().describe('The specific worker to run (default to worker_ladder unless the user named one).'),
     prompt: z.string(),
-    model: z.string().optional().describe('Model override. IGNORED for claude and omp backends (they pin their own).'),
+    model: z.string().optional().describe('Model override. Ignored by workers that pin their own model.'),
     dir: z.string().describe('Repo directory (absolute path, required)'),
     timeout: z.number().optional().describe('Hard timeout seconds (default 600). On timeout a productively-working job is frozen as `stopped` and is resumable, not killed.'),
-    extraArgs: z.array(z.string()).optional().describe('Raw extra args forwarded verbatim to the backend binary (powerful: can alter permission mode etc.). Omit unless you know the backend CLI.'),
+    extraArgs: z.array(z.string()).optional().describe('Raw extra args forwarded verbatim to the underlying worker (powerful: can alter permission mode etc.). Omit unless you know the worker CLI.'),
   },
-  async ({ backend, ...rest }) => reply(handleRun({ backend: backend as Backend, ...rest }))
+  async ({ backend, ...rest }) => {
+    if (!ALL_BACKENDS.includes(backend as Backend)) return reply(`Unknown worker: ${backend}`);
+    return reply(handleRun({ backend: backend as Backend, ...rest }));
+  }
 );
 
 server.tool('worker_resume',
@@ -401,7 +408,7 @@ server.tool('worker_resume',
     prompt: z.string(),
     dir: z.string().describe('Repo directory (absolute path, required)'),
     timeout: z.number().optional(),
-    extraArgs: z.array(z.string()).optional().describe('Raw extra args forwarded to backend binary (-- passthrough)'),
+    extraArgs: z.array(z.string()).optional().describe('Raw extra args forwarded to the underlying worker (-- passthrough)'),
   },
   async (args) => reply(handleResume(args))
 );
@@ -419,7 +426,7 @@ server.tool('worker_status',
 );
 
 server.tool('worker_doctor',
-  'Check which backends are available.',
+  'Report worker health — names only the workers that are not operational; otherwise confirms all are fine.',
   { backend: z.string().optional() },
   async (args) => reply(handleDoctor(args))
 );

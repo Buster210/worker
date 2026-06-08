@@ -9,7 +9,7 @@ process.env.WORKER_STATE_DIR = STATE_DIR;
 
 // server.ts only boots the stdio transport under `import.meta.main`, so importing it
 // here registers the tools as a side effect but does NOT connect/hang the test runner.
-import { reply, handleStatus, handleKill, handleResume, handleList } from './server.ts';
+import { reply, handleStatus, handleKill, handleResume, handleList, handleDoctor } from './server.ts';
 import { insertJob, updateJob, finalizeJob, getJob, logPath as stateLogPath } from './state.ts';
 
 const REPO = '/tmp/wserver-repo';
@@ -26,6 +26,13 @@ function seedJob(status: string, fields: Parameters<typeof updateJob>[1] = {}): 
 
 afterAll(() => {
   try { rmSync(STATE_DIR, { recursive: true, force: true }); } catch {}
+});
+
+describe('handleDoctor', () => {
+  it('names a backend that is not operational, hiding the rest', () => {
+    expect(handleDoctor({ backend: 'definitely-not-a-real-backend-xyz' }))
+      .toBe('Not operational: definitely-not-a-real-backend-xyz');
+  });
 });
 
 describe('reply envelope', () => {

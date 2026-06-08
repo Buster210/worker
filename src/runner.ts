@@ -230,7 +230,7 @@ export function activitySig(repo: string, logPath: string, lastLog: string): { s
 // argv — BOTH are data the shell expands at runtime, never text interpolated into the script
 // string, so neither can inject code (a WORKER_RC of `$(rm -rf ~)` is sourced as a filename, not
 // evaluated). Empty/missing WORKER_RC sources nothing. $0 honors a shell function of that name.
-function backendShellArgv(argv: string[]): string[] {
+export function backendShellArgv(argv: string[]): string[] {
   const shell = process.env.SHELL ?? '/bin/zsh';
   return [shell, '-c', '[ -n "$WORKER_RC" ] && [ -f "$WORKER_RC" ] && . "$WORKER_RC"; "$0" "$@"', ...argv];
 }
