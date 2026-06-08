@@ -73,7 +73,7 @@ export function removeLock(handle: string, repo?: string) { try { unlinkSync(loc
 function jobPathFn(handle: string, repo?: string): string {
   return join(handleDir(handle, repo), 'job.json');
 }
-export function ladderPath(sid: string)  { return join(workersDir(), 'ladder', `${sid}.jsonl`); }
+function ladderPath(sid: string)  { return join(workersDir(), 'ladder', `${sid}.jsonl`); }
 
 // Chain lock: one stable lock per worker_ladder invocation, held for the WHOLE auto-climb chain
 // (created when the ladder starts, removed only when it terminates — done/exhausted/killed/throw).

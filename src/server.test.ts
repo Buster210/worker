@@ -9,7 +9,7 @@ process.env.WORKER_STATE_DIR = STATE_DIR;
 
 // server.ts only boots the stdio transport under `import.meta.main`, so importing it
 // here registers the tools as a side effect but does NOT connect/hang the test runner.
-import { reply, handleStatus, handleKill, handleWait, handleResume, handleList } from './server.ts';
+import { reply, handleStatus, handleKill, handleResume, handleList } from './server.ts';
 import { insertJob, updateJob, finalizeJob, getJob, logPath as stateLogPath } from './state.ts';
 
 const REPO = '/tmp/wserver-repo';
@@ -62,17 +62,6 @@ describe('handleKill', () => {
     writeFileSync(stateLogPath(handle, REPO), 'FAILED\n'); // resolveStatus → failed
     expect(handleKill({ handle })).toBe(`killed: ${handle} (killed)`); // kill_requested beats failed
     expect(getJob(handle)?.status).toBe('killed');
-  });
-});
-
-describe('handleWait', () => {
-  it('resolves a terminal job to its result with the backend key stripped', async () => {
-    const handle = seedJob('running');
-    finalizeJob(handle, 'done');
-    const r = await handleWait({ handle });
-    expect(r.status).toBe('done');
-    expect(r.handle).toBe(handle);
-    expect('backend' in r).toBe(false);
   });
 });
 

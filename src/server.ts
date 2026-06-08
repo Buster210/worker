@@ -3,11 +3,12 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import { randomUUID } from 'crypto';
 import { readdirSync, readFileSync } from 'fs';
+import { join } from 'path';
 import { spawnSync, execSync } from 'child_process';
 import { insertJob, getJob, updateJob, createLock, workersDir, lockPath, logPath as workerLogPath, finalizeJob, getRunningJobsForRepo, chainLockPath, createChainLock, removeChainLock } from './state.ts';
 import { buildSpec, buildRunArgv, buildResumeArgv, getResumeToken, LADDER, type Backend } from './backends.ts';
 import {
-  runWorker, runClaudeTmux, trackJob, waitJob, sweepStaleJobs, reapStoppedJobs, workerEnv,
+  runWorker, runClaudeTmux, sweepStaleJobs, reapStoppedJobs, workerEnv,
   isProcessAlive, resolveStatus, watchExisting, defaultTimeoutMs, type RunResult,
 } from './runner.ts';
 import { recordLadder } from './ladder.ts';
@@ -52,8 +53,7 @@ function killLingeringJobs(dir: string): void {
 }
 
 // Shared spawn path for worker_ladder and worker_run: kill lingering → insert → buildSpec → spawn.
-// Stays ladder-agnostic — the caller composes the tracked promise (e.g. ladder appends recordLadder)
-// and calls trackJob, so launch() is reusable by both run tools without knowing about ladders.
+// Stays ladder-agnostic — the caller composes the promise (e.g. ladder appends recordLadder).
 function launch(
   backend: Backend,
   prompt: string,
@@ -92,8 +92,8 @@ type LadderResult = { handle: string; status: string; lock_path: string } | { st
 // on a non-`done` terminal, auto-recovers without any caller action — stall/timeout → resume the same
 // backend ONCE (preserving partial work), then climb; hard failure → climb straight to the next rung; until
 // a backend succeeds (`done`) or the ladder is `exhausted`. A `killed` rung stops the chain (operator intent).
-// Returns immediately with the first rung's handle (the stable key for worker_wait, whose tracked promise is
-// the whole chain) and a chain lock_path held for the entire climb (removed only when the chain terminates).
+// Returns immediately with the first rung's handle and a chain lock_path held for the entire climb
+// (removed only when the chain terminates). Completion is signaled by the lock_path clearing.
 export function handleLadder(args: { sid: string; prompt: string; dir: string; timeout?: number }): LadderResult {
   assertRepo(args.dir);
   const { sid, prompt, dir } = args;
@@ -102,7 +102,7 @@ export function handleLadder(args: { sid: string; prompt: string; dir: string; t
   if (LADDER.length === 0) return { status: 'exhausted', worker: null, note: 'no backends available' };
 
   createChainLock(sid);
-  // Launch the first rung now so its handle is the stable wait key returned to the caller.
+  // Launch the first rung now so its handle is the stable key returned to the caller.
   const timeoutSec = args.timeout;
   const first = launch(LADDER[0], prompt, dir, { sid, timeoutMs });
   const drivers: LadderDrivers = {
@@ -117,7 +117,7 @@ export function handleLadder(args: { sid: string; prompt: string; dir: string; t
     }))
     .finally(() => removeChainLock(sid));
 
-  trackJob(first.handle, chainPromise);
+  void chainPromise;
   return { handle: first.handle, status: 'running', lock_path: chainLockPath(sid) };
 }
 
@@ -165,7 +165,7 @@ export function handleRun(args: { backend: Backend; prompt: string; model?: stri
   const sid = randomUUID();
   const { handle, lock_path, promise } = launch(args.backend, args.prompt, args.dir,
     { sid, model: args.model, extraArgs: args.extraArgs, timeoutMs: args.timeout ? args.timeout * 1000 : undefined });
-  trackJob(handle, promise);
+  void promise.catch(() => {});
   return { handle, status: 'running', lock_path };
 }
 
@@ -219,7 +219,7 @@ function resumeLaunch(args: { handle: string; prompt: string; dir: string; timeo
 
 export function handleResume(args: { handle: string; prompt: string; dir: string; timeout?: number; extraArgs?: string[] }): { handle: string; status: string; lock_path: string } {
   const { handle, promise } = resumeLaunch(args);
-  trackJob(handle, promise);
+  void promise.catch(() => {});
   return { handle, status: 'running', lock_path: lockPath(handle) };
 }
 
@@ -282,20 +282,6 @@ export function handleDoctor(args: { backend?: string }): string {
   return lines.join('\n');
 }
 
-export async function handleWait(args: { handle: string; timeout?: number }): Promise<Record<string, unknown>> {
-  const { handle, timeout } = args;
-  const waitPromise = waitJob(handle);
-  let result: any;
-  if (timeout) {
-    const timer = new Promise<never>((_, rej) => setTimeout(() => rej(new Error('wait timeout')), timeout * 1000));
-    result = await Promise.race([waitPromise, timer]);
-  } else {
-    result = await waitPromise;
-  }
-  const { backend: _b, ...safe } = result as any;
-  return safe;
-}
-
 export function handleList(args: { status?: string; limit?: number }): Record<string, unknown>[] {
   const { status, limit = 20 } = args;
   const root = workersDir();
@@ -318,6 +304,10 @@ export function handleList(args: { status?: string; limit?: number }): Record<st
     .map(({ backend: _b, ...j }) => j);
 }
 
+// Absolute path to the completion watcher, resolved at load so the shipped instructions carry a
+// runnable command regardless of where the server is installed.
+const reportScript = join(import.meta.dir, 'report.ts');
+
 // Orchestration contract shipped to every client on connect (MCP `initialize`
 // `instructions`). Folds in the former client-side worker-control skill so a bare
 // `add this MCP` is self-sufficient — no skill install required.
@@ -334,8 +324,8 @@ resume, and report on them. One task = one running worker.
 - \`sid\` = the caller's session id (e.g. \$CLAUDE_CODE_SESSION_ID); it keys the ladder.
 
 ## Lifecycle
-- Run tools are ASYNC: \`worker_ladder\`/\`worker_run\`/\`worker_resume\` return immediately as \`{ handle, status: "running", lock_path }\`; the agent keeps running in the background — poll/wait for the final status.
-- \`worker_ladder\` AUTO-CLIMBS: on failed/timeout/stall it resumes the same backend once then advances to the next backend itself, until one succeeds (\`done\`) or the ladder is \`exhausted\`. No caller action to climb. Its \`lock_path\` spans the whole chain (removed only when the ladder terminates); the returned \`handle\` is the wait key — \`worker_wait(handle)\` resolves with the winning backend's result.
+- Run tools are ASYNC: \`worker_ladder\`/\`worker_run\`/\`worker_resume\` return immediately as \`{ handle, status: "running", lock_path }\`; the agent keeps running in the background.
+- \`worker_ladder\` AUTO-CLIMBS: on failed/timeout/stall it resumes the same backend once then advances to the next backend itself, until one succeeds (\`done\`) or the ladder is \`exhausted\`. No caller action to climb. Its \`lock_path\` spans the whole chain (removed only when the ladder terminates); the returned \`handle\` is the first rung's handle. For completion + results, run the report watcher (see Completion) — it emits the outcome and diff in one bundle.
 
 ## Status model — a job ends in ONE of these
 - \`done\` — completed cleanly.
@@ -349,18 +339,26 @@ resume, and report on them. One task = one running worker.
 - Thaws a \`stopped\` (frozen) worker and lets it finish; or re-attempts a \`failed\`/\`timeout\` one from its saved resume_token.
 - The \`cmd\` backend auto-prepends "a prior attempt already ran — inspect the tree and complete only the remainder," so resume won't redo finished work.
 
-## Wait for completion
-- PREFER bash lock-poll — do NOT block on \`worker_wait\`. The run returns \`lock_path\`; it exists while the worker runs and is REMOVED when done. Fire a background bash poller right after the run call — its exit IS the completion signal:
-    LOCK="<lock_path>"; while [ -f "\$LOCK" ]; do sleep 10; done
-- \`worker_wait(handle)\` is a blocking fallback only.
+## Completion — run the report watcher (do this instead of polling by hand)
+- Right after a run/ladder call, launch the watcher in the BACKGROUND (non-blocking). It polls the lock and, when the job terminates, prints ONE status-aware bundle to stdout — the same diff you'd otherwise fetch yourself, front-loaded:
+    bun ${reportScript} <handle> '<lock_path>'   # single-quote it: lock_path may contain a literal \$sid that an unquoted shell would expand to the wrong path → false \`exhausted\`
+- Its stdout IS both the completion signal and the result:
+    line 1 = outcome — one of: completed · failed[:reason] · timeout · exhausted · stopped · killed
+    completed / failed / timeout / exhausted → blank line, then the full \`git diff\`
+    stopped / killed → just the one line (no diff)
+- Do NOT also run \`git diff\` / \`worker_status\` — the bundle already carries what you need.
 
 ## Drive loop
 1. \`worker_ladder(sid, prompt, dir)\` → \`{ handle, lock_path }\` (returns at once).
-2. Background bash-poll \`lock_path\` (do NOT block on \`worker_wait\`); lock removed = task complete.
-3. On completion run \`git -C <dir> diff\` (+ \`worker_wait(handle)\` for the final status) and evaluate the work against the spec.
-4. Reviewer gate (mandatory): PASS → done · status \`exhausted\` (the ladder already auto-resumed + climbed every backend and none succeeded) → report and stop.
+2. Background-run the report watcher with that \`handle\` + \`lock_path\` (see Completion).
+3. Act on line 1 of its output:
+   - \`completed\` → reviewer-gate the diff against the spec (mandatory).
+   - \`failed\` / \`timeout\` → inspect the diff; \`worker_resume\` to re-attempt, or report.
+   - \`exhausted\` → the ladder already auto-resumed + climbed every backend and none succeeded → report and stop.
+   - \`stopped\` → \`worker_resume\` to finish (frozen, work preserved).
+   - \`killed\` → stop.
 
-\`worker_status\` is for mid-flight diagnostics only — never the completion signal; the diff is ground truth.
+\`worker_status\` is for mid-flight diagnostics only — never the completion signal; the report watcher's bundle (built from git) is ground truth.
 
 ## Other tools
 - \`worker_kill(handle)\` — terminate a running worker.
@@ -373,7 +371,7 @@ const server = new McpServer(
 );
 
 server.tool('worker_ladder',
-  'DEFAULT way to run a coding task: spawns an autonomous agent that mutates the repo, auto-routing omp→opencode→pool→cmd→claude→claude_tmux. Runs the FULL ladder itself — on failed/timeout/stall it resumes once then climbs to the next backend automatically, until one succeeds (done) or the ladder is exhausted. No caller action needed to climb. Async: returns { handle, status:"running", lock_path }; do NOT block on worker_wait — background bash-poll lock_path (removed = the whole ladder finished), then read results with `git -C <dir> diff` and worker_wait for the final status.',
+  `DEFAULT way to run a coding task: spawns an autonomous agent that mutates the repo, auto-routing omp→opencode→pool→cmd→claude→claude_tmux. Runs the FULL ladder itself — on failed/timeout/stall it resumes once then climbs to the next backend automatically, until one succeeds (done) or the ladder is exhausted. No caller action needed to climb. Async: returns { handle, status:"running", lock_path }; then background-run the report watcher (\`bun ${reportScript} <handle> <lock_path>\`) — its stdout is the outcome line + full git diff (completion signal + result in one). See MCP instructions.`,
   {
     sid: z.string().describe('Session ID ($CLAUDE_CODE_SESSION_ID)'),
     prompt: z.string().describe('Task spec'),
@@ -384,7 +382,7 @@ server.tool('worker_ladder',
 );
 
 server.tool('worker_run',
-  'Run a coding task on a SPECIFIC backend — only when the user explicitly names one; otherwise use worker_ladder. Spawns an autonomous agent that mutates the repo. Async: returns { handle, status:"running", lock_path }; read results via `git -C <dir> diff`.',
+  `Run a coding task on a SPECIFIC backend — only when the user explicitly names one; otherwise use worker_ladder. Spawns an autonomous agent that mutates the repo. Async: returns { handle, status:"running", lock_path }; then background-run the report watcher (\`bun ${reportScript} <handle> <lock_path>\`) for the outcome line + git diff.`,
   {
     backend: z.enum(['pool', 'omp', 'opencode', 'cmd', 'claude', 'claude_tmux']),
     prompt: z.string(),
@@ -426,14 +424,6 @@ server.tool('worker_doctor',
   async (args) => reply(handleDoctor(args))
 );
 
-server.tool('worker_wait',
-  'Wait for a background worker job to complete and return its final result. Call after worker_ladder/worker_run.',
-  {
-    handle: z.string().describe('Worker handle returned by worker_ladder or worker_run'),
-    timeout: z.number().optional().describe('Max seconds to wait (default: no limit)'),
-  },
-  async (args) => reply(await handleWait(args))
-);
 
 server.tool('worker_list',
   'List recent worker jobs. Optionally filter by status.',

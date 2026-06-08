@@ -4,41 +4,6 @@ import { updateJob, getJob, getAllRunningJobs, getAllStoppedJobs, removeLock, lo
 import type { Backend } from './backends.ts';
 import type { Job } from './state.ts';
 
-// In-process job registry — survives for the lifetime of this MCP server process.
-// If the server restarts mid-job, waitJob falls back to PID polling + log-based status.
-const runningJobs = new Map<string, Promise<RunResult>>();
-export function trackJob(handle: string, p: Promise<RunResult>) {
-  runningJobs.set(handle, p.finally(() => runningJobs.delete(handle)));
-}
-export async function waitJob(handle: string): Promise<RunResult> {
-  const p = runningJobs.get(handle);
-  if (p) return p;
-  // Fallback: server restarted — poll PID liveness, derive status from log when dead
-  while (true) {
-    const job = getJob(handle);
-    if (!job) throw new Error(`No job: ${handle}`);
-    if (job.status !== 'running' && job.status !== 'stopped') return jobToResult(job);
-    // For stopped jobs: if process is alive (frozen), return immediately
-    if (job.status === 'stopped') {
-      if (isProcessAlive(job.worker_pid, job.started)) {
-        return jobToResult(job);
-      }
-      // Process is dead, derive status from log
-      const status = resolveStatus(job.backend, 0, job.log_path, false);
-      const completedJob = { ...job, status };
-      return jobToResult(completedJob);
-    }
-    // For running jobs
-    let alive = false;
-    if (job.worker_pid) { alive = isProcessAlive(job.worker_pid, job.started); }
-    if (!alive) {
-      const status = finalizeJob(handle, resolveStatus(job.backend, 0, job.log_path, false));
-      return jobToResult({...job, status});
-    }
-    await Bun.sleep(2_000);
-  }
-}
-
 // On startup: mark any jobs still showing 'running' whose PIDs are dead as failed.
 // Prevents stale state after a server restart mid-job.
 // Timing knobs resolve from env at call time (defaults = production behavior), so tests
@@ -87,18 +52,6 @@ export type RunResult = {
   log: string;
 };
 
-export function jobToResult(job: Job): RunResult {
-  return {
-    status: job.status,
-    exit_code: 0,
-    backend: job.backend,
-    handle: job.handle,
-    resume_token: job.resume_token,
-    repo: job.repo,
-    shortstat: '',
-    log: job.log_path,
-  };
-}
 
 function shortstat(repo: string): string {
   try {
