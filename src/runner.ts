@@ -1,6 +1,6 @@
 import { spawn, spawnSync, execSync } from 'child_process';
 import { createWriteStream, statSync, mkdirSync, writeFileSync, readFileSync, unlinkSync, realpathSync, existsSync, copyFileSync, renameSync } from 'fs';
-import { updateJob, getJob, getAllRunningJobs, removeLock, logPath as workerLogPath, workersDir, finalizeJob } from './state.ts';
+import { updateJob, getJob, getAllRunningJobs, getAllStoppedJobs, removeLock, logPath as workerLogPath, workersDir, finalizeJob } from './state.ts';
 import type { Backend } from './backends.ts';
 import type { Job } from './state.ts';
 
@@ -49,8 +49,12 @@ function envMs(key: string, def: number): number {
 }
 export function defaultTimeoutMs(): number { return envMs('WORKER_TIMEOUT_MS', 600_000); }
 function pollIntervalMs(): number { return envMs('WORKER_POLL_MS', 5_000); }
-function logFreshnessMs(): number { return envMs('WORKER_LOG_FRESH_MS', 30_000); }
+// Resume watcher polls tighter than the main watchdog: a resumed job is already in flight, so a
+// quicker exit-detection cadence (matching the pre-extraction inline loop) keeps finalization snappy.
+function resumePollIntervalMs(): number { return envMs('WORKER_RESUME_POLL_MS', 1_000); }
 function stallTimeoutMs(): number { return envMs('WORKER_STALL_MS', 120_000); }
+// A 'stopped' (frozen) job nobody resumed is reaped past this age so it stops holding RAM.
+function reapAgeMs(): number { return envMs('WORKER_REAP_MS', 900_000); }
 
 // Augmented PATH so backends are findable (MCP server env is stripped)
 const HOME = process.env.HOME ?? '';
@@ -130,15 +134,6 @@ export { resolveStatus };
 
 export function sweepStaleJobs() {
   for (const job of getAllRunningJobs()) {
-    // Handle orphaned stopped jobs: frozen pid reparented to init can't be reattached
-    if (job.status === 'stopped') {
-      if (!isProcessAlive(job.worker_pid, job.started)) {
-        finalizeJob(job.handle, 'failed:server-restart');
-        continue;
-      }
-      continue;
-    }
-    
     let alive = false;
     if (job.worker_pid) { alive = isProcessAlive(job.worker_pid, job.started); }
     if (!alive) {
@@ -148,27 +143,49 @@ export function sweepStaleJobs() {
   }
 }
 
+/**
+ * Reclaim 'stopped' (frozen) jobs nobody resumed. Two reclaim causes, both terminal and both
+ * keeping their resume_token (worker_resume still re-attempts from scratch):
+ *  - dead frozen pid → the server bounced and the SIGSTOP'd group is gone: finalize now.
+ *  - alive but frozen past the reap window → abandoned, holding RAM at zero CPU: SIGKILL + finalize.
+ * Fresh freezes (within the window, still resumable) are left untouched.
+ */
+export function reapStoppedJobs() {
+  const now = Date.now();
+  const maxAgeMs = reapAgeMs();
+  for (const job of getAllStoppedJobs()) {
+    // 'stopped' implies a SIGSTOP'd pid; a 0/absent pid is anomalous and unkillable —
+    // process.kill(-0) would signal our OWN group — so skip it rather than act on a guess.
+    if (!job.worker_pid) continue;
+    if (!isProcessAlive(job.worker_pid, job.started)) {
+      finalizeJob(job.handle, 'failed:server-restart');
+      continue;
+    }
+    const stoppedAt = Date.parse(job.stopped_at ?? '');
+    // Missing/unparseable stopped_at → don't assume stale and kill a live job; leave it.
+    if (!Number.isFinite(stoppedAt) || now - stoppedAt < maxAgeMs) continue;
+    // Re-read in the same synchronous tick: guards a status flip (e.g. a concurrent resume that
+    // thawed it back to 'running') between the disk snapshot above and the kill below.
+    if (getJob(job.handle)?.status !== 'stopped') continue;
+    killGroup(job.worker_pid, 'SIGKILL');
+    setTimeout(() => killGroup(job.worker_pid, 'SIGKILL'), 5_000).unref?.();
+    finalizeJob(job.handle, 'timeout');
+  }
+}
+
 function killGroup(pid: number, sig: 'SIGTERM' | 'SIGKILL' | 'SIGSTOP' = 'SIGTERM') {
   try { process.kill(-pid, sig); } catch {}
 }
 
-function getLogMtime(logPath: string): number {
-  try {
-    return statSync(logPath).mtimeMs;
-  } catch {
-    return 0;
-  }
-}
-
 /**
- * After SIGSTOP, decide whether a timed-out job was still productively working.
- * Productive (log mtime fresh AND last line not FAILED) → mark 'stopped', remove lock,
- * leave the process frozen for SIGCONT resume → returns true.
- * Otherwise → SIGKILL the group, terminal → returns false.
- * Caller must have already SIGSTOP'd the group.
+ * After SIGSTOP, decide a suspended (deadline- or stall-hit) job's fate. The watch loop only
+ * suspends a process it just saw alive, so default to FREEZING it as 'stopped' — recoverable via
+ * SIGCONT, no work discarded on a guess (we can't tell "slow but working" from "hung" by log/git,
+ * and for the sole worker a false kill is the expensive failure). The lone terminal case is a
+ * self-declared failure: a FAILED last log line → SIGKILL so resume re-attempts fresh from the
+ * token rather than thawing a corpse. Caller must have already SIGSTOP'd the group.
  */
 function evalAfterStop(handle: string, pid: number, logPath: string): boolean {
-  const isMakingProgress = (Date.now() - getLogMtime(logPath)) < logFreshnessMs();
   let lastLine = '';
   let isFailed = false;
   try {
@@ -177,7 +194,7 @@ function evalAfterStop(handle: string, pid: number, logPath: string): boolean {
     isFailed = /^FAILED(:|$|\s)/.test(lastLine);
   } catch {}
 
-  if (isMakingProgress && !isFailed) {
+  if (!isFailed) {
     updateJob(handle, { status: 'stopped', stopped_at: new Date().toISOString(), last_line: lastLine });
     removeLock(handle);
     return true;
@@ -421,7 +438,7 @@ export function watchExisting(
       lastLog = log;
       if (sig !== lastSig) { lastSig = sig; lastSigChange = Date.now(); }
       else if (Date.now() - lastSigChange >= stallTimeoutMs()) { suspend(); return; }
-      setTimeout(check, pollIntervalMs());
+      setTimeout(check, resumePollIntervalMs());
     };
     check();
   });

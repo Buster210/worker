@@ -75,6 +75,13 @@ function jobPathFn(handle: string, repo?: string): string {
 }
 export function ladderPath(sid: string)  { return join(workersDir(), 'ladder', `${sid}.jsonl`); }
 
+// Chain lock: one stable lock per worker_ladder invocation, held for the WHOLE auto-climb chain
+// (created when the ladder starts, removed only when it terminates — done/exhausted/killed/throw).
+// Distinct from per-rung handle locks so a rung's finalizeJob never clears the chain-level signal.
+export function chainLockPath(sid: string) { return join(workersDir(), 'ladder', `${sid}.chain.lock`); }
+export function createChainLock(sid: string) { try { writeFileSync(chainLockPath(sid), ''); } catch {} }
+export function removeChainLock(sid: string) { try { unlinkSync(chainLockPath(sid)); } catch {} }
+
 export type Job = {
   handle: string; backend: string; sid: string;
   worker_pid: number; resume_token: string; repo: string; started: string;
@@ -127,7 +134,8 @@ export function finalizeJob(handle: string, naturalStatus: string, extra?: Parti
   return final;
 }
 
-export function getAllRunningJobs(): Job[] {
+// Two-level walk (<root>/<project>/<handle>/job.json) shared by the status-scoped scanners below.
+function scanAllJobs(): Job[] {
   try {
     const root = workersDir();
     return readdirSync(root, { withFileTypes: true })
@@ -139,9 +147,12 @@ export function getAllRunningJobs(): Job[] {
             .map(h => { try { return JSON.parse(readFileSync(join(root, d.name, h.name, 'job.json'), 'utf8')); } catch { return null; } });
         } catch { return []; }
       })
-      .filter((j): j is Job => j?.status === 'running');
+      .filter((j): j is Job => j != null);
   } catch { return []; }
 }
+
+export function getAllRunningJobs(): Job[] { return scanAllJobs().filter(j => j.status === 'running'); }
+export function getAllStoppedJobs(): Job[] { return scanAllJobs().filter(j => j.status === 'stopped'); }
 
 export function getRunningJobsForRepo(repo: string): Job[] {
   const project = projectName(repo);

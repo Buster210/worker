@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach, afterAll } from 'bun:test';
+import { describe, it, expect, beforeAll, afterEach, afterAll } from 'bun:test';
 import { spawn, spawnSync } from 'child_process';
 import { writeFileSync, rmSync, mkdtempSync, openSync } from 'fs';
 import { join } from 'path';
@@ -11,7 +11,7 @@ process.env.WORKER_STATE_DIR = STATE_DIR;
 // Hermetic: empty WORKER_RC so the backend shell sources no host rc (fakeScripts need no env/keys).
 process.env.WORKER_RC = '';
 
-import { runWorker, watchExisting, isProcessAlive, parseEtimeSeconds, activitySig } from './runner.ts';
+import { runWorker, watchExisting, isProcessAlive, parseEtimeSeconds, activitySig, reapStoppedJobs } from './runner.ts';
 import { insertJob, getJob, updateJob, logPath as stateLogPath } from './state.ts';
 
 // Real subprocess fakes: a short bash script we spawn for real, so the tests exercise
@@ -47,7 +47,7 @@ function spawnDetached(body: string, lp: string): number {
 }
 
 afterEach(() => {
-  for (const k of ['WORKER_POLL_MS', 'WORKER_LOG_FRESH_MS', 'WORKER_STALL_MS', 'WORKER_TIMEOUT_MS']) {
+  for (const k of ['WORKER_POLL_MS', 'WORKER_RESUME_POLL_MS', 'WORKER_STALL_MS', 'WORKER_TIMEOUT_MS', 'WORKER_REAP_MS']) {
     delete process.env[k];
   }
 });
@@ -85,12 +85,24 @@ describe('runWorker lifecycle (real subprocess)', () => {
     expect(r.status).toBe('failed:boom');
   });
 
-  it('resolves "timeout" when a silent worker blows the deadline without progress', async () => {
-    const handle = `timeout-${seq}`;
+  it('freezes a quiet but alive worker to "stopped" when it blows the deadline (no false kill)', async () => {
+    const handle = `dl-quiet-${seq}`;
     const lp = seedJob(handle);
     process.env.WORKER_POLL_MS = '100';
-    process.env.WORKER_LOG_FRESH_MS = '10'; // log goes stale fast → not productive → killed, not frozen
+    // Silent + alive + not self-failed → frozen for recovery, not killed (the B-wide contract).
     const r = await runWorker(fakeScript('sleep 20'), REPO, handle, 'cmd', lp, '', 800);
+    expect(r.status).toBe('stopped');
+    expect(getJob(handle)?.status).toBe('stopped');
+    const pid = getJob(handle)?.worker_pid;
+    if (pid) frozenPids.push(pid);
+  });
+
+  it('kills a self-failed worker that lingers past the deadline to "timeout"', async () => {
+    const handle = `dl-failed-${seq}`;
+    const lp = seedJob(handle);
+    process.env.WORKER_POLL_MS = '100';
+    // Declared FAILED but still alive at the deadline → terminal SIGKILL, not a frozen corpse.
+    const r = await runWorker(fakeScript('echo; echo FAILED; sleep 20'), REPO, handle, 'cmd', lp, '', 800);
     expect(r.status).toBe('timeout');
     expect(r.exit_code).toBe(124);
   });
@@ -98,7 +110,7 @@ describe('runWorker lifecycle (real subprocess)', () => {
   it('resolves "stopped" (frozen, resumable) when a productive worker blows the deadline', async () => {
     const handle = `stopped-${seq}`;
     const lp = seedJob(handle);
-    process.env.WORKER_POLL_MS = '100'; // WORKER_LOG_FRESH_MS left at default → log stays fresh
+    process.env.WORKER_POLL_MS = '100';
     const r = await runWorker(fakeScript('while true; do echo working; sleep 0.1; done'), REPO, handle, 'cmd', lp, '', 800);
     expect(r.status).toBe('stopped');
     expect(getJob(handle)?.status).toBe('stopped');
@@ -120,7 +132,7 @@ describe('watchExisting (resume watcher, real process)', () => {
   it('finalizes from the log when the re-attached process exits on its own', async () => {
     const handle = `we-done-${seq}`;
     const lp = seedJob(handle);
-    process.env.WORKER_POLL_MS = '50';
+    process.env.WORKER_RESUME_POLL_MS = '50';
     const pid = spawnDetached('echo; echo DONE', lp);
     updateJob(handle, { worker_pid: pid });
     await Bun.sleep(150); // resume attaches to an already-running process, not a just-spawned pid
@@ -132,7 +144,7 @@ describe('watchExisting (resume watcher, real process)', () => {
   it('freezes to "stopped" when the re-armed deadline fires on a still-productive process', async () => {
     const handle = `we-stopped-${seq}`;
     const lp = seedJob(handle);
-    process.env.WORKER_POLL_MS = '50'; // WORKER_LOG_FRESH_MS at default → log stays fresh → productive
+    process.env.WORKER_RESUME_POLL_MS = '50';
     const pid = spawnDetached('while true; do echo working; sleep 0.1; done', lp);
     updateJob(handle, { worker_pid: pid });
     await Bun.sleep(150); // let the process come up so the watcher attaches to a live pid (as on real resume)
@@ -142,12 +154,13 @@ describe('watchExisting (resume watcher, real process)', () => {
     frozenPids.push(pid); // SIGSTOP'd by suspendAndEval — afterAll reaps it
   });
 
-  it('freezes to "stopped" on a stall (no new activity) well before the deadline', async () => {
+  it('freezes a stalled but alive worker to "stopped", regardless of log staleness', async () => {
+    // Under B-wide a stall no longer kills: the process is alive and never self-failed, so a stale
+    // log (it emitted once, then went silent past the stall window) freezes for recovery, not death.
     const handle = `we-stall-${seq}`;
     const lp = seedJob(handle);
-    process.env.WORKER_POLL_MS = '50';
-    process.env.WORKER_STALL_MS = '200';       // stall trips after 200ms of an unchanged activity sig
-    process.env.WORKER_LOG_FRESH_MS = '10000'; // log still counts as fresh at suspend → productive → stopped, not killed
+    process.env.WORKER_RESUME_POLL_MS = '50';
+    process.env.WORKER_STALL_MS = '200'; // stall trips after 200ms of an unchanged activity sig
     const pid = spawnDetached('echo working; sleep 100', lp); // emits once, then goes silent
     updateJob(handle, { worker_pid: pid });
     await Bun.sleep(150);
@@ -158,16 +171,14 @@ describe('watchExisting (resume watcher, real process)', () => {
     frozenPids.push(pid);
   });
 
-  it('kills a stalled job to "timeout" when the log has also gone stale (production ordering)', async () => {
-    // Production default has WORKER_STALL_MS (120s) > WORKER_LOG_FRESH_MS (30s): by the time the
-    // sig has been unchanged long enough to count as a stall, the log is also stale → evalAfterStop
-    // judges it NOT productive → SIGKILL + terminal. This is the realistic outcome of a true hang.
-    const handle = `we-stall-kill-${seq}`;
+  it('kills a stalled job to "timeout" only when it has self-declared FAILED', async () => {
+    // The lone terminal stall case: the worker printed FAILED then hung. Alive but self-failed →
+    // SIGKILL + terminal, so resume re-attempts fresh rather than thawing a corpse.
+    const handle = `we-stall-failed-${seq}`;
     const lp = seedJob(handle);
-    process.env.WORKER_POLL_MS = '50';
+    process.env.WORKER_RESUME_POLL_MS = '50';
     process.env.WORKER_STALL_MS = '200';
-    process.env.WORKER_LOG_FRESH_MS = '50'; // fresh window < stall window → stale at suspend → killed
-    const pid = spawnDetached('echo working; sleep 100', lp);
+    const pid = spawnDetached('echo; echo FAILED; sleep 100', lp);
     updateJob(handle, { worker_pid: pid });
     await Bun.sleep(150);
     const r = await watchExisting(handle, pid, REPO, lp, 'cmd', 10_000);
@@ -210,6 +221,53 @@ describe('parseEtimeSeconds', () => {
     expect(parseEtimeSeconds('  03:04  ')).toBe(184);    // surrounding whitespace from `ps -o etime=`
     expect(parseEtimeSeconds('garbage')).toBeNull();
     expect(parseEtimeSeconds('')).toBeNull();
+  });
+});
+
+describe('reapStoppedJobs (stale frozen-job reaper)', () => {
+  // Isolated state dir: reapStoppedJobs scans the WHOLE store, so without this the reaper would
+  // also reclaim frozen leftovers from earlier tests — making these cases order/timing dependent.
+  const REAP_DIR = join(tmpdir(), `wrunner-reap-${process.pid}`);
+  let prevStateDir: string;
+  beforeAll(() => { prevStateDir = process.env.WORKER_STATE_DIR!; process.env.WORKER_STATE_DIR = REAP_DIR; });
+  afterAll(() => {
+    process.env.WORKER_STATE_DIR = prevStateDir;
+    try { rmSync(REAP_DIR, { recursive: true, force: true }); } catch {}
+  });
+
+  it('kills an alive frozen job past the reap window and finalizes it "timeout"', async () => {
+    const handle = `reap-old-${seq}`;
+    const lp = seedJob(handle);
+    const pid = spawnDetached('sleep 100', lp);
+    // Frozen long ago (stopped_at well past the 100ms window below), still alive → reclaim.
+    updateJob(handle, { status: 'stopped', worker_pid: pid, stopped_at: '2020-01-01T00:00:00.000Z' });
+    process.env.WORKER_REAP_MS = '100';
+    reapStoppedJobs();
+    expect(getJob(handle)?.status).toBe('timeout');
+    await Bun.sleep(100);
+    expect(isProcessAlive(pid)).toBe(false); // SIGKILLed by the reaper
+    frozenPids.push(pid);
+  });
+
+  it('leaves a freshly frozen job (within the window) untouched', () => {
+    const handle = `reap-fresh-${seq}`;
+    const lp = seedJob(handle);
+    const pid = spawnDetached('sleep 100', lp);
+    updateJob(handle, { status: 'stopped', worker_pid: pid, stopped_at: new Date().toISOString() });
+    // Default 15-min window → a seconds-old freeze is nowhere near stale.
+    reapStoppedJobs();
+    expect(getJob(handle)?.status).toBe('stopped');
+    expect(isProcessAlive(pid)).toBe(true);
+    frozenPids.push(pid);
+  });
+
+  it('finalizes a frozen job whose pid is already dead as "failed:server-restart"', () => {
+    const handle = `reap-dead-${seq}`;
+    seedJob(handle);
+    const dead = spawnSync('true'); // exits immediately → pid is dead by the time we reap
+    updateJob(handle, { status: 'stopped', worker_pid: dead.pid ?? 999999, stopped_at: new Date().toISOString() });
+    reapStoppedJobs();
+    expect(getJob(handle)?.status).toBe('failed:server-restart');
   });
 });
 
