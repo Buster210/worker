@@ -1,7 +1,8 @@
 import { spawn, spawnSync, execSync } from 'child_process';
 import { createWriteStream, statSync, mkdirSync, writeFileSync, readFileSync, unlinkSync, realpathSync, existsSync, copyFileSync, renameSync } from 'fs';
 import { updateJob, getJob, getAllRunningJobs, getAllStoppedJobs, removeLock, logPath as workerLogPath, workersDir, finalizeJob } from './state.ts';
-import type { Backend } from './backends.ts';
+import { emitsJsonLog, type Backend } from './backends.ts';
+import { readSentinel } from './logParse.ts';
 import type { Job } from './state.ts';
 
 // On startup: mark any jobs still showing 'running' whose PIDs are dead as failed.
@@ -20,7 +21,6 @@ function resumePollIntervalMs(): number { return envMs('WORKER_RESUME_POLL_MS', 
 function stallTimeoutMs(): number { return envMs('WORKER_STALL_MS', 120_000); }
 // A 'stopped' (frozen) job nobody resumed is reaped past this age so it stops holding RAM.
 function reapAgeMs(): number { return envMs('WORKER_REAP_MS', 900_000); }
-
 // Augmented PATH so backends are findable (MCP server env is stripped)
 const HOME = process.env.HOME ?? '';
 export const workerEnv: NodeJS.ProcessEnv = {
@@ -66,18 +66,8 @@ function shortstat(repo: string): string {
 
 function resolveStatus(backend: string, rc: number, logPath: string, timedOut: boolean): string {
   if (timedOut) return 'timeout';
-  try {
-    const lines = readFileSync(logPath, 'utf8').trim().split('\n').filter(Boolean);
-    const recent = lines.slice(-10);
-    for (let i = recent.length - 1; i >= 0; i--) {
-      const line = recent[i];
-      if (/^DONE(\s|$)/.test(line)) return 'done';
-      if (/^FAILED(:|$|\s)/.test(line)) {
-        const reason = line.replace(/^FAILED:?\s*/, '').trim();
-        return reason ? `failed:${reason}` : 'failed';
-      }
-    }
-  } catch {}
+  const { status } = readSentinel(logPath, emitsJsonLog(backend));
+  if (status) return status;
   if (backend === 'cmd') return rc === 0 ? 'done' : rc === 8 ? 'failed:max-turns' : 'failed';
   if (backend === 'pool') return rc === 0 ? 'done' : rc === 4 ? 'failed:task' : 'failed';
   return rc === 0 ? 'done' : 'failed';
@@ -138,14 +128,10 @@ function killGroup(pid: number, sig: 'SIGTERM' | 'SIGKILL' | 'SIGSTOP' = 'SIGTER
  * self-declared failure: a FAILED last log line → SIGKILL so resume re-attempts fresh from the
  * token rather than thawing a corpse. Caller must have already SIGSTOP'd the group.
  */
-function evalAfterStop(handle: string, pid: number, logPath: string): boolean {
-  let lastLine = '';
-  let isFailed = false;
-  try {
-    const lines = readFileSync(logPath, 'utf8').trim().split('\n').filter(Boolean);
-    lastLine = lines[lines.length - 1] ?? '';
-    isFailed = /^FAILED(:|$|\s)/.test(lastLine);
-  } catch {}
+function evalAfterStop(handle: string, pid: number, logPath: string, backend: string): boolean {
+  const { status, lastText } = readSentinel(logPath, emitsJsonLog(backend));
+  const isFailed = status !== null && status.startsWith('failed');
+  const lastLine = lastText.length > 500 ? lastText.slice(0, 500) : lastText;
 
   if (!isFailed) {
     updateJob(handle, { status: 'stopped', stopped_at: new Date().toISOString(), last_line: lastLine });
@@ -158,9 +144,9 @@ function evalAfterStop(handle: string, pid: number, logPath: string): boolean {
 }
 
 /** SIGSTOP the group then evaluate — used by the resume path when a re-armed timeout fires. */
-export function suspendAndEval(handle: string, pid: number, logPath: string): boolean {
+export function suspendAndEval(handle: string, pid: number, logPath: string, backend: string): boolean {
   killGroup(pid, 'SIGSTOP');
-  return evalAfterStop(handle, pid, logPath);
+  return evalAfterStop(handle, pid, logPath, backend);
 }
 
 // ps `etime` = elapsed time since start, format [[dd-]hh:]mm:ss → seconds.
@@ -285,7 +271,7 @@ export function launchAndWait(
 
         setTimeout(() => {
           if (settled) return;
-          stopped = evalAfterStop(handle, proc.pid!, logPath);
+          stopped = evalAfterStop(handle, proc.pid!, logPath, backend);
           finish(124, true, stopped);
         }, 100);
         return;
@@ -297,7 +283,7 @@ export function launchAndWait(
         killGroup(proc.pid!, 'SIGSTOP');
         setTimeout(() => {
           if (settled) return;
-          stopped = evalAfterStop(handle, proc.pid!, logPath);
+          stopped = evalAfterStop(handle, proc.pid!, logPath, backend);
           finish(124, true, stopped);
         }, 100);
         return;
@@ -372,7 +358,7 @@ export function watchExisting(
     });
     // Deadline or stall → suspend, then freeze ('stopped') if still productive or kill (terminal).
     const suspend = () => {
-      if (suspendAndEval(handle, pid, logPath)) {
+      if (suspendAndEval(handle, pid, logPath, backend)) {
         resolve(mkResult('stopped')); // suspendAndEval persisted 'stopped' + removed the lock
       } else {
         resolve(mkResult(finalizeJob(handle, resolveStatus(backend, 124, logPath, true))));

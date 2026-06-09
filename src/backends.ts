@@ -27,7 +27,9 @@ export function buildRunArgv(backend: Backend, spec: string, repo: string, sid: 
     case 'omp':
       // omp has no pre-assignable session id; pin a per-job session dir so resume is deterministic.
       // --approval-mode=yolo auto-approves tool calls so a fresh/untrusted dir never blocks on a prompt.
-      return ['omp', '-p', spec, '--session-dir', handleDir(sid, repo), '--approval-mode=yolo', ...(extraArgs ?? [])];
+      // --mode=json streams JSONL events so the log grows continuously — without it omp buffers all
+      // output to the end and the runner's stall-watchdog freezes the still-working job at 120s.
+      return ['omp', '-p', spec, '--session-dir', handleDir(sid, repo), '--approval-mode=yolo', '--mode=json', ...(extraArgs ?? [])];
     case 'cmd':
       return ['cmd', '-p', spec, '--yolo', '-t', '--skip-onboarding', '--add-dir', repo, ...(model ? ['--model', model] : []), ...(extraArgs ?? [])];
     case 'opencode':
@@ -50,7 +52,7 @@ export function buildResumeArgv(backend: Backend, spec: string, repo: string, to
       return ['claude', '-p', spec, '--resume', token, '--model', 'sonnet', '--dangerously-skip-permissions', '--add-dir', repo, ...(extraArgs ?? [])];
     case 'omp':
       // token is the original handle → same per-job session dir as the run; --continue resumes it.
-      return ['omp', '-p', spec, '--session-dir', handleDir(token, repo), '--continue', '--approval-mode=yolo', ...(extraArgs ?? [])];
+      return ['omp', '-p', spec, '--session-dir', handleDir(token, repo), '--continue', '--approval-mode=yolo', '--mode=json', ...(extraArgs ?? [])];
     case 'opencode':
       return ['opencode', 'run', spec, '-s', token, '--dir', repo, ...(extraArgs ?? [])];
     case 'pool':
@@ -84,3 +86,5 @@ export function getResumeToken(backend: Backend, sid: string, logPath: string): 
     default: return '';
   }
 }
+/** Which backends emit JSONL logs — ties to --mode=json (omp) / --json (codex) in buildRunArgv. */
+export function emitsJsonLog(backend: string): boolean { return backend === 'omp' || backend === 'codex'; }

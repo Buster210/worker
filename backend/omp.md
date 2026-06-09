@@ -10,5 +10,5 @@ Inherits standards: **NO** (wrapper prepends them via `buildSpec` STANDARDS prea
 - model:        wrapper threads NONE (omp uses its own default). Manual: `--model <pat>` (fuzzy: `opus`, `gpt-5.2`) · `--provider <name>` (legacy) · `--thinking <minimal|low|medium|high|xhigh>` · `PI_*` env (`PI_SMOL_MODEL`/`PI_SLOW_MODEL`/`PI_PLAN_MODEL`).
 - auto-accept:  autonomous by default (no perm flag)
 - inject:       standards prepended into `<spec>` by `buildSpec` (or `--append-system-prompt '<text>'`)
-- output/done:  text mode (default); `DONE`/`FAILED:<reason>` sentinel scanned from `run.log` tail. `--mode json` exists but the wrapper uses text.
+- output/done:  `--mode=json` streams JSONL events to `run.log` (so the stall-watchdog sees activity); completion = final assistant `text` parsed from the tail for `DONE`/`FAILED:<reason>`, else exit code.
 - handle/kill:  short `w-` handle; pid captured at launch → process-group SIGKILL. Session is keyed by `--session-dir`, not an id.

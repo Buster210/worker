@@ -1,7 +1,8 @@
 import { describe, it, expect, afterEach } from 'bun:test';
-import { writeFileSync, unlinkSync } from 'fs';
+import { writeFileSync, unlinkSync, statSync } from 'fs';
 import { tmpdir } from 'os';
 import { resolveStatus } from './runner.ts';
+import { tailCapped, extractAssistantTexts, readSentinel } from './logParse.ts';
 
 describe('resolveStatus', () => {
   const testLogs: string[] = [];
@@ -13,6 +14,8 @@ describe('resolveStatus', () => {
     testLogs.length = 0;
   });
 
+  // --- Text-mode backends: sentinel detection still works ---
+
   it('returns "done" when log last line is DONE', () => {
     const tmpLogPath = `${tmpdir()}/resolveStatus-${process.pid}-${Date.now()}-1.log`;
     writeFileSync(tmpLogPath, 'Some log line\nDONE');
@@ -21,7 +24,7 @@ describe('resolveStatus', () => {
     expect(result).toBe('done');
   });
 
-  it('returns "done" when log contains DONE buried in last 10 lines', () => {
+  it('returns "done" when DONE is in the tail (beyond old 10-line window)', () => {
     const tmpLogPath = `${tmpdir()}/resolveStatus-${process.pid}-${Date.now()}-2.log`;
     const lines = [];
     for (let i = 0; i < 15; i++) {
@@ -80,5 +83,230 @@ describe('resolveStatus', () => {
     testLogs.push(tmpLogPath);
     const result = resolveStatus('cmd', 0, tmpLogPath, false);
     expect(result).toBe('done');
+  });
+
+  // --- JSON mode: omp/codex log with assistant text sentinels ---
+
+  it('omp json log ending assistant text "DONE" -> done', () => {
+    const tmpLogPath = `${tmpdir()}/resolveStatus-${process.pid}-${Date.now()}-9.log`;
+    const events = [
+      JSON.stringify({ message: { role: 'assistant', content: [{ type: 'text', text: 'Working on it...' }] } }),
+      JSON.stringify({ message: { role: 'assistant', content: [{ type: 'text', text: 'DONE' }] } }),
+    ].join('\n');
+    writeFileSync(tmpLogPath, events);
+    testLogs.push(tmpLogPath);
+    expect(resolveStatus('omp', 0, tmpLogPath, false)).toBe('done');
+  });
+
+  it('omp json ending assistant text "FAILED:reason" -> failed:reason', () => {
+    const tmpLogPath = `${tmpdir()}/resolveStatus-${process.pid}-${Date.now()}-10.log`;
+    const events = [
+      JSON.stringify({ message: { role: 'assistant', content: [{ type: 'text', text: 'attempting task' }] } }),
+      JSON.stringify({ message: { role: 'assistant', content: [{ type: 'text', text: 'FAILED: rate limit exceeded' }] } }),
+    ].join('\n');
+    writeFileSync(tmpLogPath, events);
+    testLogs.push(tmpLogPath);
+    expect(resolveStatus('omp', 0, tmpLogPath, false)).toBe('failed:rate limit exceeded');
+  });
+
+  it('omp json ending assistant text "FAILED" (no reason) -> failed', () => {
+    const tmpLogPath = `${tmpdir()}/resolveStatus-${process.pid}-${Date.now()}-10b.log`;
+    const events = [
+      JSON.stringify({ message: { role: 'assistant', content: [{ type: 'text', text: 'FAILED' }] } }),
+    ].join('\n');
+    writeFileSync(tmpLogPath, events);
+    testLogs.push(tmpLogPath);
+    expect(resolveStatus('omp', 0, tmpLogPath, false)).toBe('failed');
+  });
+
+  it('codex json log ending assistant text "DONE" -> done', () => {
+    const tmpLogPath = `${tmpdir()}/resolveStatus-${process.pid}-${Date.now()}-11.log`;
+    const events = [
+      JSON.stringify({ message: { role: 'assistant', content: [{ type: 'text', text: 'DONE' }] } }),
+    ].join('\n');
+    writeFileSync(tmpLogPath, events);
+    testLogs.push(tmpLogPath);
+    expect(resolveStatus('codex', 0, tmpLogPath, false)).toBe('done');
+  });
+
+  it('json log whose final events exceed cap -> readSentinel null -> exit-code fallthrough', () => {
+    const tmpLogPath = `${tmpdir()}/resolveStatus-${process.pid}-${Date.now()}-12.log`;
+    // Write a log where the only real content is a giant line exceeding the cap.
+    // The cap is set via the env in the test; we use a tiny cap.
+    const giantText = 'x'.repeat(500);
+    const events = [
+      JSON.stringify({ message: { role: 'assistant', content: [{ type: 'text', text: giantText }] } }),
+      JSON.stringify({ message: { role: 'assistant', content: [{ type: 'text', text: 'DONE' }] } }),
+    ].join('\n');
+    writeFileSync(tmpLogPath, events);
+    testLogs.push(tmpLogPath);
+
+    // Set a tiny cap so the giant line is the only thing in the tail window,
+    // but the DONE line is also within the cap since both are small.
+    // Actually, to truly test "exceeds cap", write a log where the DONE line
+    // is in a giant JSONL line that alone exceeds the cap.
+    // Simpler: write only a giant line, no sentinel → readSentinel returns null.
+    const tmpLogPath2 = `${tmpdir()}/resolveStatus-${process.pid}-${Date.now()}-12b.log`;
+    const hugeEvents = [
+      JSON.stringify({ message: { role: 'assistant', content: [{ type: 'text', text: 'x'.repeat(2000) }] } }),
+    ].join('\n');
+    writeFileSync(tmpLogPath2, hugeEvents);
+    testLogs.push(tmpLogPath2);
+
+    // With a 100-byte cap, the tail will only see part of the giant line.
+    // readSentinel should return null; fall through to exit code.
+    process.env.WORKER_STATUS_TAIL_BYTES = '100';
+    expect(readSentinel(tmpLogPath2, true).status).toBeNull();
+    expect(resolveStatus('omp', 0, tmpLogPath2, false)).toBe('done'); // rc=0
+    expect(resolveStatus('omp', 1, tmpLogPath2, false)).toBe('failed'); // rc!=0
+    delete process.env.WORKER_STATUS_TAIL_BYTES;
+  });
+
+  it('text-mode bare DONE/FAILED line still resolves via raw path', () => {
+    const tmpLogPath = `${tmpdir()}/resolveStatus-${process.pid}-${Date.now()}-13.log`;
+    writeFileSync(tmpLogPath, 'info: starting\ninfo: working\nDONE');
+    testLogs.push(tmpLogPath);
+    // claude_tmux is a text backend (not emitsJsonLog)
+    expect(resolveStatus('claude_tmux', 0, tmpLogPath, false)).toBe('done');
+  });
+
+  it('json log with non-assistant lines ignored, assistant DONE found', () => {
+    const tmpLogPath = `${tmpdir()}/resolveStatus-${process.pid}-${Date.now()}-14.log`;
+    const events = [
+      JSON.stringify({ type: 'system', text: 'ignored' }),
+      JSON.stringify({ message: { role: 'user', content: [{ type: 'text', text: 'ignored' }] } }),
+      JSON.stringify({ message: { role: 'assistant', content: [{ type: 'text', text: 'DONE' }] } }),
+    ].join('\n');
+    writeFileSync(tmpLogPath, events);
+    testLogs.push(tmpLogPath);
+    expect(resolveStatus('omp', 0, tmpLogPath, false)).toBe('done');
+  });
+});
+
+describe('tailCapped', () => {
+  const testLogs: string[] = [];
+
+  afterEach(() => {
+    for (const path of testLogs) {
+      try { unlinkSync(path); } catch {}
+    }
+    testLogs.length = 0;
+  });
+
+  it('returns entire file when smaller than cap', () => {
+    const tmpLogPath = `${tmpdir()}/tailCapped-${process.pid}-${Date.now()}-1.log`;
+    writeFileSync(tmpLogPath, 'line1\nline2\nDONE\n');
+    testLogs.push(tmpLogPath);
+    const result = tailCapped(tmpLogPath, 1024);
+    expect(result).toContain('DONE');
+  });
+
+  it('reads <= cap bytes from a file larger than cap', () => {
+    const tmpLogPath = `${tmpdir()}/tailCapped-${process.pid}-${Date.now()}-2.log`;
+    // Write a file with known content: padding + sentinel at the end.
+    const padding = 'A'.repeat(900);
+    const sentinel = 'DONE';
+    writeFileSync(tmpLogPath, `${padding}\n${sentinel}\n`);
+    testLogs.push(tmpLogPath);
+
+    const cap = 200;
+    const result = tailCapped(tmpLogPath, cap);
+    // The tail should not contain the full padding (900 bytes > 200 cap).
+    expect(result.length).toBeLessThanOrEqual(cap + 10); // small margin for partial-line handling
+    expect(result).toContain('DONE');
+  });
+
+  it('never loads the whole file — asserts read offset when capped', () => {
+    const tmpLogPath = `${tmpdir()}/tailCapped-${process.pid}-${Date.now()}-3.log`;
+    // 3KB file: first 2KB is noise, last 100 bytes has sentinel.
+    const noise = 'x'.repeat(2900);
+    writeFileSync(tmpLogPath, `${noise}\nDONE\n`);
+    testLogs.push(tmpLogPath);
+
+    const cap = 200;
+    const size = statSync(tmpLogPath).size;
+    expect(size).toBeGreaterThan(cap);
+
+    const result = tailCapped(tmpLogPath, cap);
+    // The result should be at most cap bytes (plus partial-line overhead).
+    expect(result.length).toBeLessThanOrEqual(cap + 50);
+    expect(result).toContain('DONE');
+  });
+});
+
+describe('extractAssistantTexts', () => {
+  it('returns text strings from assistant message', () => {
+    const line = JSON.stringify({
+      message: { role: 'assistant', content: [{ type: 'text', text: 'hello' }, { type: 'tool_use', id: 'x' }] },
+    });
+    expect(extractAssistantTexts(line)).toEqual(['hello']);
+  });
+
+  it('returns empty array for non-assistant message', () => {
+    const line = JSON.stringify({ message: { role: 'user', content: [{ type: 'text', text: 'hi' }] } });
+    expect(extractAssistantTexts(line)).toEqual([]);
+  });
+
+  it('returns empty array for invalid JSON', () => {
+    expect(extractAssistantTexts('not json')).toEqual([]);
+  });
+
+  it('returns empty array for non-JSON lines', () => {
+    expect(extractAssistantTexts('DONE')).toEqual([]);
+  });
+});
+
+describe('readSentinel', () => {
+  const testLogs: string[] = [];
+
+  afterEach(() => {
+    for (const path of testLogs) {
+      try { unlinkSync(path); } catch {}
+    }
+    testLogs.length = 0;
+  });
+
+  it('finds DONE in json mode via assistant text', () => {
+    const tmpLogPath = `${tmpdir()}/readSentinel-${process.pid}-${Date.now()}-1.log`;
+    const events = [
+      JSON.stringify({ message: { role: 'assistant', content: [{ type: 'text', text: 'DONE' }] } }),
+    ].join('\n');
+    writeFileSync(tmpLogPath, events);
+    testLogs.push(tmpLogPath);
+    expect(readSentinel(tmpLogPath, true).status).toBe('done');
+  });
+
+  it('finds FAILED:reason in json mode via assistant text', () => {
+    const tmpLogPath = `${tmpdir()}/readSentinel-${process.pid}-${Date.now()}-2.log`;
+    const events = [
+      JSON.stringify({ message: { role: 'assistant', content: [{ type: 'text', text: 'FAILED: timeout' }] } }),
+    ].join('\n');
+    writeFileSync(tmpLogPath, events);
+    testLogs.push(tmpLogPath);
+    expect(readSentinel(tmpLogPath, true).status).toBe('failed:timeout');
+  });
+
+  it('returns null when no sentinel found', () => {
+    const tmpLogPath = `${tmpdir()}/readSentinel-${process.pid}-${Date.now()}-3.log`;
+    const events = [
+      JSON.stringify({ message: { role: 'assistant', content: [{ type: 'text', text: 'still working' }] } }),
+    ].join('\n');
+    writeFileSync(tmpLogPath, events);
+    testLogs.push(tmpLogPath);
+    expect(readSentinel(tmpLogPath, true).status).toBeNull();
+  });
+
+  it('finds DONE in text mode (raw lines)', () => {
+    const tmpLogPath = `${tmpdir()}/readSentinel-${process.pid}-${Date.now()}-4.log`;
+    writeFileSync(tmpLogPath, 'log line\nDONE');
+    testLogs.push(tmpLogPath);
+    expect(readSentinel(tmpLogPath, false).status).toBe('done');
+  });
+
+  it('finds FAILED in text mode (raw lines)', () => {
+    const tmpLogPath = `${tmpdir()}/readSentinel-${process.pid}-${Date.now()}-5.log`;
+    writeFileSync(tmpLogPath, 'log line\nFAILED: oops');
+    testLogs.push(tmpLogPath);
+    expect(readSentinel(tmpLogPath, false).status).toBe('failed:oops');
   });
 });

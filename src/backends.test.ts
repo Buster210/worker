@@ -1,5 +1,5 @@
 import { describe, it, expect, test } from 'bun:test';
-import { buildSpec, buildRunArgv, buildResumeArgv, getResumeToken, type Backend } from './backends.ts';
+import { buildSpec, buildRunArgv, buildResumeArgv, getResumeToken, emitsJsonLog, type Backend } from './backends.ts';
 import { handleDir } from './state.ts';
 
 describe('buildSpec', () => {
@@ -35,7 +35,7 @@ describe('buildRunArgv', () => {
 
   it('builds omp argv with a per-job session dir and no model/provider', () => {
     const argv = buildRunArgv('omp', 'spec', '/repo', 'sid123');
-    expect(argv).toEqual(['omp', '-p', 'spec', '--session-dir', handleDir('sid123', '/repo'), '--approval-mode=yolo']);
+    expect(argv).toEqual(['omp', '-p', 'spec', '--session-dir', handleDir('sid123', '/repo'), '--approval-mode=yolo', '--mode=json']);
     expect(argv).not.toContain('--model');
     expect(argv).not.toContain('--provider');
   });
@@ -83,7 +83,7 @@ describe('buildResumeArgv', () => {
 
   it('builds omp resume argv with the same session dir plus --continue', () => {
     const argv = buildResumeArgv('omp', 'spec', '/repo', 'token123');
-    expect(argv).toEqual(['omp', '-p', 'spec', '--session-dir', handleDir('token123', '/repo'), '--continue', '--approval-mode=yolo']);
+    expect(argv).toEqual(['omp', '-p', 'spec', '--session-dir', handleDir('token123', '/repo'), '--continue', '--approval-mode=yolo', '--mode=json']);
   });
 
   it('builds opencode resume argv with token', () => {
@@ -140,5 +140,19 @@ describe('getResumeToken', () => {
   it('returns empty string for cmd', () => {
     const token = getResumeToken('cmd', 'sid', '/path/to/log');
     expect(token).toBe('');
+  });
+});
+describe('emitsJsonLog', () => {
+  it('omp and codex emit JSONL', () => {
+    expect(emitsJsonLog('omp')).toBe(true);
+    expect(emitsJsonLog('codex')).toBe(true);
+  });
+
+  it('other backends do not emit JSONL', () => {
+    expect(emitsJsonLog('opencode')).toBe(false);
+    expect(emitsJsonLog('claude')).toBe(false);
+    expect(emitsJsonLog('cmd')).toBe(false);
+    expect(emitsJsonLog('pool')).toBe(false);
+    expect(emitsJsonLog('claude_tmux')).toBe(false);
   });
 });
