@@ -4,6 +4,7 @@ import { updateJob, getJob, getAllRunningJobs, getAllStoppedJobs, removeLock, lo
 import { emitsJsonLog, type Backend } from './backends.ts';
 import { readSentinel } from './logParse.ts';
 import type { Job } from './state.ts';
+import { killProcessTree } from './descendent-kill.ts';
 
 // On startup: mark any jobs still showing 'running' whose PIDs are dead as failed.
 // Prevents stale state after a server restart mid-job.
@@ -23,7 +24,46 @@ function stallTimeoutMs(): number { return envMs('WORKER_STALL_MS', 120_000); }
 function reapAgeMs(): number { return envMs('WORKER_REAP_MS', 900_000); }
 // Augmented PATH so backends are findable (MCP server env is stripped)
 const HOME = process.env.HOME ?? '';
+
+// --- Login-shell environment snapshot (pollution-free) ---
+// One-time login-shell env dump so workers inherit API keys, PATH extensions, etc.
+// from the user's profile WITHOUT any shell banner echo polluting the worker run.log.
+// The marker separates profile output (discarded) from the JSON env dump (kept).
+const LOGIN_ENV_MARKER = '__WORKER_ENV_a7f3__';
+let _loginEnvCache: Record<string, string> | null | undefined; // undefined = not yet attempted
+
+/** Pure: extract env JSON from login shell stdout — banner before marker discarded. */
+export function parseEnvSnapshot(stdout: string, marker: string): Record<string, string> | null {
+  const idx = stdout.indexOf(marker);
+  if (idx === -1) return null;
+  const jsonStart = stdout.indexOf('{', idx + marker.length);
+  if (jsonStart === -1) return null;
+  try { return JSON.parse(stdout.slice(jsonStart)); } catch { return null; }
+}
+
+/** One-time login-shell env snapshot. Returns null on failure, opt-out, or non-macOS. */
+export function loginShellEnv(): Record<string, string> | null {
+  if (process.env.WORKER_LOGIN_SHELL === '0') return null;
+  if (_loginEnvCache !== undefined) return _loginEnvCache;
+  const shell = process.env.SHELL ?? '/bin/zsh';
+  const bunPath = process.execPath;
+  const snippet =
+    `printf '%s\\n' '${LOGIN_ENV_MARKER}'; exec "${bunPath}" -e 'process.stdout.write(JSON.stringify(process.env))'`;
+  try {
+    const r = spawnSync(shell, ['-l', '-c', snippet], { encoding: 'utf8', timeout: 5000 });
+    if (r.error || r.status !== 0) { _loginEnvCache = null; return null; }
+    const parsed = parseEnvSnapshot(r.stdout ?? '', LOGIN_ENV_MARKER);
+    _loginEnvCache = parsed;
+    return parsed;
+  } catch {
+    _loginEnvCache = null;
+    return null;
+  }
+}
+
+const _loginEnv = loginShellEnv();
 export const workerEnv: NodeJS.ProcessEnv = {
+  ...(_loginEnv ?? {}),
   ...process.env,
   // rc the backend shell sources for env + key-injecting wrappers (see backendShellArgv).
   // Passed via env (not interpolated into the script) so its value can never be code-injected.
@@ -37,7 +77,7 @@ export const workerEnv: NodeJS.ProcessEnv = {
     '/usr/local/bin',
     '/usr/bin',
     '/bin',
-    process.env.PATH ?? '',
+    _loginEnv?.PATH ?? process.env.PATH ?? '',
   ].join(':'),
 };
 
@@ -110,8 +150,8 @@ export function reapStoppedJobs() {
     // Re-read in the same synchronous tick: guards a status flip (e.g. a concurrent resume that
     // thawed it back to 'running') between the disk snapshot above and the kill below.
     if (getJob(job.handle)?.status !== 'stopped') continue;
-    killGroup(job.worker_pid, 'SIGKILL');
-    setTimeout(() => killGroup(job.worker_pid, 'SIGKILL'), 5_000).unref?.();
+    killProcessTree(job.worker_pid, 'SIGKILL');
+    setTimeout(() => killProcessTree(job.worker_pid, 'SIGKILL'), 5_000).unref?.();
     finalizeJob(job.handle, 'timeout');
   }
 }
@@ -138,8 +178,8 @@ function evalAfterStop(handle: string, pid: number, logPath: string, backend: st
     removeLock(handle);
     return true;
   }
-  killGroup(pid, 'SIGKILL');
-  setTimeout(() => killGroup(pid, 'SIGKILL'), 5_000);
+  killProcessTree(pid, 'SIGKILL');
+  setTimeout(() => killProcessTree(pid, 'SIGKILL'), 5_000);
   return false;
 }
 

@@ -11,8 +11,8 @@
 //   exhausted -> "exhausted"        + blank line + full `git diff`
 //   stopped   -> "stopped"          (single line, no diff — frozen/resumable, work is incomplete)
 //   killed    -> "killed"           (single line, no diff — deliberate abort)
-import { existsSync } from 'fs';
-import { basename } from 'path';
+import { existsSync, watch } from 'fs';
+import { basename, dirname } from 'path';
 import { spawnSync } from 'child_process';
 import { getJob, getLadderHistory } from './state.ts';
 
@@ -68,6 +68,25 @@ export function renderReport(handle: string, lockPath: string, diff: (repo: stri
   if (!repo) return `${line}\n\n(diff unavailable: unknown handle ${handle})`;
   return `${line}\n\n${diff(repo)}`;
 }
+async function waitForUnlock(lockPath: string): Promise<void> {
+  if (!existsSync(lockPath)) return;
+  return new Promise<void>((resolve) => {
+    let resolved = false;
+    const done = () => {
+      if (resolved) return;
+      resolved = true;
+      clearInterval(fallback);
+      watcher.close();
+      resolve();
+    };
+    const watcher = watch(dirname(lockPath), () => {
+      if (!existsSync(lockPath)) done();
+    });
+    const fallback = setInterval(() => {
+      if (!existsSync(lockPath)) done();
+    }, POLL_MS);
+  });
+}
 
 if (import.meta.main) {
   const handle = process.argv[2];
@@ -76,6 +95,6 @@ if (import.meta.main) {
     console.error('usage: bun run report.ts <handle> <lock_path>');
     process.exit(1);
   }
-  while (existsSync(lockPath)) await Bun.sleep(POLL_MS);
+  await waitForUnlock(lockPath);
   console.log(renderReport(handle, lockPath));
 }

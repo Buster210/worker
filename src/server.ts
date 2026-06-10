@@ -12,13 +12,14 @@ import {
   isProcessAlive, resolveStatus, watchExisting, defaultTimeoutMs, backendShellArgv, type RunResult,
 } from './runner.ts';
 import { recordLadder } from './ladder.ts';
+import { killProcessTree } from './descendent-kill.ts';
 
 function killJobHard(job: { handle: string; backend: string; worker_pid: number; log_path: string }): void {
   updateJob(job.handle, { kill_requested: true });
   if (job.backend === 'claude_tmux') {
     try { spawnSync('tmux', ['kill-session', '-t', job.handle], { stdio: 'ignore' }); } catch {}
   } else if (job.worker_pid > 0) {
-    try { process.kill(-job.worker_pid, 'SIGKILL'); } catch {}
+    killProcessTree(job.worker_pid, 'SIGKILL');
   }
 }
 
