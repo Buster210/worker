@@ -46,13 +46,16 @@ describe('reply envelope', () => {
 });
 
 describe('handleStatus', () => {
-  it('returns job fields + alive, with the backend key stripped', () => {
+  it('returns only the live signal (status/alive/started), omitting caller-known + internal fields', () => {
     const handle = seedJob('running');
     const s = handleStatus({ handle });
-    expect(s.handle).toBe(handle);
     expect(s.status).toBe('running');
     expect(s.alive).toBe(false); // worker_pid 0 → not alive
-    expect('backend' in s).toBe(false);
+    expect('started' in s).toBe(true);
+    // caller-known context (handle/repo/task) and internals (backend/worker_pid/resume_token/log_path) are not echoed back
+    for (const k of ['handle', 'repo', 'task', 'backend', 'worker_pid', 'resume_token', 'log_path', 'kill_requested', 'sid', 'model']) {
+      expect(k in s).toBe(false);
+    }
   });
   it('throws when the handle is unknown', () => {
     expect(() => handleStatus({ handle: 'nope' })).toThrow(/No job found/);

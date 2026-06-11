@@ -1,8 +1,9 @@
 #!/usr/bin/env bun
 // Completion watcher + status-aware report. The agent fires this in the BACKGROUND right after a
-// run/ladder call; it polls the lock and, when the job terminates, prints ONE bundle to stdout —
-// front-loading the exact diff the agent would otherwise stop and fetch by hand. No MCP server
-// needed: it reads the same filesystem state (job.json / ladder audit trail) the tools read.
+// run/ladder call with just the handle; it watches the job's completion lock (event-driven, via
+// fs.watch) and, when the job terminates, prints ONE bundle to stdout — front-loading the exact
+// diff the agent would otherwise stop and fetch by hand. No MCP server needed: it reads the same
+// filesystem state (job.json / ladder audit trail) the tools read.
 //
 // Output schema (locked):
 //   done      -> "completed"        + blank line + full `git diff`
@@ -14,9 +15,15 @@
 import { existsSync, watch } from 'fs';
 import { basename, dirname } from 'path';
 import { spawnSync } from 'child_process';
-import { getJob, getLadderHistory } from './state.ts';
+import { getJob, getLadderHistory, lockPath } from './state.ts';
 
-const POLL_MS = Number(process.env.WORKER_REPORT_POLL_MS ?? 10_000);
+// Resolved lazily (not a load-time const) so tests can set a tight interval, matching the lazy-env
+// convention in state.ts/runner.ts/logParse.ts. Also guards a bad value: a non-numeric env would
+// make Number() NaN and setInterval(fn, NaN) spin at 0ms — fall back to the default instead.
+function reportPollMs(): number {
+  const v = Number(process.env.WORKER_REPORT_POLL_MS);
+  return Number.isFinite(v) && v > 0 ? v : 10_000;
+}
 
 // Resolve the TRUE terminal status. A ladder's rung-0 job.json is misleading (it shows rung 0's own
 // outcome, not the chain's), so for a chain lock we read the ladder audit trail instead: a ladder can
@@ -68,7 +75,17 @@ export function renderReport(handle: string, lockPath: string, diff: (repo: stri
   if (!repo) return `${line}\n\n(diff unavailable: unknown handle ${handle})`;
   return `${line}\n\n${diff(repo)}`;
 }
-async function waitForUnlock(lockPath: string): Promise<void> {
+// Liveness probe with no PID-reuse guard — a heuristic, deliberately lightweight so report.ts (a
+// standalone bin) need not import runner.ts (whose module init spawns a login shell). Bails ONLY on
+// ESRCH (process definitively gone); EPERM (alive but owned by another uid) reads as alive, so a
+// cross-uid server is never mis-flagged dead. Worst case a reused PID reads as alive → keep waiting.
+function ownerDead(serverPid: number): boolean {
+  if (!serverPid) return false; // legacy/unknown owner → can't attribute, never bail on it
+  try { process.kill(serverPid, 0); return false; }
+  catch (e) { return (e as NodeJS.ErrnoException).code === 'ESRCH'; }
+}
+
+export async function waitForUnlock(lockPath: string, serverPid = 0): Promise<void> {
   if (!existsSync(lockPath)) return;
   return new Promise<void>((resolve) => {
     let resolved = false;
@@ -82,19 +99,32 @@ async function waitForUnlock(lockPath: string): Promise<void> {
     const watcher = watch(dirname(lockPath), () => {
       if (!existsSync(lockPath)) done();
     });
+    watcher.on('error', () => { if (!existsSync(lockPath)) done(); });
     const fallback = setInterval(() => {
-      if (!existsSync(lockPath)) done();
-    }, POLL_MS);
+      // Lock cleared the normal way → done.
+      if (!existsSync(lockPath)) { done(); return; }
+      // Lock still held but the owning server is gone: a crashed/killed server can never finalize,
+      // and a chain lock is never adopted by another server, so this lock would never clear. Bail and
+      // let renderReport report the last known terminal state instead of hanging forever.
+      if (ownerDead(serverPid)) done();
+    }, reportPollMs());
   });
 }
 
 if (import.meta.main) {
   const handle = process.argv[2];
-  const lockPath = process.argv[3];
-  if (!handle || !lockPath) {
-    console.error('usage: bun run report.ts <handle> <lock_path>');
+  if (!handle) {
+    console.error('usage: worker-report <handle>');
     process.exit(1);
   }
-  await waitForUnlock(lockPath);
-  console.log(renderReport(handle, lockPath));
+  const job = getJob(handle);
+  if (!job) {
+    console.error(`report: unknown handle ${handle}`);
+    process.exit(1);
+  }
+  // The completion lock is persisted on the job (chain lock for a ladder, per-handle lock for a
+  // single run), so the handle alone is enough — no lock_path argument, no $sid-quoting footgun.
+  const lock = job.completion_lock || lockPath(handle, job.repo);
+  await waitForUnlock(lock, job.server_pid);
+  console.log(renderReport(handle, lock));
 }

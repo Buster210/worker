@@ -87,13 +87,17 @@ export type Job = {
   worker_pid: number; resume_token: string; repo: string; started: string;
   finished?: string; stopped_at?: string; last_line?: string;
   status: string; model: string; task: string; log_path: string;
+  // The lock whose removal signals THIS job's completion to report.ts. A single run → its own
+  // per-handle lock; a ladder rung-0 → the sid-keyed chain lock (spans the whole climb). Persisted
+  // so report.ts derives it from the handle alone — no need to pass lock_path on the command line.
+  completion_lock: string;
   kill_requested?: boolean;
 };
 
 export function insertJob(j: {
   handle: string; backend: string; sid: string;
   worker_pid?: number; resume_token?: string; repo: string; model?: string;
-  task?: string; log_path: string;
+  task?: string; log_path: string; completion_lock?: string;
 }) {
   const job: Job = {
     handle: j.handle, backend: j.backend,
@@ -101,6 +105,8 @@ export function insertJob(j: {
     resume_token: j.resume_token ?? '', repo: j.repo,
     started: new Date().toISOString(), status: 'running',
     model: j.model ?? '', task: j.task ?? '', log_path: j.log_path,
+    // Default to the per-handle lock; worker_ladder overrides with the chain lock for rung 0.
+    completion_lock: j.completion_lock ?? lockPath(j.handle, j.repo),
   };
   mkdirSync(handleDir(j.handle, j.repo), { recursive: true });
   const jobPath = jobPathFn(j.handle, j.repo);

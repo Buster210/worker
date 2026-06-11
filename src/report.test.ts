@@ -1,12 +1,15 @@
 import { describe, it, expect } from 'bun:test';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { mkdirSync, writeFileSync, existsSync, unlinkSync } from 'fs';
 
-// Throwaway state store, set BEFORE importing report/state (resolution is lazy).
+// Throwaway state store, set BEFORE importing report/state (resolution is lazy). A tiny report poll
+// interval keeps the waitForUnlock anti-hang test fast (reportPollMs() reads the env lazily per tick).
 const STATE_DIR = join(tmpdir(), `wreport-state-${process.pid}`);
 process.env.WORKER_STATE_DIR = STATE_DIR;
+process.env.WORKER_REPORT_POLL_MS = '20';
 
-import { terminalStatus, statusLine, wantsDiff, renderReport } from './report.ts';
+import { terminalStatus, statusLine, wantsDiff, renderReport, waitForUnlock } from './report.ts';
 import { insertJob, updateJob, appendLadder, chainLockPath } from './state.ts';
 
 let seq = 0;
@@ -102,5 +105,43 @@ describe('renderReport (diff injected — no real git)', () => {
     const r = renderReport('ghost', '/any/ghost/.lock', () => { called = true; return 'WRONGDIFF'; });
     expect(r).toBe('failed\n\n(diff unavailable: unknown handle ghost)');
     expect(called).toBe(false);
+  });
+});
+
+describe('waitForUnlock — anti-hang', () => {
+  mkdirSync(STATE_DIR, { recursive: true });
+
+  it('resolves promptly when the lock is removed (owner alive)', async () => {
+    const lock = join(STATE_DIR, `${uniq('lk')}.lock`);
+    writeFileSync(lock, '');
+    const p = waitForUnlock(lock, process.pid); // own pid = a live owner
+    setTimeout(() => { try { unlinkSync(lock); } catch {} }, 30);
+    await p; // must resolve once the lock clears, not hang
+    expect(existsSync(lock)).toBe(false);
+  });
+
+  it('returns immediately when the lock is already gone', async () => {
+    await waitForUnlock(join(STATE_DIR, `${uniq('lk')}.missing.lock`), process.pid);
+    expect(true).toBe(true); // resolved without throwing/hanging
+  });
+
+  it('bails when the owning server is dead even though the lock persists', async () => {
+    const lock = join(STATE_DIR, `${uniq('lk')}.lock`);
+    writeFileSync(lock, '');
+    // PID space well above anything a fresh box allocated → process.kill(pid,0) throws → dead owner.
+    await waitForUnlock(lock, 42_000_321); // must resolve despite the lock still being held
+    expect(existsSync(lock)).toBe(true); // we bailed on the dead owner; lock was never cleared
+  });
+
+  it('legacy/unknown owner (serverPid 0) does NOT bail — only the lock removal resolves it', async () => {
+    const lock = join(STATE_DIR, `${uniq('lk')}.lock`);
+    writeFileSync(lock, '');
+    let resolved = false;
+    const p = waitForUnlock(lock, 0).then(() => { resolved = true; });
+    await Bun.sleep(80); // several poll ticks — must NOT have bailed
+    expect(resolved).toBe(false);
+    unlinkSync(lock);
+    await p;
+    expect(resolved).toBe(true);
   });
 });

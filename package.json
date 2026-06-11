@@ -2,6 +2,9 @@
   "name": "worker-mcp",
   "version": "0.1.0",
   "type": "module",
+  "bin": {
+    "worker-report": "./src/report.ts"
+  },
   "scripts": {
     "start": "bun run src/server.ts",
     "dev": "bun run --watch src/server.ts",
