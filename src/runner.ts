@@ -1,5 +1,5 @@
 import { spawn, spawnSync, execSync } from 'child_process';
-import { createWriteStream, statSync, mkdirSync, writeFileSync, readFileSync, unlinkSync, realpathSync, existsSync, copyFileSync, renameSync } from 'fs';
+import { openSync, closeSync, writeSync, statSync, mkdirSync, writeFileSync, readFileSync, unlinkSync, realpathSync, existsSync, copyFileSync, renameSync } from 'fs';
 import { updateJob, getJob, getAllRunningJobs, getAllStoppedJobs, removeLock, logPath as workerLogPath, workersDir, finalizeJob } from './state.ts';
 import { emitsJsonLog, type Backend } from './backends.ts';
 import { readSentinel } from './logParse.ts';
@@ -117,9 +117,23 @@ export { resolveStatus };
 
 export function sweepStaleJobs() {
   for (const job of getAllRunningJobs()) {
+    // Owning server still alive → its in-process runner (launchAndWait / runClaudeTmux) owns this
+    // job's finalization, so the sweep must not race it. This covers claude_tmux jobs (worker_pid=0
+    // by design) and the brief window after insertJob before launchAndWait sets the real worker_pid —
+    // both previously looked "dead" to the worker_pid check below and got finalized failed:server-restart
+    // mid-run by the periodic sweep. Only true orphans (server dead) or legacy jobs (server_pid=0) proceed.
+    if (job.server_pid > 0 && isProcessAlive(job.server_pid, job.server_started)) continue;
     let alive = false;
     if (job.worker_pid) { alive = isProcessAlive(job.worker_pid, job.started); }
-    if (!alive) {
+    if (alive) {
+      // Orphan: worker is alive but the MCP server that launched it is dead (killed -9).
+      // server_pid=0 means legacy job → never sweep (safe-fail: existing dead-worker branch
+      // covers those if/when the worker itself dies).
+      if (job.server_pid > 0 && !isProcessAlive(job.server_pid, job.server_started)) {
+        killProcessTree(job.worker_pid, 'SIGKILL');
+        finalizeJob(job.handle, 'failed', { resume_token: job.resume_token });
+      }
+    } else {
       const status = resolveStatus(job.backend, 0, job.log_path, false);
       finalizeJob(job.handle, status === 'done' ? status : 'failed:server-restart');
     }
@@ -270,17 +284,19 @@ export function launchAndWait(
   timeoutMs: number = defaultTimeoutMs(),
 ): Promise<{ rc: number; timedOut: boolean; stopped: boolean }> {
   return new Promise((resolve) => {
-    const logStream = createWriteStream(logPath, { flags: 'a' });
+    // Child writes straight to the log file via an inherited fd, NOT a Node pipe. A piped stream
+    // gets .end()'d when the watchdog freezes the job (SIGSTOP), so a later SIGCONT resume
+    // (watchExisting) would write into a dead pipe — output lost and the job mis-graded non-done
+    // off a frozen log. An inherited fd survives freeze/resume: the frozen child keeps its own copy
+    // and resumes appending to the same file.
+    const logFd = openSync(logPath, 'a');
     const [cmd, ...args] = backendShellArgv(argv);
     const proc = spawn(cmd, args, {
       cwd: repo,
       env: workerEnv,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: ['ignore', logFd, logFd],
       detached: true,
     });
-
-    proc.stdout?.pipe(logStream);
-    proc.stderr?.pipe(logStream);
 
     updateJob(handle, { worker_pid: proc.pid ?? 0 });
 
@@ -294,7 +310,9 @@ export function launchAndWait(
       if (settled) return;
       settled = true;
       clearInterval(watchdog);
-      logStream.end();
+      // Close only the parent's copy; the child (esp. a frozen one) keeps its inherited fd so it
+      // can resume writing after SIGCONT.
+      try { closeSync(logFd); } catch {}
       resolve({ rc: code, timedOut: timed, stopped: stoppedJob });
     };
     let lastSig = '';
@@ -336,7 +354,7 @@ export function launchAndWait(
     });
 
     proc.on('error', (err) => {
-      logStream.write(`\nspawn error: ${err.message}\n`);
+      try { writeSync(logFd, `\nspawn error: ${err.message}\n`); } catch {}
       finish(1, false, false);
     });
   });

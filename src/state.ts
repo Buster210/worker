@@ -92,12 +92,18 @@ export type Job = {
   // so report.ts derives it from the handle alone — no need to pass lock_path on the command line.
   completion_lock: string;
   kill_requested?: boolean;
+  // Owning MCP server identity — used by the orphan sweep to detect when the server that launched
+  // this worker has been killed -9. server_pid=0 / server_started='' means legacy (pre-sweep) job
+  // and is NEVER swept (safe-fail: existing dead-worker branch still covers these).
+  server_pid: number;
+  server_started: string;
 };
 
 export function insertJob(j: {
   handle: string; backend: string; sid: string;
   worker_pid?: number; resume_token?: string; repo: string; model?: string;
   task?: string; log_path: string; completion_lock?: string;
+  server_pid?: number; server_started?: string;
 }) {
   const job: Job = {
     handle: j.handle, backend: j.backend,
@@ -107,6 +113,8 @@ export function insertJob(j: {
     model: j.model ?? '', task: j.task ?? '', log_path: j.log_path,
     // Default to the per-handle lock; worker_ladder overrides with the chain lock for rung 0.
     completion_lock: j.completion_lock ?? lockPath(j.handle, j.repo),
+    server_pid: j.server_pid ?? 0,
+    server_started: j.server_started ?? '',
   };
   mkdirSync(handleDir(j.handle, j.repo), { recursive: true });
   const jobPath = jobPathFn(j.handle, j.repo);

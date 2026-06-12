@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterEach, afterAll } from 'bun:test';
 import { spawn, spawnSync } from 'child_process';
-import { writeFileSync, rmSync, mkdtempSync, openSync } from 'fs';
+import { writeFileSync, readFileSync, rmSync, mkdtempSync, openSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -169,6 +169,27 @@ describe('watchExisting (resume watcher, real process)', () => {
     expect(r.status).toBe('stopped');
     expect(getJob(handle)?.status).toBe('stopped');
     frozenPids.push(pid);
+  });
+
+  it('captures post-resume output across a real freeze→SIGCONT handoff (regression: closed log stream)', async () => {
+    // End-to-end: a job launched by runWorker, frozen mid-run, then thawed and watched by
+    // watchExisting on the SAME process. 'working' is logged before the freeze; 'DONE' is emitted
+    // only AFTER SIGCONT. If launchAndWait piped stdout through a stream it .end()'d at freeze, the
+    // post-resume 'DONE' would vanish and the job would mis-grade non-done. The inherited-fd log
+    // keeps the frozen child's output flowing to the same file across the handoff.
+    const handle = `resume-handoff-${seq}`;
+    const lp = seedJob(handle);
+    process.env.WORKER_POLL_MS = '100';
+    process.env.WORKER_RESUME_POLL_MS = '50';
+    const r1 = await runWorker(fakeScript('echo working; sleep 1; echo; echo DONE'), REPO, handle, 'cmd', lp, '', 300);
+    expect(r1.status).toBe('stopped');
+    const pid = getJob(handle)!.worker_pid!;
+    frozenPids.push(pid); // defensive: it should exit on its own below, but reap if it flakes
+    process.kill(-pid, 'SIGCONT'); // mirror resumeLaunch: thaw the group, then hand to the watcher
+    const r2 = await watchExisting(handle, pid, REPO, lp, 'cmd', 10_000);
+    expect(r2.status).toBe('done');
+    expect(getJob(handle)?.status).toBe('done');
+    expect(readFileSync(lp, 'utf8')).toContain('DONE'); // post-resume output reached the log
   });
 
   it('kills a stalled job to "timeout" only when it has self-declared FAILED', async () => {

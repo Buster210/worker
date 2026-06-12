@@ -13,6 +13,15 @@ import {
 import { recordLadder } from './ladder.ts';
 import { killProcessTree } from './descendent-kill.ts';
 
+// Boot timestamp captured once at module init — written to every job so the orphan sweep can
+// verify a job's owning server is still alive (PID-reuse guard via isProcessAlive's started arg).
+const SERVER_STARTED = new Date().toISOString();
+// Handles (job IDs) this server process launched. Scoped cleanup on shutdown — never
+// touch another session's workers. Populated by trackLaunched() at launch time.
+const launchedHandles = new Set<string>();
+export function trackLaunched(handle: string) { launchedHandles.add(handle); }
+
+
 function killJobHard(job: { handle: string; backend: string; worker_pid: number; log_path: string }): void {
   updateJob(job.handle, { kill_requested: true });
   if (job.backend === 'claude_tmux') {
@@ -61,12 +70,13 @@ function launch(
   opts: { sid: string; model?: string; extraArgs?: string[]; timeoutMs?: number; completionLock?: string },
 ): { handle: string; promise: Promise<RunResult> } {
   const handle = newHandle(backend);
+  trackLaunched(handle);
   killLingeringJobs(dir);
   const lp = workerLogPath(handle, dir);
   const spec = buildSpec(backend, prompt);
   // claude pins sonnet; omp + claude_tmux ignore model entirely. None thread the model parameter.
   const modelToUse = (backend === 'claude' || backend === 'omp' || backend === 'claude_tmux') ? undefined : opts.model;
-  insertJob({ handle, backend, sid: opts.sid, repo: dir, model: modelToUse, task: prompt, log_path: lp, completion_lock: opts.completionLock });
+  insertJob({ handle, backend, sid: opts.sid, repo: dir, model: modelToUse, task: prompt, log_path: lp, completion_lock: opts.completionLock, server_pid: process.pid, server_started: SERVER_STARTED });
 
   let promise: Promise<RunResult>;
   if (backend === 'claude_tmux') {
@@ -85,6 +95,26 @@ function launch(
   }
   return { handle, promise };
 }
+
+/**
+ * Graceful shutdown: kill every worker process this server launched that is still in flight,
+ * finalize it resumable (preserving resume_token), then exit. Idempotent — repeated calls
+ * (signal + stdin EOF both firing) are a no-op after the first.
+ */
+export async function shutdown(): Promise<void> {
+  if (_shuttingDown) return;
+  _shuttingDown = true;
+  for (const handle of launchedHandles) {
+    const job = getJob(handle);
+    if (!job || (job.status !== 'running' && job.status !== 'stopped')) continue;
+    if (job.worker_pid > 0) killProcessTree(job.worker_pid, 'SIGKILL');
+    finalizeJob(handle, 'failed', { resume_token: job.resume_token });
+  }
+  process.exit(0);
+}
+let _shuttingDown = false;
+/** Reset shutdown state for testing. Production code never calls this. */
+export function resetShutdownState(): void { _shuttingDown = false; launchedHandles.clear(); }
 
 type LadderResult = { handle: string; status: string } | { status: 'exhausted'; note: string };
 
@@ -427,9 +457,15 @@ server.tool('worker_list',
 if (import.meta.main) {
   sweepStaleJobs();
   reapStoppedJobs();
-  // Periodic reap so a frozen job nobody resumes is reclaimed within ~1 scan of its window,
-  // not only on the next server boot. unref'd → never keeps the process alive on its own.
-  setInterval(reapStoppedJobs, 60_000).unref();
+  // Periodic sweep: reap frozen jobs AND reap orphaned workers (whose owning server was killed -9).
+  // Both run in the same interval to keep the dead-worker logic single-sourced. unref'd → never
+  // keeps the process alive on its own.
+  setInterval(() => { reapStoppedJobs(); sweepStaleJobs(); }, 60_000).unref();
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  // Clean up this session's workers on exit. SIGTERM/SIGINT from the OS, or stdin
+  // EOF when the parent Claude process exits (pipe closes even on kill -9 of parent).
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
+  process.stdin.on('end', shutdown);
 }
