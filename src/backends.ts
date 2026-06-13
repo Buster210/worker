@@ -1,11 +1,56 @@
-import { handleDir } from './state.ts';
+import { handleDir, workersDir } from './state.ts';
+import { join } from 'path';
+import { readFileSync } from 'fs';
 import { tailCapped } from './logParse.ts';
 
 export type Backend = 'pool' | 'omp' | 'opencode' | 'cmd' | 'claude' | 'claude_tmux' | 'codex';
 
 export const ALL_BACKENDS: readonly Backend[] = ['omp', 'opencode', 'pool', 'cmd', 'codex', 'claude', 'claude_tmux'];
 
-export const LADDER: Backend[] = ALL_BACKENDS.filter(be => process.env[`SKIP_${be}`] !== '1');
+export function computeLadder(): Backend[] {
+  const validSet = new Set<string>(ALL_BACKENDS);
+  const defaultOrder: Backend[] = ALL_BACKENDS.filter(be => process.env[`SKIP_${be}`] !== '1');
+
+  let filePath: string;
+  try {
+    filePath = join(workersDir(), 'ladder.json');
+  } catch (e) {
+    console.error(`[ladder] failed to resolve workersDir: ${e}`);
+    return defaultOrder;
+  }
+
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(filePath, 'utf-8'));
+  } catch (e: any) {
+    if (e?.code === 'ENOENT') return defaultOrder;
+    console.error(`[ladder] failed to read ladder.json: ${e?.message ?? e}`);
+    return defaultOrder;
+  }
+
+  if (!Array.isArray(raw)) {
+    console.error('[ladder] ladder.json is not an array, falling back to default');
+    return defaultOrder;
+  }
+
+  const seen = new Set<string>();
+  const ordered: Backend[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== 'string') continue;
+    if (!validSet.has(entry)) continue;
+    if (seen.has(entry)) continue;
+    seen.add(entry);
+    ordered.push(entry as Backend);
+  }
+
+  for (const be of ALL_BACKENDS) {
+    if (!seen.has(be)) ordered.push(be);
+  }
+
+  return ordered.filter(be => process.env[`SKIP_${be}`] !== '1');
+}
+
+export const LADDER: Backend[] = computeLadder();
 
 const STANDARDS = `You are a coding worker. BINDING STANDARDS: priority correctness > security > clarity > performance > brevity. Make surgical, minimal changes — touch only what the task needs, no drive-by refactors. When changing code that already works, stay behaviorally lossless. Validate inputs at trust boundaries; never put secrets in code or logs. Match the surrounding code conventions; idiomatic to the language; prefer stdlib/maintained deps over hand-rolling.`;
 const CONTRACT = `\nMake only the changes the task requires. Stop when done. Final reply = ONE line: "DONE" or "FAILED:<reason>". Nothing else.`;
