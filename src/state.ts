@@ -15,6 +15,28 @@ export function workersDir(): string {
   return dir;
 }
 
+// Per-process in-memory read cache for job.json, write-through to disk. Populated from disk
+// on cold boot (scanAllJobs) and kept in sync by every write path (insertJob / updateJob /
+// finalizeJob). Same-process reads hit the map first, falling back to disk on miss. This
+// cache is NOT cross-process coherent — the worker-report bin uses getJobFresh to bypass it.
+//
+// Memory: bounded by handle count (~500B per Job serialized, ~1KB in V8). For 200 jobs
+// that's ~200KB — negligible. For 1000 jobs, ~1MB.
+const _jobs = new Map<string, Job>();
+let _jobsBootstrapped = false;
+
+/** Populate the in-memory map from disk. Called once on first read after process start. */
+function ensureBootstrapped(): void {
+  if (_jobsBootstrapped) return;
+  _jobsBootstrapped = true;
+  for (const j of scanAllJobsFromDisk()) _jobs.set(j.handle, j);
+}
+
+/** Bypass the cache for a single read (used by the bootstrap itself). */
+function scanAllJobsFromDisk(): Job[] {
+  return scanAllJobs();
+}
+
 export function projectName(repo: string): string {
   const homePrefix = `${process.env.HOME}/`;
   let rel = repo;
@@ -97,13 +119,18 @@ export type Job = {
   // and is NEVER swept (safe-fail: existing dead-worker branch still covers these).
   server_pid: number;
   server_started: string;
+  // Owning Claude session id (CLAUDE_CODE_SESSION_ID of the parent session). Combined with
+  // server_pid/server_started, this closes the PID-reuse window: even if a recycled pid +
+  // coincident start-time happen to match an alive server, a different sid means it's a different
+  // MCP server (and that server's own orphan sweep owns its own jobs).
+  server_sid: string;
 };
 
 export function insertJob(j: {
   handle: string; backend: string; sid: string;
   worker_pid?: number; resume_token?: string; repo: string; model?: string;
   task?: string; log_path: string; completion_lock?: string;
-  server_pid?: number; server_started?: string;
+  server_pid?: number; server_started?: string; server_sid?: string;
 }) {
   const job: Job = {
     handle: j.handle, backend: j.backend,
@@ -115,8 +142,13 @@ export function insertJob(j: {
     completion_lock: j.completion_lock ?? lockPath(j.handle, j.repo),
     server_pid: j.server_pid ?? 0,
     server_started: j.server_started ?? '',
+    server_sid: j.server_sid ?? '',
   };
   mkdirSync(handleDir(j.handle, j.repo), { recursive: true });
+  // Seed the cache BEFORE writing to disk so a concurrent getJob from another tick sees the new job
+  // (the event loop is single-threaded, but `mkdirSync` is one tick away from `writeFileSync` — any
+  // intervening await in the future would expose the race without this ordering).
+  _jobs.set(job.handle, job);
   const jobPath = jobPathFn(j.handle, j.repo);
   const tmpPath = `${jobPath}.${process.pid}.tmp`;
   writeFileSync(tmpPath, JSON.stringify(job, null, 2));
@@ -124,18 +156,45 @@ export function insertJob(j: {
   createLock(j.handle, j.repo);
 }
 
+/**
+ * Update job fields: merge into the in-memory map, then write-through to job.json.
+ * Synchronous — no interleaving possible on the single-threaded JS event loop, so
+ * concurrent updateJob calls naturally serialize and each sees the other's prior write.
+ */
 export function updateJob(handle: string, fields: Partial<Job>) {
+  ensureBootstrapped();
+  const current = _jobs.get(handle);
+  if (!current) return; // unknown handle — nothing to update
+  const merged = { ...current, ...fields };
+  _jobs.set(handle, merged);
   const path = jobPathFn(handle);
   try {
-    const job = JSON.parse(readFileSync(path, 'utf8'));
     const tmpPath = `${path}.${process.pid}.tmp`;
-    writeFileSync(tmpPath, JSON.stringify({ ...job, ...fields }, null, 2));
+    writeFileSync(tmpPath, JSON.stringify(merged, null, 2));
     renameSync(tmpPath, path);
   } catch {}
 }
 
 export function getJob(handle: string): Job | null {
-  try { return JSON.parse(readFileSync(jobPathFn(handle), 'utf8')); }
+  ensureBootstrapped();
+  const cached = _jobs.get(handle);
+  if (cached) return cached;
+  // Cache miss for a handle we never inserted this process — try the disk once (e.g. a
+  // resume targeting a job the original server wrote, and another process later reads).
+  try {
+    const job = JSON.parse(readFileSync(jobPathFn(handle), 'utf8')) as Job;
+    _jobs.set(handle, job);
+    return job;
+  } catch {
+    return null;
+  }
+}
+/** Read a job straight from disk, bypassing the in-memory cache. For cross-process
+ *  readers (the worker-report bin) that MUST observe writes made by the owning server
+ *  process — the cache is per-process and never invalidates, so a cached 'running' would
+ *  mask the final terminal status. */
+export function getJobFresh(handle: string): Job | null {
+  try { return JSON.parse(readFileSync(jobPathFn(handle), 'utf8')) as Job; }
   catch { return null; }
 }
 
@@ -165,18 +224,16 @@ function scanAllJobs(): Job[] {
   } catch { return []; }
 }
 
-export function getAllRunningJobs(): Job[] { return scanAllJobs().filter(j => j.status === 'running'); }
-export function getAllStoppedJobs(): Job[] { return scanAllJobs().filter(j => j.status === 'stopped'); }
+export function getAllRunningJobs(): Job[] { ensureBootstrapped(); return Array.from(_jobs.values()).filter(j => j.status === 'running'); }
+export function getAllStoppedJobs(): Job[] { ensureBootstrapped(); return Array.from(_jobs.values()).filter(j => j.status === 'stopped'); }
+/** All cached jobs regardless of status — used by handleList which filters by status itself. */
+export function getAllJobs(): Job[] { ensureBootstrapped(); return Array.from(_jobs.values()); }
 
 export function getRunningJobsForRepo(repo: string): Job[] {
-  const project = projectName(repo);
-  try {
-    const root = workersDir();
-    return readdirSync(join(root, project), { withFileTypes: true })
-      .filter(h => h.isDirectory())
-      .map(h => { try { return JSON.parse(readFileSync(join(root, project, h.name, 'job.json'), 'utf8')); } catch { return null; } })
-      .filter((j): j is Job => j && (j.status === 'running' || j.status === 'stopped'));
-  } catch { return []; }
+  ensureBootstrapped();
+  return Array.from(_jobs.values()).filter(j =>
+    (j.status === 'running' || j.status === 'stopped') && j.repo === repo
+  );
 }
 
 export function appendLadder(sid: string, turn: number, worker: string, result: string) {

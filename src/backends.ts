@@ -1,5 +1,5 @@
-import { readFileSync } from 'fs';
 import { handleDir } from './state.ts';
+import { tailCapped } from './logParse.ts';
 
 export type Backend = 'pool' | 'omp' | 'opencode' | 'cmd' | 'claude' | 'claude_tmux' | 'codex';
 
@@ -54,7 +54,10 @@ export function buildResumeArgv(backend: Backend, spec: string, repo: string, to
       // token is the original handle → same per-job session dir as the run; --continue resumes it.
       return ['omp', '-p', spec, '--session-dir', handleDir(token, repo), '--continue', '--approval-mode=yolo', '--mode=json', ...(extraArgs ?? [])];
     case 'opencode':
-      return ['opencode', 'run', spec, '-s', token, '--dir', repo, ...(extraArgs ?? [])];
+      // Must carry --dangerously-skip-permissions exactly like buildRunArgv: stdin is /dev/null in
+      // the runner, so a permission prompt on resume would block with no input → the log stops
+      // growing → the stall watchdog freezes the (actually fine) job at 120s. Omitting it broke resume.
+      return ['opencode', 'run', spec, '-s', token, '--dir', repo, '--dangerously-skip-permissions', ...(extraArgs ?? [])];
     case 'pool':
       return ['pool', 'exec', '-p', spec, '-d', repo, '--unsafe-auto-allow', '--continue', token, ...(extraArgs ?? [])];
     case 'cmd':
@@ -73,8 +76,12 @@ export function getResumeToken(backend: Backend, sid: string, logPath: string): 
     case 'claude': case 'omp': return sid;
     case 'pool': case 'codex': return 'last';
     case 'opencode': {
+      // opencode appends ses_<id> tokens as it runs, so the last one in the log is the session
+      // to resume. Read the tail only — full-file reads on a 100MB+ opencode log would block the
+      // event loop for hundreds of ms at completion. tailCapped drops the first (partial) line
+      // when the cap lands mid-file; that line is older than any ses_ match anyway.
       try {
-        const log = readFileSync(logPath, 'utf8');
+        const log = tailCapped(logPath);
         const matches = log.match(/ses_[A-Za-z0-9]+/g);
         const lastMatch = matches?.[matches.length - 1] ?? '';
         if (!lastMatch && log.trim().length > 0) {

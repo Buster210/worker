@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach, afterAll } from 'bun:test';
-import { rmSync, mkdirSync, readdirSync } from 'fs';
+import { rmSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -8,7 +8,7 @@ import { tmpdir } from 'os';
 const STATE_DIR = join(tmpdir(), `wstate-state-${process.pid}`);
 process.env.WORKER_STATE_DIR = STATE_DIR;
 
-import { finalizeJob, insertJob, getJob, updateJob, workersDir, handleDir, resolveHandleDir } from './state.ts';
+import { finalizeJob, insertJob, getJob, getJobFresh, updateJob, workersDir, handleDir, resolveHandleDir } from './state.ts';
 
 afterAll(() => {
   try { rmSync(STATE_DIR, { recursive: true, force: true }); } catch {}
@@ -92,5 +92,26 @@ describe('handleDir cache (#5)', () => {
     rmSync(join(workersDir(), 'tmp-wcache-proj'), { recursive: true, force: true });
     expect(resolveHandleDir(handle)).toBeNull();   // the scan now yields nothing
     expect(handleDir(handle)).toBe(cachedDir);      // ...yet handleDir still returns it → served from cache
+  });
+});
+
+describe('getJobFresh bypasses in-memory cache', () => {
+  it('reads the latest disk state while getJob returns stale cache', () => {
+    const handle = `fresh-test-${process.pid}-${Date.now()}`;
+    insertJob({ handle, backend: 'cmd', sid: 't', repo: '/tmp/fresh-test', log_path: 'x' });
+
+    // Both agree on 'running' initially
+    expect(getJob(handle)?.status).toBe('running');
+    expect(getJobFresh(handle)?.status).toBe('running');
+
+    const jobPath = join(handleDir(handle), 'job.json');
+    const disk = JSON.parse(readFileSync(jobPath, 'utf8'));
+    disk.status = 'done';
+    writeFileSync(jobPath, JSON.stringify(disk, null, 2));
+
+    // getJob still returns the stale in-memory 'running'
+    expect(getJob(handle)?.status).toBe('running');
+    // getJobFresh reads disk and returns the updated 'done'
+    expect(getJobFresh(handle)?.status).toBe('done');
   });
 });

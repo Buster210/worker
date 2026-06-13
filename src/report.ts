@@ -12,17 +12,19 @@
 //   exhausted -> "exhausted"        + blank line + full `git diff`
 //   stopped   -> "stopped"          (single line, no diff — frozen/resumable, work is incomplete)
 //   killed    -> "killed"           (single line, no diff — deliberate abort)
-import { existsSync, watch } from 'fs';
-import { basename, dirname } from 'path';
+import { existsSync } from 'fs';
+import { basename } from 'path';
 import { spawnSync } from 'child_process';
-import { getJob, getLadderHistory, lockPath } from './state.ts';
+import { getJobFresh, getLadderHistory, lockPath } from './state.ts';
 
 // Resolved lazily (not a load-time const) so tests can set a tight interval, matching the lazy-env
 // convention in state.ts/runner.ts/logParse.ts. Also guards a bad value: a non-numeric env would
 // make Number() NaN and setInterval(fn, NaN) spin at 0ms — fall back to the default instead.
+// Default 500ms: without fs.watch we can go faster unconditionally; the agent's perceived
+// completion latency at 500ms is the same as event-driven (~1 tick). Tests override via env.
 function reportPollMs(): number {
   const v = Number(process.env.WORKER_REPORT_POLL_MS);
-  return Number.isFinite(v) && v > 0 ? v : 10_000;
+  return Number.isFinite(v) && v > 0 ? v : 500;
 }
 
 // Resolve the TRUE terminal status. A ladder's rung-0 job.json is misleading (it shows rung 0's own
@@ -39,7 +41,7 @@ export function terminalStatus(handle: string, lockPath: string): string {
     if (last === 'killed') return 'killed';
     return 'exhausted';
   }
-  return getJob(handle)?.status ?? 'failed';
+  return getJobFresh(handle)?.status ?? 'failed';
 }
 
 // done collapses to the single word "completed"; every other status is reported verbatim (preserving
@@ -71,7 +73,7 @@ export function renderReport(handle: string, lockPath: string, diff: (repo: stri
   if (!wantsDiff(status)) return line;
   // Hard-fail on an unknown handle rather than letting an empty repo path diff the watcher's own cwd
   // (`git -C '' diff` silently succeeds against wherever the watcher runs → a plausible but wrong tree).
-  const repo = getJob(handle)?.repo;
+  const repo = getJobFresh(handle)?.repo;
   if (!repo) return `${line}\n\n(diff unavailable: unknown handle ${handle})`;
   return `${line}\n\n${diff(repo)}`;
 }
@@ -87,27 +89,20 @@ function ownerDead(serverPid: number): boolean {
 
 export async function waitForUnlock(lockPath: string, serverPid = 0): Promise<void> {
   if (!existsSync(lockPath)) return;
+  // Plain stat-poll. fs.watch on a parent directory fires for sibling-file churn on macOS
+  // FSEvents and has a non-trivial setup cost; a tight poll is simpler, predictable, and at the
+  // default 500ms the agent's perceived latency matches event-driven (~1 tick). The interval is
+  // .unref()'d so the polling timer never holds the report process open past lock release.
   return new Promise<void>((resolve) => {
-    let resolved = false;
-    const done = () => {
-      if (resolved) return;
-      resolved = true;
-      clearInterval(fallback);
-      watcher.close();
-      resolve();
-    };
-    const watcher = watch(dirname(lockPath), () => {
-      if (!existsSync(lockPath)) done();
-    });
-    watcher.on('error', () => { if (!existsSync(lockPath)) done(); });
-    const fallback = setInterval(() => {
+    const interval = setInterval(() => {
       // Lock cleared the normal way → done.
-      if (!existsSync(lockPath)) { done(); return; }
+      if (!existsSync(lockPath)) { clearInterval(interval); resolve(); return; }
       // Lock still held but the owning server is gone: a crashed/killed server can never finalize,
       // and a chain lock is never adopted by another server, so this lock would never clear. Bail and
       // let renderReport report the last known terminal state instead of hanging forever.
-      if (ownerDead(serverPid)) done();
+      if (ownerDead(serverPid)) { clearInterval(interval); resolve(); }
     }, reportPollMs());
+    interval.unref?.();
   });
 }
 
@@ -117,7 +112,7 @@ if (import.meta.main) {
     console.error('usage: worker-report <handle>');
     process.exit(1);
   }
-  const job = getJob(handle);
+  const job = getJobFresh(handle);
   if (!job) {
     console.error(`report: unknown handle ${handle}`);
     process.exit(1);

@@ -2,9 +2,8 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { randomUUID } from 'crypto';
-import { readdirSync, readFileSync } from 'fs';
 import { spawnSync } from 'child_process';
-import { insertJob, getJob, updateJob, createLock, workersDir, logPath as workerLogPath, finalizeJob, getRunningJobsForRepo, chainLockPath, createChainLock, removeChainLock } from './state.ts';
+import { insertJob, getJob, updateJob, createLock, logPath as workerLogPath, finalizeJob, getRunningJobsForRepo, chainLockPath, createChainLock, removeChainLock, getAllJobs } from './state.ts';
 import { buildSpec, buildRunArgv, buildResumeArgv, getResumeToken, LADDER, ALL_BACKENDS, type Backend } from './backends.ts';
 import {
   runWorker, runClaudeTmux, sweepStaleJobs, reapStoppedJobs, workerEnv,
@@ -16,6 +15,10 @@ import { killProcessTree } from './descendent-kill.ts';
 // Boot timestamp captured once at module init — written to every job so the orphan sweep can
 // verify a job's owning server is still alive (PID-reuse guard via isProcessAlive's started arg).
 const SERVER_STARTED = new Date().toISOString();
+// Owning Claude session id (CLAUDE_CODE_SESSION_ID). Persisted on every job so the orphan sweep
+// can distinguish "this server died" from "another server with a recycled pid happens to match
+// this server's pid + start time". sid is unique per Claude session and does not get recycled.
+const SERVER_SID = process.env.CLAUDE_CODE_SESSION_ID ?? '';
 // Handles (job IDs) this server process launched. Scoped cleanup on shutdown — never
 // touch another session's workers. Populated by trackLaunched() at launch time.
 const launchedHandles = new Set<string>();
@@ -76,15 +79,25 @@ function launch(
   const spec = buildSpec(backend, prompt);
   // claude pins sonnet; omp + claude_tmux ignore model entirely. None thread the model parameter.
   const modelToUse = (backend === 'claude' || backend === 'omp' || backend === 'claude_tmux') ? undefined : opts.model;
-  insertJob({ handle, backend, sid: opts.sid, repo: dir, model: modelToUse, task: prompt, log_path: lp, completion_lock: opts.completionLock, server_pid: process.pid, server_started: SERVER_STARTED });
+  insertJob({ handle, backend, sid: opts.sid, repo: dir, model: modelToUse, task: prompt, log_path: lp, completion_lock: opts.completionLock, server_pid: process.pid, server_started: SERVER_STARTED, server_sid: SERVER_SID });
+
+  // Catch any uncaught throw from the runner and finalize the job as 'failed'. The runners
+  // (runWorker / runClaudeTmux) finalize on their own happy/exit paths, but a synchronous
+  // throw from argument validation, a backend spawn failure that escapes the watchdog's
+  // proc.on('error'), or any future throw site would otherwise leave the job stuck 'running'
+  // until the next periodic sweep reaps it as 'failed:server-restart' (60 s window).
+  const trackError = (p: Promise<RunResult>): Promise<RunResult> => p.catch((err: unknown) => {
+    finalizeJob(handle, 'failed');
+    throw err;  // re-throw so callers (chain controller) see the failure too
+  });
 
   let promise: Promise<RunResult>;
   if (backend === 'claude_tmux') {
-    promise = runClaudeTmux(spec, dir, handle, handle, opts.timeoutMs);
+    promise = trackError(runClaudeTmux(spec, dir, handle, handle, opts.timeoutMs));
   } else {
     const argv = buildRunArgv(backend, spec, dir, handle, modelToUse, opts.extraArgs);
     const initToken = backend === 'opencode' ? '' : getResumeToken(backend, handle, lp);
-    promise = runWorker(argv, dir, handle, backend, lp, initToken, opts.timeoutMs)
+    promise = trackError(runWorker(argv, dir, handle, backend, lp, initToken, opts.timeoutMs))
       .then(r => {
         if (backend === 'opencode') {
           const tok = getResumeToken('opencode', handle, lp);
@@ -197,6 +210,8 @@ export function handleRun(args: { backend: Backend; prompt: string; model?: stri
   const sid = randomUUID();
   const { handle, promise } = launch(args.backend, args.prompt, args.dir,
     { sid, model: args.model, extraArgs: args.extraArgs, timeoutMs: args.timeout ? args.timeout * 1000 : undefined });
+  // Errors are already logged + finalized inside launch(); silence here so the MCP tool
+  // envelope stays clean (no unhandled-rejection on the tool surface).
   void promise.catch(() => {});
   return { handle, status: 'running' };
 }
@@ -210,6 +225,12 @@ function resumeLaunch(args: { handle: string; prompt: string; dir: string; timeo
   if (!job) throw new Error(`No job found for handle: ${handle}`);
   updateJob(handle, { kill_requested: false });
 
+  // Catch + finalize any uncaught throw from the resume path (see launch() for rationale).
+  const trackError = (p: Promise<RunResult>): Promise<RunResult> => p.catch((err: unknown) => {
+    finalizeJob(handle, 'failed');
+    throw err;
+  });
+
   // Handle stopped jobs: SIGCONT the process, re-arm fresh timeout
   if (job.status === 'stopped') {
     const pid = job.worker_pid;
@@ -222,7 +243,7 @@ function resumeLaunch(args: { handle: string; prompt: string; dir: string; timeo
       const argv = buildResumeArgv(be, spec, dir, job.resume_token, undefined, extraArgs);
       const p = runWorker(argv, dir, handle, be, lp,
         job.resume_token, timeout ? timeout * 1000 : undefined);
-      return { handle, promise: p };
+      return { handle, promise: trackError(p) };
     }
 
     // Resume the frozen process: SIGCONT, re-arm a fresh hard timeout, hand off to the watcher.
@@ -233,7 +254,7 @@ function resumeLaunch(args: { handle: string; prompt: string; dir: string; timeo
     const be = job.backend as Backend;
     const lp = workerLogPath(handle);
     const deadlineMs = timeout ? timeout * 1000 : defaultTimeoutMs();
-    return { handle, promise: watchExisting(handle, pid, dir, lp, be, deadlineMs) };
+    return { handle, promise: trackError(watchExisting(handle, pid, dir, lp, be, deadlineMs)) };
   }
 
   // Normal resume for non-stopped jobs
@@ -246,11 +267,14 @@ function resumeLaunch(args: { handle: string; prompt: string; dir: string; timeo
   const argv = buildResumeArgv(be, spec, dir, job.resume_token, undefined, extraArgs);
   const p = runWorker(argv, dir, handle, be, lp,
     job.resume_token, timeout ? timeout * 1000 : undefined);
-  return { handle, promise: p };
+  return { handle, promise: trackError(p) };
 }
 
 export function handleResume(args: { handle: string; prompt: string; dir: string; timeout?: number; extraArgs?: string[] }): { handle: string; status: string } {
   const { handle, promise } = resumeLaunch(args);
+  // resumeLaunch's underlying runWorker/watchExisting already finalize on happy paths; this
+  // catches any uncaught throw and keeps the tool envelope clean. (A throw here is rare — see
+  // the spawn-error / argument-validation cases in launch()'s trackError wrapper.)
   void promise.catch(() => {});
   return { handle, status: 'running' };
 }
@@ -322,20 +346,8 @@ export function handleDoctor(args: { backend?: string }): string {
 
 export function handleList(args: { status?: string; limit?: number }): Record<string, unknown>[] {
   const { status, limit = 20 } = args;
-  const root = workersDir();
-  // Jobs nest as <root>/<project>/<handle>/job.json (see state.insertJob), so walk two levels —
-  // mirrors getAllRunningJobs. The old one-level read silently returned nothing for every job
-  // stored under the current layout.
-  return readdirSync(root, { withFileTypes: true })
-    .filter(d => d.isDirectory() && d.name !== 'ladder' && d.name !== 'tmux')
-    .flatMap(project => {
-      try {
-        return readdirSync(`${root}/${project.name}`, { withFileTypes: true })
-          .filter(h => h.isDirectory())
-          .map(h => { try { return JSON.parse(readFileSync(`${root}/${project.name}/${h.name}/job.json`, 'utf8')); } catch { return null; } });
-      } catch { return []; }
-    })
-    .filter((j): j is NonNullable<typeof j> => j !== null)
+  // O(N) in-memory filter + sort + slice over the bootstrap cache. No disk I/O.
+  return getAllJobs()
     .filter(j => !status || j.status === status)
     .sort((a, b) => (b.started ?? '').localeCompare(a.started ?? ''))
     .slice(0, limit)
@@ -381,7 +393,7 @@ Hand a coding task to a background agent that edits a git repo, then check, resu
 - \`worker_doctor(backend?)\` — health check; names only the workers that aren't working.`;
 
 const server = new McpServer(
-  { name: 'worker', version: '0.1.0' },
+  { name: 'worker', version: '0.2.0' },
   { instructions: WORKER_INSTRUCTIONS },
 );
 

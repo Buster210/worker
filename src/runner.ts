@@ -6,6 +6,15 @@ import { readSentinel } from './logParse.ts';
 import type { Job } from './state.ts';
 import { killProcessTree } from './descendent-kill.ts';
 
+// Owning Claude session id (CLAUDE_CODE_SESSION_ID). The orphan sweep compares each job's
+// server_sid to this value to distinguish "this server died" from "another server with a recycled
+// pid happens to match our pid + start time". sid is unique per Claude session and does not get
+// recycled. Read lazily per call so tests can set the env AFTER module init (ES imports are
+// hoisted above test setup, so an eager read at module top would always see '' under bun test).
+function thisServerSid(): string {
+  return process.env.CLAUDE_CODE_SESSION_ID ?? '';
+}
+
 // On startup: mark any jobs still showing 'running' whose PIDs are dead as failed.
 // Prevents stale state after a server restart mid-job.
 // Timing knobs resolve from env at call time (defaults = production behavior), so tests
@@ -117,6 +126,12 @@ export { resolveStatus };
 
 export function sweepStaleJobs() {
   for (const job of getAllRunningJobs()) {
+    // Only sweep jobs owned by THIS server. server_sid is unique per Claude session and never
+    // recycles, so it's a strict superset of the server_pid+server_started check: even a recycled
+    // pid + coincident start time won't make another server's job look like ours. Jobs with no
+    // server_sid (legacy / pre-sweep) are skipped — the dead-worker branch below still catches
+    // them once the worker itself dies.
+    if (job.server_sid === '' || job.server_sid !== thisServerSid()) continue;
     // Owning server still alive → its in-process runner (launchAndWait / runClaudeTmux) owns this
     // job's finalization, so the sweep must not race it. This covers claude_tmux jobs (worker_pid=0
     // by design) and the brief window after insertJob before launchAndWait sets the real worker_pid —
@@ -207,8 +222,11 @@ export function suspendAndEval(handle: string, pid: number, logPath: string, bac
 // Elapsed (not wall-clock lstart) is timezone-independent: parsing lstart with `new Date()`
 // silently misreads the system-local string whenever the runtime TZ differs (e.g. TZ=UTC),
 // skewing the start by the offset and breaking the PID-reuse guard for every live process.
+// Hoisted to module scope so the regex is compiled once, not per isProcessAlive call (which
+// fires on every worker_status + every sweep tick + every reap iteration).
+const ETIME_RE = /^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/;
 export function parseEtimeSeconds(etime: string): number | null {
-  const m = etime.trim().match(/^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/);
+  const m = etime.trim().match(ETIME_RE);
   if (!m) return null;
   const [, dd, hh, mm, ss] = m;
   return Number(dd ?? 0) * 86400 + Number(hh ?? 0) * 3600 + Number(mm) * 60 + Number(ss);
@@ -459,14 +477,25 @@ const CLAUDE_CFG_BAK = `${CLAUDE_CFG}.worker-bak`;
 // We deliberately never restore afterward: the trust flag is benign/idempotent, while
 // ~/.claude.json is a large file other claude processes write concurrently — a teardown restore
 // would clobber their writes. One-time backup + atomic write keep the mutation safe; flag stays set.
+
+// Memoize per (raw, realpath) so a 7-rung ladder on the same repo does 1 read+write of
+// ~/.claude.json instead of 7. Keyed on the pair itself (not just repo) because the realpath
+// resolution can differ across callers and we want each unique identity cached exactly once.
+// Process-local; no invalidation needed (the trust flag, once set, stays set for the session).
+const _seedRepoTrustCache = new Set<string>();
+
 function seedRepoTrust(repo: string): void {
+  let real = repo;
+  try { real = realpathSync(repo); } catch {}
+  const cacheKey = `${repo}\0${real}`;
+  if (_seedRepoTrustCache.has(cacheKey)) return;
+  _seedRepoTrustCache.add(cacheKey);
+
   let cfg: ClaudeConfig;
   try { cfg = JSON.parse(readFileSync(CLAUDE_CFG, 'utf8')); }
   catch { return; } // missing/corrupt config → skip seeding, never crash the run
 
   const projects = cfg.projects ?? (cfg.projects = {});
-  let real = repo;
-  try { real = realpathSync(repo); } catch {}
   const keys = [...new Set([repo, real])];
 
   if (keys.every(k => projects[k]?.hasTrustDialogAccepted === true)) return;

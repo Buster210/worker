@@ -86,9 +86,9 @@ describe('buildResumeArgv', () => {
     expect(argv).toEqual(['omp', '-p', 'spec', '--session-dir', handleDir('token123', '/repo'), '--continue', '--approval-mode=yolo', '--mode=json']);
   });
 
-  it('builds opencode resume argv with token', () => {
+  it('builds opencode resume argv with token and skips permissions like run', () => {
     const argv = buildResumeArgv('opencode', 'spec', '/repo', 'token123');
-    expect(argv).toEqual(['opencode', 'run', 'spec', '-s', 'token123', '--dir', '/repo']);
+    expect(argv).toEqual(['opencode', 'run', 'spec', '-s', 'token123', '--dir', '/repo', '--dangerously-skip-permissions']);
   });
 
   it('builds codex resume argv', () => {

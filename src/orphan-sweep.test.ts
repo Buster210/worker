@@ -10,6 +10,10 @@ import { tmpdir } from 'os';
 // Instead we drive the REAL killProcessTree against real `sleep` processes.
 const STATE_DIR = join(tmpdir(), `worphan-state-${process.pid}`);
 process.env.WORKER_STATE_DIR = STATE_DIR;
+// Capture the runner's view of THIS server's sid so seedRunning() can tag jobs as "ours" —
+// without matching server_sid, the new sid-aware orphan check skips every seeded job.
+const THIS_SID = process.env.CLAUDE_CODE_SESSION_ID ?? `test-sid-${process.pid}`;
+process.env.CLAUDE_CODE_SESSION_ID = THIS_SID;
 
 import { sweepStaleJobs, isProcessAlive } from './runner.ts';
 import { insertJob, getJob, logPath as stateLogPath } from './state.ts';
@@ -35,6 +39,7 @@ function seedRunning(fields: {
   server_pid?: number;
   server_started?: string;
   resume_token?: string;
+  server_sid?: string;
 }): string {
   const handle = `orphan-${process.pid}-${seq++}`;
   insertJob({
@@ -44,6 +49,7 @@ function seedRunning(fields: {
     resume_token: fields.resume_token,
     server_pid: fields.server_pid ?? 0,
     server_started: fields.server_started ?? '',
+    server_sid: fields.server_sid ?? THIS_SID,
   });
   return handle;
 }
@@ -118,6 +124,24 @@ describe('sweepStaleJobs — orphan branch', () => {
     sweepStaleJobs();
 
     expect(getJob(handle)!.status).toBe('running');   // orphan branch skipped on server_pid 0
+    expect(isProcessAlive(workerPid)).toBe(true);
+  });
+
+  it('leaves a job owned by a different sid untouched (cross-server isolation)', () => {
+    // A14 fix: server_sid is the unique-per-session identity. A recycled pid + coincident start
+    // time cannot make another server's job look like ours — different sid → skipped.
+    const workerPid = spawnSleep();
+    const handle = seedRunning({
+      worker_pid: workerPid,
+      server_pid: deadPid(),          // owner is "dead" by pid/start
+      server_started: new Date().toISOString(),
+      server_sid: 'some-other-sid',   // but owner is a DIFFERENT server (different session)
+    });
+
+    sweepStaleJobs();
+
+    // The other server's own orphan sweep owns this job; we must not touch it.
+    expect(getJob(handle)!.status).toBe('running');
     expect(isProcessAlive(workerPid)).toBe(true);
   });
 });
