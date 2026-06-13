@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach, afterAll } from 'bun:test';
-import { rmSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'fs';
+import { rmSync, mkdirSync, readdirSync, readFileSync, writeFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -8,7 +8,7 @@ import { tmpdir } from 'os';
 const STATE_DIR = join(tmpdir(), `wstate-state-${process.pid}`);
 process.env.WORKER_STATE_DIR = STATE_DIR;
 
-import { finalizeJob, insertJob, getJob, getJobFresh, updateJob, workersDir, handleDir, resolveHandleDir } from './state.ts';
+import { finalizeJob, insertJob, getJob, getJobFresh, updateJob, workersDir, handleDir, resolveHandleDir, pruneOldJobs } from './state.ts';
 
 afterAll(() => {
   try { rmSync(STATE_DIR, { recursive: true, force: true }); } catch {}
@@ -113,5 +113,25 @@ describe('getJobFresh bypasses in-memory cache', () => {
     expect(getJob(handle)?.status).toBe('running');
     // getJobFresh reads disk and returns the updated 'done'
     expect(getJobFresh(handle)?.status).toBe('done');
+  });
+});
+
+describe('pruneOldJobs', () => {
+  it('removes terminal jobs past retention, keeps fresh + running', () => {
+    const mk = (handle: string, status: string, finishedAgoMs?: number) => {
+      insertJob({ handle, backend: 'cmd', sid: 's', repo: '/tmp/prune-repo', log_path: '/tmp/x' });
+      if (status !== 'running') {
+        updateJob(handle, { status, finished: new Date(Date.now() - (finishedAgoMs ?? 0)).toISOString() });
+      }
+    };
+    mk('old-term', 'done', 8 * 86_400_000);  // 8 days old -> prune
+    mk('fresh-term', 'done', 1000);          // 1s old -> keep
+    mk('run', 'running');                    // running -> keep
+    const oldDir = handleDir('old-term', '/tmp/prune-repo');
+    expect(pruneOldJobs(Date.now())).toBe(1);
+    expect(getJob('old-term')).toBeNull();
+    expect(existsSync(oldDir)).toBe(false);
+    expect(getJob('fresh-term')).not.toBeNull();
+    expect(getJob('run')).not.toBeNull();
   });
 });

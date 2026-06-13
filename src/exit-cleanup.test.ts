@@ -7,7 +7,7 @@ import { mkdirSync, rmSync } from 'fs';
 const STATE_DIR = join(tmpdir(), `wexit-${process.pid}`);
 process.env.WORKER_STATE_DIR = STATE_DIR;
 
-import { shutdown, trackLaunched, resetShutdownState } from './server.ts';
+import { shutdown, trackLaunched, resetShutdownState } from './lifecycle.ts';
 import { insertJob, updateJob, getJob, logPath as stateLogPath } from './state.ts';
 
 const REPO = '/tmp/wexit-repo';

@@ -1,0 +1,96 @@
+import { spawnSync } from 'child_process';
+import { statSync, writeFileSync, readFileSync, renameSync } from 'fs';
+import { workersDir } from './state.ts';
+
+export function envMs(key: string, def: number): number {
+  const v = Number(process.env[key]);
+  return Number.isFinite(v) && v > 0 ? v : def;
+}
+
+export function defaultTimeoutMs(): number { return envMs('WORKER_TIMEOUT_MS', 600_000); }
+export function watchdogMs(): number { return envMs('WORKER_WATCHDOG_MS', 5_000); }
+export function stallTimeoutMs(): number { return envMs('WORKER_STALL_MS', 60_000); }
+export function quietStallMs(): number { return envMs('WORKER_STALL_MS_QUIET', 240_000); }
+export function reapAgeMs(): number { return envMs('WORKER_REAP_MS', 900_000); }
+
+const HOME = process.env.HOME ?? '';
+
+const LOGIN_ENV_MARKER = '__WORKER_ENV_a7f3__';
+let _loginEnvCache: Record<string, string> | null | undefined;
+
+export function parseEnvSnapshot(stdout: string, marker: string): Record<string, string> | null {
+  const idx = stdout.indexOf(marker);
+  if (idx === -1) return null;
+  const jsonStart = stdout.indexOf('{', idx + marker.length);
+  if (jsonStart === -1) return null;
+  try { return JSON.parse(stdout.slice(jsonStart)); } catch { return null; }
+}
+
+export function loginEnvSig(shell: string): string {
+  const home = process.env.HOME ?? '';
+  const paths = [
+    `${home}/.zshenv`, `${home}/.zprofile`, `${home}/.zlogin`, `${home}/.zshrc`,
+    `${home}/.bash_profile`, `${home}/.bash_login`, `${home}/.bashrc`, `${home}/.profile`,
+    '/etc/zshenv', '/etc/zprofile', '/etc/zlogin', '/etc/zshrc',
+    '/etc/profile', '/etc/bashrc', '/etc/bash.bashrc',
+  ];
+  const parts = paths.map(p => { try { return `${p}:${statSync(p).mtimeMs}`; } catch { return `${p}:-`; } });
+  return `${shell}\n${parts.join('\n')}`;
+}
+export function loginEnvCachePath(): string { return `${workersDir()}/.login-env.json`; }
+export function __resetLoginEnvCache(): void {
+  _loginEnvCache = undefined;
+}
+
+export function loginShellEnv(): Record<string, string> | null {
+  if (process.env.WORKER_LOGIN_SHELL === '0') return null;
+  if (_loginEnvCache !== undefined) return _loginEnvCache;
+  const shell = process.env.SHELL ?? '/bin/zsh';
+  const sig = loginEnvSig(shell);
+  const cachePath = loginEnvCachePath();
+  try {
+    const cached = JSON.parse(readFileSync(cachePath, 'utf8')) as { shell?: string; sig?: string; env?: Record<string, string> };
+    if (cached.shell === shell && cached.sig === sig && cached.env) {
+      _loginEnvCache = cached.env;
+      return cached.env;
+    }
+  } catch {}
+  const bunPath = process.execPath;
+  const snippet =
+    `printf '%s\\n' '${LOGIN_ENV_MARKER}'; exec "${bunPath}" -e 'process.stdout.write(JSON.stringify(process.env))'`;
+  try {
+    const r = spawnSync(shell, ['-l', '-c', snippet], { encoding: 'utf8', timeout: 5000 });
+    if (r.error || r.status !== 0) { _loginEnvCache = null; return null; }
+    const parsed = parseEnvSnapshot(r.stdout ?? '', LOGIN_ENV_MARKER);
+    _loginEnvCache = parsed;
+    if (parsed) {
+      try {
+        const tmp = `${cachePath}.${process.pid}.tmp`;
+        writeFileSync(tmp, JSON.stringify({ shell, sig, env: parsed }));
+        renameSync(tmp, cachePath);
+      } catch {}
+    }
+    return parsed;
+  } catch {
+    _loginEnvCache = null;
+    return null;
+  }
+}
+
+const _loginEnv = loginShellEnv();
+export const workerEnv: NodeJS.ProcessEnv = {
+  ...(_loginEnv ?? {}),
+  ...process.env,
+  WORKER_RC: process.env.WORKER_RC ?? `${HOME}/.common`,
+  PATH: [
+    `${HOME}/.bun/bin`,
+    `${HOME}/.local/bin`,
+    `${HOME}/.cargo/bin`,
+    '/opt/homebrew/bin',
+    '/opt/homebrew/sbin',
+    '/usr/local/bin',
+    '/usr/bin',
+    '/bin',
+    _loginEnv?.PATH ?? process.env.PATH ?? '',
+  ].join(':'),
+};

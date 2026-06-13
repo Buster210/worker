@@ -3,9 +3,6 @@ import { tailCapped } from './logParse.ts';
 
 export type Backend = 'pool' | 'omp' | 'opencode' | 'cmd' | 'claude' | 'claude_tmux' | 'codex';
 
-// All known workers in ladder order. Single source: LADDER is this minus any SKIP_<name>=1,
-// the doctor probes this, and worker_run validates against it. Names live in code only —
-// never exposed to the MCP client (see server.ts client-facing surfaces).
 export const ALL_BACKENDS: readonly Backend[] = ['omp', 'opencode', 'pool', 'cmd', 'codex', 'claude', 'claude_tmux'];
 
 export const LADDER: Backend[] = ALL_BACKENDS.filter(be => process.env[`SKIP_${be}`] !== '1');
@@ -25,21 +22,14 @@ export function buildRunArgv(backend: Backend, spec: string, repo: string, sid: 
     case 'claude':
       return ['claude', '-p', spec, '--session-id', sid, '--model', 'sonnet', '--dangerously-skip-permissions', '--add-dir', repo, ...(extraArgs ?? [])];
     case 'omp':
-      // omp has no pre-assignable session id; pin a per-job session dir so resume is deterministic.
-      // --approval-mode=yolo auto-approves tool calls so a fresh/untrusted dir never blocks on a prompt.
-      // --mode=json streams JSONL events so the log grows continuously — without it omp buffers all
-      // output to the end and the runner's stall-watchdog freezes the still-working job at 120s.
       return ['omp', '-p', spec, '--session-dir', handleDir(sid, repo), '--approval-mode=yolo', '--mode=json', ...(extraArgs ?? [])];
     case 'cmd':
       return ['cmd', '-p', spec, '--yolo', '-t', '--skip-onboarding', '--add-dir', repo, ...(model ? ['--model', model] : []), ...(extraArgs ?? [])];
     case 'opencode':
-      return ['opencode', 'run', spec, '--dir', repo, '--dangerously-skip-permissions', ...(model ? ['-m', model] : []), ...(extraArgs ?? [])];
+      return ['opencode', 'run', spec, '--dir', repo, '--dangerously-skip-permissions', '--format', 'json', ...(model ? ['-m', model] : []), ...(extraArgs ?? [])];
     case 'pool':
       return ['pool', 'exec', '-p', spec, '-d', repo, '--unsafe-auto-allow', ...(extraArgs ?? [])];
     case 'codex':
-      // codex makes its own session id; resume via `exec resume --last` cwd-filtered by spawn cwd.
-      // --json streams JSONL events so the log grows continuously — without it codex buffers all
-      // output to the end and the runner's stall-watchdog freezes the still-working job at 120s.
       return ['codex', 'exec', '--json', '--cd', repo, '--skip-git-repo-check', '--dangerously-bypass-approvals-and-sandbox', ...(model ? ['-m', model] : []), spec];
     default:
       throw new Error(`Unknown backend: ${backend}`);
@@ -51,20 +41,14 @@ export function buildResumeArgv(backend: Backend, spec: string, repo: string, to
     case 'claude':
       return ['claude', '-p', spec, '--resume', token, '--model', 'sonnet', '--dangerously-skip-permissions', '--add-dir', repo, ...(extraArgs ?? [])];
     case 'omp':
-      // token is the original handle → same per-job session dir as the run; --continue resumes it.
       return ['omp', '-p', spec, '--session-dir', handleDir(token, repo), '--continue', '--approval-mode=yolo', '--mode=json', ...(extraArgs ?? [])];
     case 'opencode':
-      // Must carry --dangerously-skip-permissions exactly like buildRunArgv: stdin is /dev/null in
-      // the runner, so a permission prompt on resume would block with no input → the log stops
-      // growing → the stall watchdog freezes the (actually fine) job at 120s. Omitting it broke resume.
       return ['opencode', 'run', spec, '-s', token, '--dir', repo, '--dangerously-skip-permissions', ...(extraArgs ?? [])];
     case 'pool':
       return ['pool', 'exec', '-p', spec, '-d', repo, '--unsafe-auto-allow', '--continue', token, ...(extraArgs ?? [])];
     case 'cmd':
       return ['cmd', '-p', spec, '--yolo', '-t', '--skip-onboarding', '--add-dir', repo, ...(model ? ['--model', model] : []), ...(extraArgs ?? [])];
     case 'codex':
-      // `exec resume` has no --cd, relies on spawn cwd; always resumes last session.
-      // --json: stream events so the log keeps growing (see buildRunArgv) — avoids a false stall.
       return ['codex', 'exec', 'resume', '--last', '--json', '--skip-git-repo-check', '--dangerously-bypass-approvals-and-sandbox', ...(model ? ['-m', model] : []), spec];
     default:
       throw new Error(`Unknown backend: ${backend}`);
@@ -76,12 +60,8 @@ export function getResumeToken(backend: Backend, sid: string, logPath: string): 
     case 'claude': case 'omp': return sid;
     case 'pool': case 'codex': return 'last';
     case 'opencode': {
-      // opencode appends ses_<id> tokens as it runs, so the last one in the log is the session
-      // to resume. Read the tail only — full-file reads on a 100MB+ opencode log would block the
-      // event loop for hundreds of ms at completion. tailCapped drops the first (partial) line
-      // when the cap lands mid-file; that line is older than any ses_ match anyway.
       try {
-        const log = tailCapped(logPath);
+        const log = tailCapped(logPath, 65_536);
         const matches = log.match(/ses_[A-Za-z0-9]+/g);
         const lastMatch = matches?.[matches.length - 1] ?? '';
         if (!lastMatch && log.trim().length > 0) {
@@ -93,5 +73,4 @@ export function getResumeToken(backend: Backend, sid: string, logPath: string): 
     default: return '';
   }
 }
-/** Which backends emit JSONL logs — ties to --mode=json (omp) / --json (codex) in buildRunArgv. */
-export function emitsJsonLog(backend: string): boolean { return backend === 'omp' || backend === 'codex'; }
+export function emitsJsonLog(backend: string): boolean { return backend === 'omp' || backend === 'codex' || backend === 'pool'; }

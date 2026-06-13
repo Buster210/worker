@@ -143,16 +143,16 @@ describe('getResumeToken', () => {
   });
 });
 describe('emitsJsonLog', () => {
-  it('omp and codex emit JSONL', () => {
+  it('omp, codex, and pool emit JSONL', () => {
     expect(emitsJsonLog('omp')).toBe(true);
     expect(emitsJsonLog('codex')).toBe(true);
+    expect(emitsJsonLog('pool')).toBe(true);
   });
 
   it('other backends do not emit JSONL', () => {
     expect(emitsJsonLog('opencode')).toBe(false);
     expect(emitsJsonLog('claude')).toBe(false);
     expect(emitsJsonLog('cmd')).toBe(false);
-    expect(emitsJsonLog('pool')).toBe(false);
     expect(emitsJsonLog('claude_tmux')).toBe(false);
   });
 });

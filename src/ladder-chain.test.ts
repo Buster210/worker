@@ -7,7 +7,7 @@ import { tmpdir } from 'os';
 const STATE_DIR = join(tmpdir(), `wladder-state-${process.pid}`);
 process.env.WORKER_STATE_DIR = STATE_DIR;
 
-import { runLadderChain, type LadderDrivers } from './server.ts';
+import { runLadderChain, type LadderDrivers } from './chain.ts';
 import { LADDER, type Backend } from './backends.ts';
 import { getLadderHistory } from './state.ts';
 import type { RunResult } from './runner.ts';

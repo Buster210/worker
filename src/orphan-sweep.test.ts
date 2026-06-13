@@ -15,7 +15,8 @@ process.env.WORKER_STATE_DIR = STATE_DIR;
 const THIS_SID = process.env.CLAUDE_CODE_SESSION_ID ?? `test-sid-${process.pid}`;
 process.env.CLAUDE_CODE_SESSION_ID = THIS_SID;
 
-import { sweepStaleJobs, isProcessAlive } from './runner.ts';
+import { sweepStaleJobs } from './maintenance.ts';
+import { isProcessAlive } from './process.ts';
 import { insertJob, getJob, logPath as stateLogPath } from './state.ts';
 
 const REPO = join(tmpdir(), `worphan-repo-${process.pid}`);

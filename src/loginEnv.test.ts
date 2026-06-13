@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'bun:test';
-import { parseEnvSnapshot, loginShellEnv } from './runner.ts';
+import { parseEnvSnapshot, loginShellEnv } from './env.ts';
 import { spawnSync } from 'child_process';
 import { writeFileSync, chmodSync, mkdirSync } from 'fs';
 import { join } from 'path';

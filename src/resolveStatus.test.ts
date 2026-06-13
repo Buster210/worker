@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from 'bun:test';
 import { writeFileSync, unlinkSync, statSync } from 'fs';
 import { tmpdir } from 'os';
-import { resolveStatus } from './runner.ts';
+import { resolveStatus } from './status.ts';
 import { tailCapped, extractAssistantTexts, readSentinel } from './logParse.ts';
 
 describe('resolveStatus', () => {
@@ -117,6 +117,61 @@ describe('resolveStatus', () => {
     writeFileSync(tmpLogPath, events);
     testLogs.push(tmpLogPath);
     expect(resolveStatus('omp', 0, tmpLogPath, false)).toBe('failed');
+  });
+
+  it('omp json with provider errorStatus (e.g. 402 credits) -> failed:<message>', () => {
+    const tmpLogPath = `${tmpdir()}/resolveStatus-${process.pid}-10c.log`;
+    const events = [
+      JSON.stringify({ type: 'session', version: 3, id: 's1' }),
+      JSON.stringify({ type: 'agent_start' }),
+      JSON.stringify({ type: 'turn_start' }),
+      JSON.stringify({ type: 'message_end', message: { role: 'assistant', content: [] }, stopReason: 'error', errorStatus: 402, errorMessage: '402 Add credits to continue' }),
+      JSON.stringify({ type: 'agent_end', messages: [] }),
+    ].join('\n');
+    writeFileSync(tmpLogPath, events);
+    testLogs.push(tmpLogPath);
+    expect(resolveStatus('omp', 0, tmpLogPath, false)).toBe('failed:402 Add credits to continue');
+  });
+
+  it('codex json with agent_message containing FAILED:<reason> -> failed:<reason>', () => {
+    const tmpLogPath = `${tmpdir()}/resolveStatus-${process.pid}-10d.log`;
+    const events = [
+      JSON.stringify({ type: 'thread.started', thread_id: 't1' }),
+      JSON.stringify({ type: 'item.completed', item: { id: 'i1', type: 'agent_message', text: 'FAILED: bad prompt' } }),
+      JSON.stringify({ type: 'turn.completed', usage: {} }),
+    ].join('\n');
+    writeFileSync(tmpLogPath, events);
+    testLogs.push(tmpLogPath);
+    expect(resolveStatus('codex', 0, tmpLogPath, false)).toBe('failed:bad prompt');
+  });
+
+  it('pool json with thought containing FAILED -> failed', () => {
+    const tmpLogPath = `${tmpdir()}/resolveStatus-${process.pid}-10e.log`;
+    const events = [
+      JSON.stringify({ type: 'reasoning', reasoning: 'thinking' }),
+      JSON.stringify({ type: 'thought', thought: 'FAILED: out of context' }),
+      JSON.stringify({ args: { success: false }, name: 'exit', type: 'toolCall' }),
+    ].join('\n');
+    writeFileSync(tmpLogPath, events);
+    testLogs.push(tmpLogPath);
+    expect(resolveStatus('pool', 0, tmpLogPath, false)).toBe('failed:out of context');
+  });
+
+  it('pool rc=4 maps to failed:task (rc fallback wins when no sentinel in log)', () => {
+    const tmpLogPath = `${tmpdir()}/resolveStatus-${process.pid}-10f.log`;
+    writeFileSync(tmpLogPath, '');
+    testLogs.push(tmpLogPath);
+    expect(resolveStatus('pool', 4, tmpLogPath, false)).toBe('failed:task');
+  });
+
+  it('codex/omp with stopReason=refusal -> failed', () => {
+    const tmpLogPath = `${tmpdir()}/resolveStatus-${process.pid}-10g.log`;
+    const events = [
+      JSON.stringify({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'I cannot help with that' }] }, stopReason: 'refusal' }),
+    ].join('\n');
+    writeFileSync(tmpLogPath, events);
+    testLogs.push(tmpLogPath);
+    expect(resolveStatus('codex', 0, tmpLogPath, false)).toBe('failed');
   });
 
   it('codex json log ending assistant text "DONE" -> done', () => {

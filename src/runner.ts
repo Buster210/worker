@@ -1,94 +1,13 @@
-import { spawn, spawnSync, execSync } from 'child_process';
-import { openSync, closeSync, writeSync, statSync, mkdirSync, writeFileSync, readFileSync, unlinkSync, realpathSync, existsSync, copyFileSync, renameSync } from 'fs';
-import { updateJob, getJob, getAllRunningJobs, getAllStoppedJobs, removeLock, logPath as workerLogPath, workersDir, finalizeJob } from './state.ts';
+import { spawn, spawnSync } from 'child_process';
+import { openSync, closeSync, writeSync } from 'fs';
+import { updateJob, getJob, removeLock, finalizeJob } from './state.ts';
 import { emitsJsonLog, type Backend } from './backends.ts';
 import { readSentinel } from './logParse.ts';
-import type { Job } from './state.ts';
-import { killProcessTree } from './descendent-kill.ts';
+import { resolveStatus } from './status.ts';
+import { killProcessTree, killGroup, isProcessAlive } from './process.ts';
+import { startActivityMonitor } from './monitor.ts';
 
-// Owning Claude session id (CLAUDE_CODE_SESSION_ID). The orphan sweep compares each job's
-// server_sid to this value to distinguish "this server died" from "another server with a recycled
-// pid happens to match our pid + start time". sid is unique per Claude session and does not get
-// recycled. Read lazily per call so tests can set the env AFTER module init (ES imports are
-// hoisted above test setup, so an eager read at module top would always see '' under bun test).
-function thisServerSid(): string {
-  return process.env.CLAUDE_CODE_SESSION_ID ?? '';
-}
-
-// On startup: mark any jobs still showing 'running' whose PIDs are dead as failed.
-// Prevents stale state after a server restart mid-job.
-// Timing knobs resolve from env at call time (defaults = production behavior), so tests
-// can drive fast timeout/stall paths per-case without touching production values.
-function envMs(key: string, def: number): number {
-  const v = Number(process.env[key]);
-  return Number.isFinite(v) && v > 0 ? v : def;
-}
-export function defaultTimeoutMs(): number { return envMs('WORKER_TIMEOUT_MS', 600_000); }
-function pollIntervalMs(): number { return envMs('WORKER_POLL_MS', 5_000); }
-// Resume watcher polls tighter than the main watchdog: a resumed job is already in flight, so a
-// quicker exit-detection cadence (matching the pre-extraction inline loop) keeps finalization snappy.
-function resumePollIntervalMs(): number { return envMs('WORKER_RESUME_POLL_MS', 1_000); }
-function stallTimeoutMs(): number { return envMs('WORKER_STALL_MS', 120_000); }
-// A 'stopped' (frozen) job nobody resumed is reaped past this age so it stops holding RAM.
-function reapAgeMs(): number { return envMs('WORKER_REAP_MS', 900_000); }
-// Augmented PATH so backends are findable (MCP server env is stripped)
-const HOME = process.env.HOME ?? '';
-
-// --- Login-shell environment snapshot (pollution-free) ---
-// One-time login-shell env dump so workers inherit API keys, PATH extensions, etc.
-// from the user's profile WITHOUT any shell banner echo polluting the worker run.log.
-// The marker separates profile output (discarded) from the JSON env dump (kept).
-const LOGIN_ENV_MARKER = '__WORKER_ENV_a7f3__';
-let _loginEnvCache: Record<string, string> | null | undefined; // undefined = not yet attempted
-
-/** Pure: extract env JSON from login shell stdout — banner before marker discarded. */
-export function parseEnvSnapshot(stdout: string, marker: string): Record<string, string> | null {
-  const idx = stdout.indexOf(marker);
-  if (idx === -1) return null;
-  const jsonStart = stdout.indexOf('{', idx + marker.length);
-  if (jsonStart === -1) return null;
-  try { return JSON.parse(stdout.slice(jsonStart)); } catch { return null; }
-}
-
-/** One-time login-shell env snapshot. Returns null on failure, opt-out, or non-macOS. */
-export function loginShellEnv(): Record<string, string> | null {
-  if (process.env.WORKER_LOGIN_SHELL === '0') return null;
-  if (_loginEnvCache !== undefined) return _loginEnvCache;
-  const shell = process.env.SHELL ?? '/bin/zsh';
-  const bunPath = process.execPath;
-  const snippet =
-    `printf '%s\\n' '${LOGIN_ENV_MARKER}'; exec "${bunPath}" -e 'process.stdout.write(JSON.stringify(process.env))'`;
-  try {
-    const r = spawnSync(shell, ['-l', '-c', snippet], { encoding: 'utf8', timeout: 5000 });
-    if (r.error || r.status !== 0) { _loginEnvCache = null; return null; }
-    const parsed = parseEnvSnapshot(r.stdout ?? '', LOGIN_ENV_MARKER);
-    _loginEnvCache = parsed;
-    return parsed;
-  } catch {
-    _loginEnvCache = null;
-    return null;
-  }
-}
-
-const _loginEnv = loginShellEnv();
-export const workerEnv: NodeJS.ProcessEnv = {
-  ...(_loginEnv ?? {}),
-  ...process.env,
-  // rc the backend shell sources for env + key-injecting wrappers (see backendShellArgv).
-  // Passed via env (not interpolated into the script) so its value can never be code-injected.
-  WORKER_RC: process.env.WORKER_RC ?? `${HOME}/.common`,
-  PATH: [
-    `${HOME}/.bun/bin`,
-    `${HOME}/.local/bin`,
-    `${HOME}/.cargo/bin`,
-    '/opt/homebrew/bin',
-    '/opt/homebrew/sbin',
-    '/usr/local/bin',
-    '/usr/bin',
-    '/bin',
-    _loginEnv?.PATH ?? process.env.PATH ?? '',
-  ].join(':'),
-};
+import { defaultTimeoutMs, workerEnv, pollIntervalMs, resumePollIntervalMs, stallTimeoutMs } from './env.ts';
 
 export type RunResult = {
   status: string;
@@ -101,103 +20,28 @@ export type RunResult = {
   log: string;
 };
 
-
-function shortstat(repo: string): string {
+export function shortstat(repo: string): string {
   try {
-    const diffResult = spawnSync('git', ['diff', '--shortstat'], { cwd: repo, encoding: 'utf8' });
-    const diffCachedResult = spawnSync('git', ['diff', '--cached', '--shortstat'], { cwd: repo, encoding: 'utf8' });
-    const diffStat = (diffResult.stdout + diffCachedResult.stdout).trim();
-    const untrackedResult = spawnSync('git', ['ls-files', '--others', '--exclude-standard'], { cwd: repo, encoding: 'utf8' });
-    const ut = untrackedResult.stdout.trim().split('\n').filter(Boolean).length;
-    return [diffStat, ut > 0 ? `${ut} untracked` : ''].filter(Boolean).join(', ') || 'no changes';
+    const r = spawnSync('git', ['-C', repo, 'status', '--porcelain'], { encoding: 'utf8', timeout: 2000 });
+    if (r.status !== 0) return 'unknown';
+    const lines = r.stdout.trim().split('\n').filter(Boolean);
+    if (lines.length === 0) return 'no changes';
+    let adds = 0, dels = 0;
+    try {
+      const n = spawnSync('git', ['-C', repo, 'diff', '--numstat', 'HEAD'], { encoding: 'utf8', timeout: 2000 });
+      if (n.status === 0) {
+        for (const ln of n.stdout.split('\n').filter(Boolean)) {
+          const [a, d] = ln.split('\t');
+          adds += a === '-' ? 0 : Number(a);
+          dels += d === '-' ? 0 : Number(d);
+        }
+      }
+    } catch {}
+    return `${lines.length} file${lines.length === 1 ? '' : 's'} +${adds}/-${dels}`;
   } catch { return 'unknown'; }
 }
 
-function resolveStatus(backend: string, rc: number, logPath: string, timedOut: boolean): string {
-  if (timedOut) return 'timeout';
-  const { status } = readSentinel(logPath, emitsJsonLog(backend));
-  if (status) return status;
-  if (backend === 'cmd') return rc === 0 ? 'done' : rc === 8 ? 'failed:max-turns' : 'failed';
-  if (backend === 'pool') return rc === 0 ? 'done' : rc === 4 ? 'failed:task' : 'failed';
-  return rc === 0 ? 'done' : 'failed';
-}
-
-export { resolveStatus };
-
-export function sweepStaleJobs() {
-  for (const job of getAllRunningJobs()) {
-    // Only sweep jobs owned by THIS server. server_sid is unique per Claude session and never
-    // recycles, so it's a strict superset of the server_pid+server_started check: even a recycled
-    // pid + coincident start time won't make another server's job look like ours. Jobs with no
-    // server_sid (legacy / pre-sweep) are skipped — the dead-worker branch below still catches
-    // them once the worker itself dies.
-    if (job.server_sid === '' || job.server_sid !== thisServerSid()) continue;
-    // Owning server still alive → its in-process runner (launchAndWait / runClaudeTmux) owns this
-    // job's finalization, so the sweep must not race it. This covers claude_tmux jobs (worker_pid=0
-    // by design) and the brief window after insertJob before launchAndWait sets the real worker_pid —
-    // both previously looked "dead" to the worker_pid check below and got finalized failed:server-restart
-    // mid-run by the periodic sweep. Only true orphans (server dead) or legacy jobs (server_pid=0) proceed.
-    if (job.server_pid > 0 && isProcessAlive(job.server_pid, job.server_started)) continue;
-    let alive = false;
-    if (job.worker_pid) { alive = isProcessAlive(job.worker_pid, job.started); }
-    if (alive) {
-      // Orphan: worker is alive but the MCP server that launched it is dead (killed -9).
-      // server_pid=0 means legacy job → never sweep (safe-fail: existing dead-worker branch
-      // covers those if/when the worker itself dies).
-      if (job.server_pid > 0 && !isProcessAlive(job.server_pid, job.server_started)) {
-        killProcessTree(job.worker_pid, 'SIGKILL');
-        finalizeJob(job.handle, 'failed', { resume_token: job.resume_token });
-      }
-    } else {
-      const status = resolveStatus(job.backend, 0, job.log_path, false);
-      finalizeJob(job.handle, status === 'done' ? status : 'failed:server-restart');
-    }
-  }
-}
-
-/**
- * Reclaim 'stopped' (frozen) jobs nobody resumed. Two reclaim causes, both terminal and both
- * keeping their resume_token (worker_resume still re-attempts from scratch):
- *  - dead frozen pid → the server bounced and the SIGSTOP'd group is gone: finalize now.
- *  - alive but frozen past the reap window → abandoned, holding RAM at zero CPU: SIGKILL + finalize.
- * Fresh freezes (within the window, still resumable) are left untouched.
- */
-export function reapStoppedJobs() {
-  const now = Date.now();
-  const maxAgeMs = reapAgeMs();
-  for (const job of getAllStoppedJobs()) {
-    // 'stopped' implies a SIGSTOP'd pid; a 0/absent pid is anomalous and unkillable —
-    // process.kill(-0) would signal our OWN group — so skip it rather than act on a guess.
-    if (!job.worker_pid) continue;
-    if (!isProcessAlive(job.worker_pid, job.started)) {
-      finalizeJob(job.handle, 'failed:server-restart');
-      continue;
-    }
-    const stoppedAt = Date.parse(job.stopped_at ?? '');
-    // Missing/unparseable stopped_at → don't assume stale and kill a live job; leave it.
-    if (!Number.isFinite(stoppedAt) || now - stoppedAt < maxAgeMs) continue;
-    // Re-read in the same synchronous tick: guards a status flip (e.g. a concurrent resume that
-    // thawed it back to 'running') between the disk snapshot above and the kill below.
-    if (getJob(job.handle)?.status !== 'stopped') continue;
-    killProcessTree(job.worker_pid, 'SIGKILL');
-    setTimeout(() => killProcessTree(job.worker_pid, 'SIGKILL'), 5_000).unref?.();
-    finalizeJob(job.handle, 'timeout');
-  }
-}
-
-function killGroup(pid: number, sig: 'SIGTERM' | 'SIGKILL' | 'SIGSTOP' = 'SIGTERM') {
-  try { process.kill(-pid, sig); } catch {}
-}
-
-/**
- * After SIGSTOP, decide a suspended (deadline- or stall-hit) job's fate. The watch loop only
- * suspends a process it just saw alive, so default to FREEZING it as 'stopped' — recoverable via
- * SIGCONT, no work discarded on a guess (we can't tell "slow but working" from "hung" by log/git,
- * and for the sole worker a false kill is the expensive failure). The lone terminal case is a
- * self-declared failure: a FAILED last log line → SIGKILL so resume re-attempts fresh from the
- * token rather than thawing a corpse. Caller must have already SIGSTOP'd the group.
- */
-function evalAfterStop(handle: string, pid: number, logPath: string, backend: string): boolean {
+export function decideFateAfterFreeze(handle: string, pid: number, logPath: string, backend: string): boolean {
   const { status, lastText } = readSentinel(logPath, emitsJsonLog(backend));
   const isFailed = status !== null && status.startsWith('failed');
   const lastLine = lastText.length > 500 ? lastText.slice(0, 500) : lastText;
@@ -208,86 +52,15 @@ function evalAfterStop(handle: string, pid: number, logPath: string, backend: st
     return true;
   }
   killProcessTree(pid, 'SIGKILL');
-  setTimeout(() => killProcessTree(pid, 'SIGKILL'), 5_000);
+  setTimeout(() => killProcessTree(pid, 'SIGKILL'), 5_000).unref?.();
   return false;
 }
 
-/** SIGSTOP the group then evaluate — used by the resume path when a re-armed timeout fires. */
-export function suspendAndEval(handle: string, pid: number, logPath: string, backend: string): boolean {
+export function freezeThenDecide(handle: string, pid: number, logPath: string, backend: string): boolean {
   killGroup(pid, 'SIGSTOP');
-  return evalAfterStop(handle, pid, logPath, backend);
+  return decideFateAfterFreeze(handle, pid, logPath, backend);
 }
 
-// ps `etime` = elapsed time since start, format [[dd-]hh:]mm:ss → seconds.
-// Elapsed (not wall-clock lstart) is timezone-independent: parsing lstart with `new Date()`
-// silently misreads the system-local string whenever the runtime TZ differs (e.g. TZ=UTC),
-// skewing the start by the offset and breaking the PID-reuse guard for every live process.
-// Hoisted to module scope so the regex is compiled once, not per isProcessAlive call (which
-// fires on every worker_status + every sweep tick + every reap iteration).
-const ETIME_RE = /^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/;
-export function parseEtimeSeconds(etime: string): number | null {
-  const m = etime.trim().match(ETIME_RE);
-  if (!m) return null;
-  const [, dd, hh, mm, ss] = m;
-  return Number(dd ?? 0) * 86400 + Number(hh ?? 0) * 3600 + Number(mm) * 60 + Number(ss);
-}
-
-function getProcessStartTime(pid: number): string | null {
-  try {
-    const result = spawnSync('ps', ['-o', 'etime=', '-p', String(pid)], { encoding: 'utf8' });
-    if (result.status !== 0) return null;
-    const elapsedSec = parseEtimeSeconds(result.stdout);
-    if (elapsedSec === null) return null;
-    return new Date(Date.now() - elapsedSec * 1000).toISOString();
-  } catch {
-    return null;
-  }
-}
-
-export function isProcessAlive(pid: number, started?: string): boolean {
-  if (!pid) return false;
-  try { process.kill(pid, 0); } catch { return false; }
-  
-  if (!started) return true;
-  
-  const procStart = getProcessStartTime(pid);
-  if (!procStart) return true;
-  
-  const jobStart = new Date(started);
-  const procStartDate = new Date(procStart);
-  const skewMs = Math.abs(procStartDate.getTime() - jobStart.getTime());
-  
-  return skewMs < 60_000;
-}
-/**
- * Composite activity signature, log-first. The log's mtime+size is the cheap primary signal:
- * if it advanced since the last tick the worker is demonstrably alive, so we skip the two git
- * probes entirely (the common case — backends stream to the log while working). Only when the
- * log is idle do we pay for `git diff`/`status`, which still catch a worker mutating files
- * without logging. Caller threads `lastLog` (the prior tick's log component) and stores the
- * returned `log` for the next call.
- */
-export function activitySig(repo: string, logPath: string, lastLog: string): { sig: string; log: string } {
-  let log = '';
-  try { const st = statSync(logPath); log = `${st.mtimeMs}:${st.size}`; } catch {}
-  if (log && log !== lastLog) return { sig: log, log };
-  let gitDiff = '';
-  try { gitDiff = spawnSync('git', ['-C', repo, 'diff', '--stat'], { encoding: 'utf8', timeout: 2000 }).stdout ?? ''; } catch {}
-  let gitStatus = '';
-  try { gitStatus = spawnSync('git', ['-C', repo, 'status', '--porcelain'], { encoding: 'utf8', timeout: 2000 }).stdout ?? ''; } catch {}
-  return { sig: log + gitDiff + gitStatus, log };
-}
-
-// Wrap argv to run through a NON-INTERACTIVE shell that first sources the host's env-defining
-// rc, so backends inherit its env + per-launch auth wrappers (e.g. provider-key injectors) that
-// the stripped MCP server env lacks — WITHOUT any interactive cosmetics (prompt frameworks,
-// fastfetch banners, job-control setopts) that corrupt a headless, TTY-less worker's stdio. An
-// interactive shell (`-i`) into a pipe makes `[[ -o interactive ]]` guards fire with no terminal,
-// flooding the backend's channel; `-c` keeps the rc's own guards correctly skipping cosmetics.
-// The rc path arrives as $WORKER_RC in the spawn env (workerEnv) and the backend command as $0 +
-// argv — BOTH are data the shell expands at runtime, never text interpolated into the script
-// string, so neither can inject code (a WORKER_RC of `$(rm -rf ~)` is sourced as a filename, not
-// evaluated). Empty/missing WORKER_RC sources nothing. $0 honors a shell function of that name.
 export function backendShellArgv(argv: string[]): string[] {
   const shell = process.env.SHELL ?? '/bin/zsh';
   return [shell, '-c', '[ -n "$WORKER_RC" ] && [ -f "$WORKER_RC" ] && . "$WORKER_RC"; "$0" "$@"', ...argv];
@@ -300,13 +73,8 @@ export function launchAndWait(
   backend: Backend,
   logPath: string,
   timeoutMs: number = defaultTimeoutMs(),
-): Promise<{ rc: number; timedOut: boolean; stopped: boolean }> {
+): Promise<{ rc: number; timedOut: boolean; stopped: boolean; dirty: string }> {
   return new Promise((resolve) => {
-    // Child writes straight to the log file via an inherited fd, NOT a Node pipe. A piped stream
-    // gets .end()'d when the watchdog freezes the job (SIGSTOP), so a later SIGCONT resume
-    // (watchExisting) would write into a dead pipe — output lost and the job mis-graded non-done
-    // off a frozen log. An inherited fd survives freeze/resume: the frozen child keeps its own copy
-    // and resumes appending to the same file.
     const logFd = openSync(logPath, 'a');
     const [cmd, ...args] = backendShellArgv(argv);
     const proc = spawn(cmd, args, {
@@ -316,57 +84,59 @@ export function launchAndWait(
       detached: true,
     });
 
-    updateJob(handle, { worker_pid: proc.pid ?? 0 });
+    if (proc.pid) {
+      try { updateJob(handle, { worker_pid: proc.pid }); } catch {}
+    }
 
     let rc = 0;
     let timedOut = false;
     let stopped = false;
     let settled = false;
+    let exiting = false;
     const startMs = Date.now();
+    const mon = startActivityMonitor(repo, logPath);
+    let lastSig = mon.sig;
+    let lastActivityAt = mon.at;
 
     const finish = (code: number, timed: boolean, stoppedJob: boolean) => {
       if (settled) return;
       settled = true;
       clearInterval(watchdog);
-      // Close only the parent's copy; the child (esp. a frozen one) keeps its inherited fd so it
-      // can resume writing after SIGCONT.
+      const dirty = mon.dirty;
+      try { mon.dispose(); } catch {}
       try { closeSync(logFd); } catch {}
-      resolve({ rc: code, timedOut: timed, stopped: stoppedJob });
+      resolve({ rc: code, timedOut: timed, stopped: stoppedJob, dirty });
     };
-    let lastSig = '';
-    let lastLog = '';
-    let lastSigChange = Date.now();
+
+    const freezeAndFinish = () => {
+      if (settled || exiting) return;
+      killGroup(proc.pid!, 'SIGSTOP');
+      setTimeout(() => {
+        if (settled || exiting) return;
+        if (!isProcessAlive(proc.pid!)) { exiting = true; finish(124, true, false); return; }
+        stopped = decideFateAfterFreeze(handle, proc.pid!, logPath, backend);
+        finish(124, true, stopped);
+      }, 20);
+    };
 
     const watchdog = setInterval(() => {
-      if (settled) return;
+      if (settled || exiting) return;
       const now = Date.now();
 
       if (now - startMs >= timeoutMs) {
         timedOut = true;
-        killGroup(proc.pid!, 'SIGSTOP');
-
-        setTimeout(() => {
-          if (settled) return;
-          stopped = evalAfterStop(handle, proc.pid!, logPath, backend);
-          finish(124, true, stopped);
-        }, 100);
+        freezeAndFinish();
         return;
       }
-      const { sig, log } = activitySig(repo, logPath, lastLog);
-      lastLog = log;
-      if (sig !== lastSig) { lastSig = sig; lastSigChange = Date.now(); }
-      else if (Date.now() - lastSigChange >= stallTimeoutMs()) {
-        killGroup(proc.pid!, 'SIGSTOP');
-        setTimeout(() => {
-          if (settled) return;
-          stopped = evalAfterStop(handle, proc.pid!, logPath, backend);
-          finish(124, true, stopped);
-        }, 100);
+      if (mon.sig !== lastSig) { lastSig = mon.sig; lastActivityAt = mon.at; }
+      else if (now - lastActivityAt >= stallTimeoutMs()) {
+        freezeAndFinish();
         return;
       }
     }, pollIntervalMs());
 
     proc.on('exit', (code, signal) => {
+      exiting = true;
       rc = code ?? (signal ? 1 : 0);
       finish(rc, false, false);
     });
@@ -387,30 +157,29 @@ export async function runWorker(
   resumeToken: string,
   timeoutMs?: number,
 ): Promise<RunResult> {
-  const { rc, timedOut, stopped } = await launchAndWait(argv, repo, handle, backend, logPath, timeoutMs);
-  // Stopped jobs are already persisted (status='stopped', lock removed) inside evalAfterStop.
+  const { rc, timedOut, stopped, dirty } = await launchAndWait(argv, repo, handle, backend, logPath, timeoutMs);
   let status: string;
   if (stopped) {
     status = 'stopped';
   } else {
     status = finalizeJob(handle, resolveStatus(backend, rc, logPath, timedOut), { resume_token: resumeToken });
   }
+  const ss = shortstatFromDirty(dirty) ?? shortstat(repo);
   return {
     status, exit_code: rc, backend, handle,
     resume_token: resumeToken, repo,
-    shortstat: shortstat(repo),
+    shortstat: ss,
     log: logPath,
   };
 }
 
-/**
- * Watch an already-running process we hold no child handle for (a SIGCONT'd resume), polling to
- * completion. No spawn — the process exists; we only observe PID liveness against a re-armed
- * deadline and a stall timer. Mirrors launchAndWait's watchdog: exited-on-its-own → finalize from
- * log; deadline fired OR activity stalled (activitySig unchanged for stallTimeoutMs) → suspendAndEval
- * (freeze to 'stopped' if still productive, else SIGKILL + terminal).
- * started/resume_token come from the persisted job (set at insert, immutable for its lifetime).
- */
+function shortstatFromDirty(dirty: string): string | null {
+  if (!dirty) return null;
+  const lines = dirty.trim().split('\n').filter(Boolean);
+  if (lines.length === 0) return 'no changes';
+  return `${lines.length} file${lines.length === 1 ? '' : 's'}`;
+}
+
 export function watchExisting(
   handle: string,
   pid: number,
@@ -420,173 +189,45 @@ export function watchExisting(
   deadlineMs: number,
 ): Promise<RunResult> {
   const job = getJob(handle);
-  const started = job?.started;
   const resumeToken = job?.resume_token ?? '';
   const watchStart = Date.now();
-  let lastSig = '';
-  let lastLog = '';
-  let lastSigChange = watchStart;
+  const mon = startActivityMonitor(repo, logPath);
+  let lastSig = mon.sig;
+  let lastActivityAt = mon.at;
 
   return new Promise((resolve) => {
-    const mkResult = (status: string): RunResult => ({
+    let resolved = false;
+    const buildResult = (status: string): RunResult => ({
       status, exit_code: 0, backend, handle,
       resume_token: resumeToken, repo, shortstat: '', log: logPath,
     });
-    // Deadline or stall → suspend, then freeze ('stopped') if still productive or kill (terminal).
+    const finish = (status: string) => {
+      if (resolved) return;
+      resolved = true;
+      try { mon.dispose(); } catch {}
+      resolve(buildResult(status));
+    };
+
     const suspend = () => {
-      if (suspendAndEval(handle, pid, logPath, backend)) {
-        resolve(mkResult('stopped')); // suspendAndEval persisted 'stopped' + removed the lock
+      if (freezeThenDecide(handle, pid, logPath, backend)) {
+        finish('stopped');
       } else {
-        resolve(mkResult(finalizeJob(handle, resolveStatus(backend, 124, logPath, true))));
+        finish(finalizeJob(handle, resolveStatus(backend, 124, logPath, true)));
       }
     };
+
     const check = () => {
-      // Process exited on its own → finalize from log.
-      if (!isProcessAlive(pid, started)) {
-        resolve(mkResult(finalizeJob(handle, resolveStatus(backend, 0, logPath, false))));
+      if (resolved) return;
+      if (!isProcessAlive(pid)) {
+        finish(finalizeJob(handle, resolveStatus(backend, 0, logPath, false)));
         return;
       }
-      // Re-armed deadline fired.
-      if (Date.now() - watchStart >= deadlineMs) { suspend(); return; }
-      // Activity stalled (no new log/diff for stallTimeoutMs) → treat like a fresh run's stall.
-      const { sig, log } = activitySig(repo, logPath, lastLog);
-      lastLog = log;
-      if (sig !== lastSig) { lastSig = sig; lastSigChange = Date.now(); }
-      else if (Date.now() - lastSigChange >= stallTimeoutMs()) { suspend(); return; }
+      const now = Date.now();
+      if (now - watchStart >= deadlineMs) { suspend(); return; }
+      if (mon.sig !== lastSig) { lastSig = mon.sig; lastActivityAt = mon.at; }
+      else if (now - lastActivityAt >= stallTimeoutMs()) { suspend(); return; }
       setTimeout(check, resumePollIntervalMs());
     };
     check();
   });
-}
-
-type TrustEntry = {
-  hasTrustDialogAccepted?: boolean;
-  hasCompletedProjectOnboarding?: boolean;
-  projectOnboardingSeenCount?: number;
-  [k: string]: unknown;
-};
-type ClaudeConfig = { projects?: Record<string, TrustEntry>; [k: string]: unknown };
-
-const CLAUDE_CFG = `${process.env.HOME}/.claude.json`;
-const CLAUDE_CFG_BAK = `${CLAUDE_CFG}.worker-bak`;
-
-// Interactive claude (no -p) blocks on the workspace trust dialog in a fresh/untrusted repo,
-// hanging the unattended TUI. No CLI flag bypasses it (trust is gated before settings are read,
-// hardened by CVE-2026-33068), so we pre-seed the trust state in ~/.claude.json. Claude keys
-// trust off the *canonical* cwd (/var -> /private/var on macOS), so seed both raw + realpath.
-// We deliberately never restore afterward: the trust flag is benign/idempotent, while
-// ~/.claude.json is a large file other claude processes write concurrently — a teardown restore
-// would clobber their writes. One-time backup + atomic write keep the mutation safe; flag stays set.
-
-// Memoize per (raw, realpath) so a 7-rung ladder on the same repo does 1 read+write of
-// ~/.claude.json instead of 7. Keyed on the pair itself (not just repo) because the realpath
-// resolution can differ across callers and we want each unique identity cached exactly once.
-// Process-local; no invalidation needed (the trust flag, once set, stays set for the session).
-const _seedRepoTrustCache = new Set<string>();
-
-function seedRepoTrust(repo: string): void {
-  let real = repo;
-  try { real = realpathSync(repo); } catch {}
-  const cacheKey = `${repo}\0${real}`;
-  if (_seedRepoTrustCache.has(cacheKey)) return;
-  _seedRepoTrustCache.add(cacheKey);
-
-  let cfg: ClaudeConfig;
-  try { cfg = JSON.parse(readFileSync(CLAUDE_CFG, 'utf8')); }
-  catch { return; } // missing/corrupt config → skip seeding, never crash the run
-
-  const projects = cfg.projects ?? (cfg.projects = {});
-  const keys = [...new Set([repo, real])];
-
-  if (keys.every(k => projects[k]?.hasTrustDialogAccepted === true)) return;
-
-  if (!existsSync(CLAUDE_CFG_BAK)) {
-    try { copyFileSync(CLAUDE_CFG, CLAUDE_CFG_BAK); } catch {}
-  }
-
-  for (const key of keys) {
-    projects[key] = {
-      ...projects[key],
-      hasTrustDialogAccepted: true,
-      hasCompletedProjectOnboarding: true,
-      projectOnboardingSeenCount: projects[key]?.projectOnboardingSeenCount ?? 1,
-    };
-  }
-
-  const tmp = `${CLAUDE_CFG}.${process.pid}.tmp`;
-  try {
-    writeFileSync(tmp, JSON.stringify(cfg, null, 2));
-    renameSync(tmp, CLAUDE_CFG);
-  } catch {
-    try { unlinkSync(tmp); } catch {}
-  }
-}
-
-export async function runClaudeTmux(
-  spec: string,
-  repo: string,
-  handle: string,
-  sid: string,
-  timeoutMs: number = defaultTimeoutMs(),
-): Promise<RunResult> {
-  try { execSync('which tmux', { stdio: 'ignore' }); }
-  catch { throw new Error('claude_tmux backend requires tmux'); }
-
-  const wdir = `${workersDir()}/tmux`;
-  mkdirSync(wdir, { recursive: true });
-
-  const setf    = `${wdir}/${sid}.settings.json`;
-  const donef   = `${wdir}/${sid}.done`;
-  const specf   = `${wdir}/${sid}.spec`;
-  const launchf = `${wdir}/${sid}.launch.sh`;
-  const logPath = workerLogPath(handle);
-
-  seedRepoTrust(repo);
-
-  // Sentinel: Stop hook writes to donef
-  writeFileSync(setf, JSON.stringify({
-    hooks: { Stop: [{ matcher: '', hooks: [{ type: 'command', command: `printf 'stop\\n' >> '${donef}'` }] }] }
-  }));
-  writeFileSync(specf, spec);
-  writeFileSync(donef, '');  // touch
-  writeFileSync(launchf, `#!/usr/bin/env bash\nexec claude --settings "${setf}" --dangerously-skip-permissions --model sonnet "$(cat "${specf}")"`, { mode: 0o755 });
-
-  try { execSync(`tmux kill-session -t ${sid} 2>/dev/null`, { stdio: 'ignore' }); } catch {}
-
-  const spawn = spawnSync('tmux', ['new-session', '-d', '-s', sid, '-x', '220', '-y', '50', '-c', repo, `bash "${launchf}"`], {
-    env: workerEnv, encoding: 'utf8',
-  });
-
-  if (spawn.status !== 0) {
-    finalizeJob(handle, 'failed');
-    return { status: 'failed', exit_code: 1, backend: 'claude_tmux', handle, resume_token: '', repo, shortstat: shortstat(repo), log: logPath };
-  }
-
-  updateJob(handle, { worker_pid: 0 });
-
-  const deadline = Date.now() + timeoutMs;
-  let stopped = false;
-
-  while (Date.now() < deadline) {
-    try {
-      const content = readFileSync(donef, 'utf8');
-      if (content.trim().length > 0) { stopped = true; break; }
-    } catch {}
-    try { execSync(`tmux has-session -t ${sid} 2>/dev/null`, { stdio: 'ignore' }); }
-    catch { stopped = true; break; }
-    await Bun.sleep(1000);
-  }
-
-  try {
-    const pane = execSync(`tmux capture-pane -t ${sid} -p -S -5000 2>/dev/null`, { encoding: 'utf8', env: workerEnv });
-    writeFileSync(logPath, pane);
-  } catch {}
-
-  try { execSync(`tmux kill-session -t ${sid} 2>/dev/null`, { stdio: 'ignore' }); } catch {}
-  for (const f of [setf, specf, launchf, donef]) { try { unlinkSync(f); } catch {} }
-
-  const timedOut = !stopped;
-  const status = finalizeJob(handle, resolveStatus('claude_tmux', 0, logPath, timedOut));
-
-  return { status, exit_code: timedOut ? 124 : 0, backend: 'claude_tmux', handle, resume_token: '', repo, shortstat: shortstat(repo), log: logPath };
 }

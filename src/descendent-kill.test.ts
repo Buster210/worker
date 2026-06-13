@@ -1,6 +1,6 @@
 import { describe, it, expect, afterAll } from 'bun:test';
 import { spawnSync, spawn } from 'child_process';
-import { listDescendants, killProcessTree } from './descendent-kill.ts';
+import { listDescendants, killProcessTree } from './process.ts'
 
 // Spawn a detached process tree: top pid forks a child, which forks a grandchild,
 // which forks a great-grandchild — all `sleep 30`.

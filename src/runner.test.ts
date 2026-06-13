@@ -11,7 +11,10 @@ process.env.WORKER_STATE_DIR = STATE_DIR;
 // Hermetic: empty WORKER_RC so the backend shell sources no host rc (fakeScripts need no env/keys).
 process.env.WORKER_RC = '';
 
-import { runWorker, watchExisting, isProcessAlive, parseEtimeSeconds, activitySig, reapStoppedJobs } from './runner.ts';
+import { runWorker, watchExisting, type RunResult } from './runner.ts';
+import { reapStoppedJobs } from './maintenance.ts';
+import { isProcessAlive, parseEtimeSeconds } from './process.ts';
+import { activitySig } from './monitor.ts';
 import { insertJob, getJob, updateJob, logPath as stateLogPath } from './state.ts';
 
 // Real subprocess fakes: a short bash script we spawn for real, so the tests exercise
@@ -311,5 +314,34 @@ describe('activitySig log-first probing (#6b)', () => {
     const idle = activitySig(repo, lp, grew.log);
     expect(idle.sig).toContain('dirty.txt');
     expect(idle.sig).not.toBe(idle.log);
+  });
+});
+
+describe('shortstat reports real +/- line deltas', () => {
+  it('shows non-zero insertions and deletions for staged+unstaged changes', async () => {
+    const repo = mkdtempSync(join(tmpdir(), 'wrunner-shortstat-'));
+    tmpDirs.push(repo);
+    spawnSync('git', ['init', '-q'], { cwd: repo });
+    spawnSync('git', ['config', 'user.email', 'test@test.com'], { cwd: repo });
+    spawnSync('git', ['config', 'user.name', 'Test'], { cwd: repo });
+    // Initial commit with a file
+    writeFileSync(join(repo, 'base.txt'), 'line1\nline2\nline3\n');
+    spawnSync('git', ['add', 'base.txt'], { cwd: repo });
+    spawnSync('git', ['commit', '-q', '-m', 'init'], { cwd: repo });
+    // Unstaged: modify base.txt (add 2 lines, remove 1)
+    writeFileSync(join(repo, 'base.txt'), 'line1\nnew_a\nnew_b\nline3\n');
+    // Staged: add a new file with content
+    writeFileSync(join(repo, 'staged.txt'), 'alpha\nbeta\ngamma\n');
+    spawnSync('git', ['add', 'staged.txt'], { cwd: repo });
+    const handle = `shortstat-${seq}`;
+    const lp = seedJob(handle);
+    process.env.WORKER_POLL_MS = '100';
+    const r = await runWorker(fakeScript('echo; echo DONE'), repo, handle, 'cmd', lp, '');
+    expect(r.status).toBe('done');
+    // shortstat must contain non-zero deltas
+    expect(r.shortstat).toMatch(/\+[^0]/);
+    expect(r.shortstat).toMatch(/-[^0]/);
+    // file count >= 2 (base.txt modified + staged.txt added)
+    expect(r.shortstat).toMatch(/[2-9]\s+files?\s/);
   });
 });
