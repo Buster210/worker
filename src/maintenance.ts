@@ -1,5 +1,5 @@
 import { reapAgeMs } from './env.ts';
-import { getAllRunningJobs, getAllStoppedJobs, getJob, finalizeJob } from './state.ts';
+import { getAllRunningJobs, getAllStoppedJobs, finalizeJob } from './state.ts';
 import { isProcessAlive, killProcessTree } from './process.ts'
 import { resolveStatus } from './status.ts'
 import { SERVER_STARTED } from './lifecycle.ts';
@@ -41,7 +41,12 @@ export function reapStoppedJobs() {
     const stoppedAt = Date.parse(job.stopped_at ?? '');
     if (!Number.isFinite(stoppedAt) || now - stoppedAt < maxAgeMs) continue;
     killProcessTree(job.worker_pid, 'SIGKILL');
-    setTimeout(() => killProcessTree(job.worker_pid, 'SIGKILL'), 5_000).unref?.();
+    // Deferred backstop re-kill. Guard with a pid-reuse-safe liveness check: if the
+    // original worker already died (pid freed/recycled in the 5s window), skip — else
+    // we could SIGKILL an unrelated process tree that inherited the pid.
+    setTimeout(() => {
+      if (isProcessAlive(job.worker_pid, job.started)) killProcessTree(job.worker_pid, 'SIGKILL');
+    }, 5_000).unref?.();
     finalizeJob(job.handle, 'timeout');
   }
 }

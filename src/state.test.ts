@@ -77,6 +77,26 @@ describe('finalizeJob', () => {
     const persistedJob = getJob(handle);
     expect(persistedJob?.status).toBe('done');
   });
+
+  it('is idempotent: second finalize on an already-terminal job returns first result without updating finished', () => {
+    const handle = `finalize-idem-${process.pid}-${Date.now()}`;
+    const logPath = `/tmp/${handle}.log`;
+    testHandles.push(handle);
+
+    insertJob({ handle, backend: 'cmd', sid: 't', repo: '/tmp/finalizetest', log_path: logPath });
+    const first = finalizeJob(handle, 'done');
+    expect(first).toBe('done');
+
+    const firstFinished = getJob(handle)!.finished;
+    // Wait a moment so a second call would have a different timestamp
+    const start = Date.now();
+    const second = finalizeJob(handle, 'failed'); // would be 'failed', but idempotent
+    expect(second).toBe('done'); // returns first result, NOT 'failed'
+
+    const job = getJob(handle)!;
+    expect(job.status).toBe('done'); // status NOT changed to failed
+    expect(job.finished).toBe(firstFinished); // finished time unchanged
+  });
 });
 
 describe('handleDir cache (#5)', () => {
@@ -133,5 +153,27 @@ describe('pruneOldJobs', () => {
     expect(existsSync(oldDir)).toBe(false);
     expect(getJob('fresh-term')).not.toBeNull();
     expect(getJob('run')).not.toBeNull();
+  });
+
+  it('keeps terminal jobs without finished field (no finished = not stale)', () => {
+    // A terminal job with no finished timestamp is NOT considered stale
+    const handle = `prune-nofinish-${process.pid}-${Date.now()}`;
+    insertJob({ handle, backend: 'cmd', sid: 's', repo: '/tmp/prune-nofinish', log_path: '/tmp/x' });
+    updateJob(handle, { status: 'done' }); // done but no finished timestamp
+    expect(pruneOldJobs()).toBe(0); // nothing pruned
+    expect(getJob(handle)).not.toBeNull();
+    // Clean up
+    rmSync(handleDir(handle), { recursive: true, force: true });
+  });
+
+  it('keeps terminal jobs with invalid finished timestamp', () => {
+    // Invalid/NaN finished is treated as "not stale"
+    const handle = `prune-invalid-finished-${process.pid}-${Date.now()}`;
+    insertJob({ handle, backend: 'cmd', sid: 's', repo: '/tmp/prune-invalid', log_path: '/tmp/x' });
+    updateJob(handle, { status: 'done', finished: 'not-a-timestamp' });
+    expect(pruneOldJobs()).toBe(0);
+    expect(getJob(handle)).not.toBeNull();
+    // Clean up
+    rmSync(handleDir(handle), { recursive: true, force: true });
   });
 });

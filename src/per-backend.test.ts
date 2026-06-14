@@ -1,4 +1,8 @@
-import { describe, it, expect, afterAll, afterEach, beforeAll } from 'bun:test';
+import { describe, it, expect, afterAll, afterEach, beforeAll, setDefaultTimeout } from 'bun:test';
+
+// Live-backend tests budget 60s internally via runToLog; bun's 5s default would kill
+// them before any real LLM call returns. Raise the per-test ceiling so they can complete.
+setDefaultTimeout(70_000);
 import { spawn, spawnSync } from 'child_process';
 import { writeFileSync, readFileSync, rmSync, mkdtempSync, statSync } from 'fs';
 import { join } from 'path';
@@ -179,7 +183,7 @@ describe('cmd real CLI', () => {
 
   it('plain text: rc=8 (max-turns) → failed:max-turns', async () => {
     const lp = logFile('cmd-maxturns');
-    const { path, argv } = fakeScript('cmd -p "loop" --yolo --max-turns 1 --skip-onboarding --add-dir /tmp 2>&1');
+    const { argv } = fakeScript('cmd -p "loop" --yolo --max-turns 1 --skip-onboarding --add-dir /tmp 2>&1');
     const r = await runToLog(argv, lp, 60_000);
     if (r.timedOut) return;
     const status = resolveStatus('cmd', r.rc, lp, r.timedOut);
@@ -226,9 +230,8 @@ describe('opencode real CLI', () => {
 });
 
 describe('resource limits', () => {
-  it('spawn does not set nice/ulimit (workers get full RAM/CPU)', () => {
+  it('spawn does not lower nice priority (workers get full CPU)', () => {
     let niceSet = false;
-    let ulimitSet = false;
     const proc = spawn('bash', ['-c', 'echo $$; sleep 1'], {
       detached: true,
       stdio: 'ignore',
@@ -239,6 +242,5 @@ describe('resource limits', () => {
     const nice = parseInt(r.stdout.trim(), 10);
     if (!isNaN(nice) && nice !== 0) niceSet = true;
     expect(niceSet).toBe(false);
-    expect(ulimitSet).toBe(false);
   });
 });

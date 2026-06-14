@@ -16,7 +16,7 @@ const SERVER_SID = process.env.CLAUDE_CODE_SESSION_ID ?? '';
 const launchedHandles = new Set<string>();
 
 export function trackLaunched(handle: string) { launchedHandles.add(handle); }
-export function untrackLaunched(handle: string) { launchedHandles.delete(handle); }
+function untrackLaunched(handle: string) { launchedHandles.delete(handle); }
 
 // --- Repo guard ---
 const _repoChecked = new Set<string>();
@@ -51,7 +51,7 @@ function killLingeringJobs(dir: string): void {
   }
 }
 
-export type LaunchResult = { handle: string; promise: Promise<RunResult> };
+type LaunchResult = { handle: string; promise: Promise<RunResult> };
 
 export function launch(
   backend: Backend,

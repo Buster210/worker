@@ -16,7 +16,7 @@ let sidSeq = 0;
 const nextSid = () => `chain-test-${process.pid}-${sidSeq++}`;
 
 function res(status: string, handle = 'h'): RunResult {
-  return { status, exit_code: 0, backend: 'cmd' as Backend, handle, resume_token: handle, repo: '/x', shortstat: '', log: '' };
+  return { status, exit_code: 0, backend: 'cmd' as Backend, handle, resume_token: handle, repo: '/x', log: '' };
 }
 
 // A driver that scripts each rung's outcome by call order. runRung pulls the next scripted result;
@@ -109,5 +109,25 @@ describe('runLadderChain (auto-climb controller)', () => {
     expect(final.status).toBe('killed');
     expect(d.runCalls).toEqual([]);                // killed → chain stops, no climb
     expect(d.resumeCalls).toEqual([]);
+  });
+
+  it('KNOWN GAP: no total wall-clock cap — resumes + climbs every rung, each with the FULL per-rung timeout', async () => {
+    // The caller's `timeout` is applied PER RUNG, not across the chain: handleLadder (chain.ts:15)
+    // computes timeoutMs once and hands the SAME value to every launch/resume (chain.ts:21-24).
+    // runLadderChain has no notion of a cumulative deadline — given stops/failures it resumes rung 0
+    // and then climbs through EVERY remaining backend, each receiving a fresh full timeout. So
+    // worst-case cumulative runtime ≈ (#climbs + #resumes) × timeout, far exceeding the caller's
+    // `timeout` (the real bug: a `timeout:900` ladder ran well past 900s). NO source fix in this
+    // scope — when the chain grows a total budget that short-circuits early, this assertion changes.
+    const sid = nextSid();
+    // rung 0 stops → resume (also stops) → climb; every climbed rung fails → exhausts the whole ladder.
+    const d = scriptedDrivers({ rungs: Array(LADDER.length).fill('failed'), resume: () => 'stopped' });
+    const final = await runLadderChain(sid, Promise.resolve(res('stopped', 'rung0')), d);
+    expect(final.status).toBe('exhausted');
+    expect(d.resumeCalls).toEqual(['rung0']);      // resumed rung 0 once
+    expect(d.runCalls).toEqual(LADDER.slice(1));   // then climbed through every remaining backend
+    // Total full-timeout-bearing operations after rung 0 = 1 resume + (LADDER.length-1) climbs.
+    // Nothing short-circuited on elapsed time — that is the gap.
+    expect(d.resumeCalls.length + d.runCalls.length).toBe(LADDER.length);
   });
 });

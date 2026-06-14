@@ -3,7 +3,7 @@ import { LADDER, type Backend } from './backends.ts';
 import { type RunResult } from './runner.ts';
 import { launch, resumeLaunch } from './lifecycle.ts';
 
-export type LadderResult = { handle: string; status: string } | { status: 'exhausted'; note: string };
+type LadderResult = { handle: string; status: string } | { status: 'exhausted'; note: string };
 
 export type LadderDrivers = {
   runRung: (backend: Backend) => Promise<RunResult>;
@@ -27,7 +27,7 @@ export function handleLadder(args: { sid: string; prompt: string; dir: string; t
   const chainPromise = runLadderChain(sid, first.promise, drivers)
     .catch((): RunResult => ({
       status: 'failed', exit_code: 1, backend: LADDER[0], handle: first.handle,
-      resume_token: first.handle, repo: dir, shortstat: '', log: '',
+      resume_token: first.handle, repo: dir, log: '',
     }))
     .finally(() => removeChainLock(sid));
 

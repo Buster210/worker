@@ -129,6 +129,19 @@ describe('runWorker lifecycle (real subprocess)', () => {
     expect(r.status).toBe('killed');
     expect(getJob(handle)?.status).toBe('killed');
   });
+
+  it('resolves "failed" when the spawn errors before the process starts', async () => {
+    // Spawn error (e.g., ENOENT for missing command) still resolves via the error handler
+    const handle = `spawn-err-${seq}`;
+    const lp = seedJob(handle);
+    // Fake script with a non-existent command - spawn will fail
+    const nonExistentDir = join(tmpdir(), `nonexistent-${process.pid}`);
+    const badScriptPath = join(nonExistentDir, 'fake.cmd');
+    try { rmSync(nonExistentDir, { recursive: true, force: true }); } catch {}
+    // No script written - running it will error at spawn time
+    const r = await runWorker(['bash', badScriptPath], REPO, handle, 'cmd', lp, '');
+    expect(r.status).toBe('failed');
+  });
 });
 
 describe('watchExisting (resume watcher, real process)', () => {
@@ -317,31 +330,3 @@ describe('activitySig log-first probing (#6b)', () => {
   });
 });
 
-describe('shortstat reports real +/- line deltas', () => {
-  it('shows non-zero insertions and deletions for staged+unstaged changes', async () => {
-    const repo = mkdtempSync(join(tmpdir(), 'wrunner-shortstat-'));
-    tmpDirs.push(repo);
-    spawnSync('git', ['init', '-q'], { cwd: repo });
-    spawnSync('git', ['config', 'user.email', 'test@test.com'], { cwd: repo });
-    spawnSync('git', ['config', 'user.name', 'Test'], { cwd: repo });
-    // Initial commit with a file
-    writeFileSync(join(repo, 'base.txt'), 'line1\nline2\nline3\n');
-    spawnSync('git', ['add', 'base.txt'], { cwd: repo });
-    spawnSync('git', ['commit', '-q', '-m', 'init'], { cwd: repo });
-    // Unstaged: modify base.txt (add 2 lines, remove 1)
-    writeFileSync(join(repo, 'base.txt'), 'line1\nnew_a\nnew_b\nline3\n');
-    // Staged: add a new file with content
-    writeFileSync(join(repo, 'staged.txt'), 'alpha\nbeta\ngamma\n');
-    spawnSync('git', ['add', 'staged.txt'], { cwd: repo });
-    const handle = `shortstat-${seq}`;
-    const lp = seedJob(handle);
-    process.env.WORKER_POLL_MS = '100';
-    const r = await runWorker(fakeScript('echo; echo DONE'), repo, handle, 'cmd', lp, '');
-    expect(r.status).toBe('done');
-    // shortstat must contain non-zero deltas
-    expect(r.shortstat).toMatch(/\+[^0]/);
-    expect(r.shortstat).toMatch(/-[^0]/);
-    // file count >= 2 (base.txt modified + staged.txt added)
-    expect(r.shortstat).toMatch(/[2-9]\s+files?\s/);
-  });
-});

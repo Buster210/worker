@@ -4,10 +4,8 @@ type ActivityMonitor = {
   readonly sig: string;
   readonly log: string;
   readonly at: number;
-  readonly dirty: string;
   readonly repo: string;
   readonly logPath: string;
-  readonly _lastEmitted: { sig: string; at: number };
   dispose: () => void;
 };
 
@@ -21,7 +19,6 @@ export function startActivityMonitor(repo: string, logPath: string): ActivityMon
   let watcher: FSWatcher | undefined;
   let cachedLog = readLogStat(logPath);
   let cachedAt = Date.now();
-  let dirty = '';
   let lastPollAt = 0;
   const poll = () => {
     if (Date.now() === lastPollAt) return;
@@ -33,10 +30,8 @@ export function startActivityMonitor(repo: string, logPath: string): ActivityMon
     get sig() { poll(); return cachedLog; },
     get log() { return cachedLog; },
     get at() { poll(); return cachedAt; },
-    get dirty() { return dirty; },
     repo,
     logPath,
-    _lastEmitted: { sig: cachedLog, at: cachedAt },
     dispose() {
       try { watcher?.close(); } catch {}
       _activityMonitors.delete(key);

@@ -11,17 +11,9 @@ export function computeLadder(): Backend[] {
   const validSet = new Set<string>(ALL_BACKENDS);
   const defaultOrder: Backend[] = ALL_BACKENDS.filter(be => process.env[`SKIP_${be}`] !== '1');
 
-  let filePath: string;
-  try {
-    filePath = join(workersDir(), 'ladder.json');
-  } catch (e) {
-    console.error(`[ladder] failed to resolve workersDir: ${e}`);
-    return defaultOrder;
-  }
-
   let raw: unknown;
   try {
-    raw = JSON.parse(readFileSync(filePath, 'utf-8'));
+    raw = JSON.parse(readFileSync(join(workersDir(), 'ladder.json'), 'utf-8'));
   } catch (e: any) {
     if (e?.code === 'ENOENT') return defaultOrder;
     console.error(`[ladder] failed to read ladder.json: ${e?.message ?? e}`);

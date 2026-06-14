@@ -53,8 +53,12 @@ function listDescendantsLegacy(pid: number): number[] {
 
 export function killProcessTree(pid: number, sig: NodeJS.Signals | number = 'SIGKILL'): void {
   if (pid <= 0) return;
-  try { process.kill(-pid, sig); } catch {}
+  // Snapshot the tree while it is still intact. Killing the group first would let
+  // an intermediate process die and its children reparent to init, vanishing from
+  // the ppid walk and surviving as orphans. Enumerate, then kill the group, then
+  // kill each captured descendant individually (catches any that escaped the group).
   const descendants = listDescendants(pid);
+  try { process.kill(-pid, sig); } catch {}
   for (const child of descendants) {
     try { process.kill(child, sig); } catch {}
   }

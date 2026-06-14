@@ -1,4 +1,4 @@
-import { spawn, spawnSync } from 'child_process';
+import { spawn } from 'child_process';
 import { openSync, closeSync, writeSync } from 'fs';
 import { updateJob, getJob, removeLock, finalizeJob } from './state.ts';
 import { emitsJsonLog, type Backend } from './backends.ts';
@@ -16,38 +16,16 @@ export type RunResult = {
   handle: string;
   resume_token: string;
   repo: string;
-  shortstat: string;
   log: string;
 };
 
-export function shortstat(repo: string): string {
-  try {
-    const r = spawnSync('git', ['-C', repo, 'status', '--porcelain'], { encoding: 'utf8', timeout: 2000 });
-    if (r.status !== 0) return 'unknown';
-    const lines = r.stdout.trim().split('\n').filter(Boolean);
-    if (lines.length === 0) return 'no changes';
-    let adds = 0, dels = 0;
-    try {
-      const n = spawnSync('git', ['-C', repo, 'diff', '--numstat', 'HEAD'], { encoding: 'utf8', timeout: 2000 });
-      if (n.status === 0) {
-        for (const ln of n.stdout.split('\n').filter(Boolean)) {
-          const [a, d] = ln.split('\t');
-          adds += a === '-' ? 0 : Number(a);
-          dels += d === '-' ? 0 : Number(d);
-        }
-      }
-    } catch {}
-    return `${lines.length} file${lines.length === 1 ? '' : 's'} +${adds}/-${dels}`;
-  } catch { return 'unknown'; }
-}
 
-export function decideFateAfterFreeze(handle: string, pid: number, logPath: string, backend: string): boolean {
-  const { status, lastText } = readSentinel(logPath, emitsJsonLog(backend));
+function decideFateAfterFreeze(handle: string, pid: number, logPath: string, backend: string): boolean {
+  const { status } = readSentinel(logPath, emitsJsonLog(backend));
   const isFailed = status !== null && status.startsWith('failed');
-  const lastLine = lastText.length > 500 ? lastText.slice(0, 500) : lastText;
 
   if (!isFailed) {
-    updateJob(handle, { status: 'stopped', stopped_at: new Date().toISOString(), last_line: lastLine });
+    updateJob(handle, { status: 'stopped', stopped_at: new Date().toISOString() });
     removeLock(handle);
     return true;
   }
@@ -56,7 +34,7 @@ export function decideFateAfterFreeze(handle: string, pid: number, logPath: stri
   return false;
 }
 
-export function freezeThenDecide(handle: string, pid: number, logPath: string, backend: string): boolean {
+function freezeThenDecide(handle: string, pid: number, logPath: string, backend: string): boolean {
   killGroup(pid, 'SIGSTOP');
   return decideFateAfterFreeze(handle, pid, logPath, backend);
 }
@@ -66,14 +44,14 @@ export function backendShellArgv(argv: string[]): string[] {
   return [shell, '-c', '[ -n "$WORKER_RC" ] && [ -f "$WORKER_RC" ] && . "$WORKER_RC"; "$0" "$@"', ...argv];
 }
 
-export function launchAndWait(
+function launchAndWait(
   argv: string[],
   repo: string,
   handle: string,
   backend: Backend,
   logPath: string,
   timeoutMs: number = defaultTimeoutMs(),
-): Promise<{ rc: number; timedOut: boolean; stopped: boolean; dirty: string }> {
+): Promise<{ rc: number; timedOut: boolean; stopped: boolean }> {
   return new Promise((resolve) => {
     const logFd = openSync(logPath, 'a');
     const [cmd, ...args] = backendShellArgv(argv);
@@ -102,10 +80,9 @@ export function launchAndWait(
       if (settled) return;
       settled = true;
       clearInterval(watchdog);
-      const dirty = mon.dirty;
       try { mon.dispose(); } catch {}
       try { closeSync(logFd); } catch {}
-      resolve({ rc: code, timedOut: timed, stopped: stoppedJob, dirty });
+      resolve({ rc: code, timedOut: timed, stopped: stoppedJob });
     };
 
     const freezeAndFinish = () => {
@@ -157,27 +134,18 @@ export async function runWorker(
   resumeToken: string,
   timeoutMs?: number,
 ): Promise<RunResult> {
-  const { rc, timedOut, stopped, dirty } = await launchAndWait(argv, repo, handle, backend, logPath, timeoutMs);
+  const { rc, timedOut, stopped } = await launchAndWait(argv, repo, handle, backend, logPath, timeoutMs);
   let status: string;
   if (stopped) {
     status = 'stopped';
   } else {
     status = finalizeJob(handle, resolveStatus(backend, rc, logPath, timedOut), { resume_token: resumeToken });
   }
-  const ss = shortstatFromDirty(dirty) ?? shortstat(repo);
   return {
     status, exit_code: rc, backend, handle,
     resume_token: resumeToken, repo,
-    shortstat: ss,
     log: logPath,
   };
-}
-
-function shortstatFromDirty(dirty: string): string | null {
-  if (!dirty) return null;
-  const lines = dirty.trim().split('\n').filter(Boolean);
-  if (lines.length === 0) return 'no changes';
-  return `${lines.length} file${lines.length === 1 ? '' : 's'}`;
 }
 
 export function watchExisting(
@@ -199,7 +167,7 @@ export function watchExisting(
     let resolved = false;
     const buildResult = (status: string): RunResult => ({
       status, exit_code: 0, backend, handle,
-      resume_token: resumeToken, repo, shortstat: '', log: logPath,
+      resume_token: resumeToken, repo, log: logPath,
     });
     const finish = (status: string) => {
       if (resolved) return;

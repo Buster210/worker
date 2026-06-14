@@ -3,7 +3,7 @@ import { mkdirSync, writeFileSync, readFileSync, unlinkSync, realpathSync, exist
 import { updateJob, finalizeJob, workersDir, logPath as workerLogPath } from './state.ts';
 import { resolveStatus } from './status.ts';
 import { defaultTimeoutMs, workerEnv } from './env.ts';
-import { shortstat, type RunResult } from './runner.ts';
+import { type RunResult } from './runner.ts';
 
 type TrustEntry = { hasTrustDialogAccepted?: boolean; hasCompletedProjectOnboarding?: boolean; projectOnboardingSeenCount?: number; [k: string]: unknown };
 type ClaudeConfig = { projects?: Record<string, TrustEntry>; [k: string]: unknown };
@@ -86,7 +86,7 @@ export async function runClaudeTmux(
 
   if (tmuxSpawn.status !== 0) {
     finalizeJob(handle, 'failed');
-    return { status: 'failed', exit_code: 1, backend: 'claude_tmux', handle, resume_token: '', repo, shortstat: shortstat(repo), log: logPath };
+    return { status: 'failed', exit_code: 1, backend: 'claude_tmux', handle, resume_token: '', repo, log: logPath };
   }
 
   updateJob(handle, { worker_pid: 0 });
@@ -115,5 +115,5 @@ export async function runClaudeTmux(
   const timedOut = !stopped;
   const status = finalizeJob(handle, resolveStatus('claude_tmux', 0, logPath, timedOut));
 
-  return { status, exit_code: timedOut ? 124 : 0, backend: 'claude_tmux', handle, resume_token: '', repo, shortstat: shortstat(repo), log: logPath };
+  return { status, exit_code: timedOut ? 124 : 0, backend: 'claude_tmux', handle, resume_token: '', repo, log: logPath };
 }

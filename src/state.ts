@@ -80,7 +80,7 @@ export function removeChainLock(sid: string) { try { unlinkSync(chainLockPath(si
 export type Job = {
   handle: string; backend: string; sid: string;
   worker_pid: number; resume_token: string; repo: string; started: string;
-  finished?: string; stopped_at?: string; last_line?: string;
+  finished?: string; stopped_at?: string;
   status: string; model: string; task: string; log_path: string;
   completion_lock: string;
   kill_requested?: boolean;
@@ -155,6 +155,9 @@ export function getJobFresh(handle: string): Job | null {
 export function finalizeJob(handle: string, naturalStatus: string, extra?: Partial<Job>): string {
   const job = getJob(handle);
   if (!job) return naturalStatus;
+  // Idempotent: once a job is terminal (anything but running/stopped), the first
+  // finalize wins. A later call must not downgrade done->failed or bump `finished`.
+  if (job.status !== 'running' && job.status !== 'stopped') return job.status;
   const final = naturalStatus === 'done' ? 'done' : (job.kill_requested ? 'killed' : naturalStatus);
   updateJob(handle, { status: final, finished: new Date().toISOString(), ...extra });
   removeLock(handle);

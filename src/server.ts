@@ -11,10 +11,10 @@ import { LADDER, ALL_BACKENDS, type Backend } from './backends.ts';
 import { backendShellArgv } from './runner.ts';
 import { workerEnv } from './env.ts';
 import { resolveStatus } from './status.ts';
-import { isProcessAlive, killProcessTree } from './process.ts';
+import { isProcessAlive } from './process.ts';
 import { sweepStaleJobs, reapStoppedJobs } from './maintenance.ts';
-import { launch, forceKillJob, assertRepo, resumeLaunch as lifecycleResumeLaunch, shutdown, resetShutdownState } from './lifecycle.ts';
-import { handleLadder, runLadderChain, type LadderDrivers } from './chain.ts';
+import { launch, forceKillJob, assertRepo, resumeLaunch as lifecycleResumeLaunch, shutdown } from './lifecycle.ts';
+import { handleLadder } from './chain.ts';
 
 // --- MCP tool handlers (keep in server.ts) ---
 

@@ -1,5 +1,6 @@
-import { describe, it, expect, afterAll } from 'bun:test';
+import { describe, it, expect, afterAll, spyOn } from 'bun:test';
 import { spawnSync, spawn } from 'child_process';
+import * as childProcess from 'child_process';
 import { listDescendants, killProcessTree } from './process.ts'
 
 // Spawn a detached process tree: top pid forks a child, which forks a grandchild,
@@ -81,6 +82,26 @@ describe('listDescendants', () => {
     const desc = listDescendants(-1);
     expect(desc).toEqual([]);
   });
+
+  it('skips malformed ps output lines (no crash, no false pids)', () => {
+    // Mock ps output with junk lines mixed with valid ones
+    // ps -axo pid=,ppid= outputs "child_pid parent_pid" format
+    const psSpy = spyOn(childProcess, 'spawnSync').mockReturnValue({
+      stdout: `123 bogus\n789 1\n`, // first line has invalid parent (no space after child), second is valid child of pid 1
+      status: 0,
+      signal: null,
+      pid: 0,
+      output: [],
+      stderr: '',
+    } as any);
+    try {
+      const desc = listDescendants(1);
+      // Only the valid line extracted; junk lines skipped
+      expect(desc).toEqual([789]);
+    } finally {
+      psSpy.mockRestore();
+    }
+  });
 });
 
 describe('killProcessTree', () => {
@@ -106,5 +127,37 @@ describe('killProcessTree', () => {
     killProcessTree(0, 'SIGKILL');
     killProcessTree(-1, 'SIGKILL');
     // No throw = pass.
+  });
+
+  // Regression guard: descendants MUST be snapshotted while the tree is still
+  // intact (before the group kill). If the group is killed first, an intermediate
+  // process dies and its children reparent to init — they vanish from the ppid
+  // walk and survive as orphans. This asserts ordering deterministically (no real
+  // processes, no flake) by recording the sequence of side effects.
+  it('enumerates descendants BEFORE killing the group (no reparent leak)', () => {
+    const FAKE = 999999;
+    const CHILD = 888888;
+    const order: string[] = [];
+
+    const psSpy = spyOn(childProcess, 'spawnSync').mockImplementation((cmd: any) => {
+      if (cmd === 'ps') {
+        order.push('enumerate');
+        return { stdout: `${CHILD} ${FAKE}\n`, status: 0, signal: null, pid: 0, output: [], stderr: '' } as any;
+      }
+      return { stdout: '', status: 0, signal: null, pid: 0, output: [], stderr: '' } as any;
+    });
+    const killSpy = spyOn(process, 'kill').mockImplementation(((p: number) => {
+      if (p === -FAKE) order.push('killgroup');
+      else if (p === CHILD) order.push('killchild');
+      return true;
+    }) as any);
+
+    try {
+      killProcessTree(FAKE, 'SIGKILL');
+      expect(order).toEqual(['enumerate', 'killgroup', 'killchild']);
+    } finally {
+      psSpy.mockRestore();
+      killSpy.mockRestore();
+    }
   });
 });
