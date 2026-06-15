@@ -1,14 +1,15 @@
 import { randomUUID } from 'crypto';
-import { spawnSync } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
+import { join } from 'path';
 import { killProcessTree, isProcessAlive } from './process.ts';
-import { defaultTimeoutMs, workerEnv } from './env.ts';
 import {
-  insertJob, getJob, updateJob, createLock, logPath as workerLogPath, finalizeJob,
-  getRunningJobsForRepo,
+  handleDir, insertJob, getJob, updateJob, createLock, logPath as workerLogPath, finalizeJob,
 } from './state.ts';
+import { addWorktreeAsync } from './worktree.ts';
 import { buildSpec, buildRunArgv, buildResumeArgv, getResumeToken, type Backend } from './backends.ts';
 import { runWorker, watchExisting, type RunResult } from './runner.ts';
 import { runClaudeTmux } from './claudeTmux.ts';
+import { defaultTimeoutMs, loginShellEnvAsync } from './env.ts';
 
 // --- Server lifecycle state ---
 export const SERVER_STARTED = new Date().toISOString();
@@ -44,13 +45,6 @@ function newHandle(backend: Backend): string {
   return backend === 'claude' ? id : `w-${id.slice(0, 8)}`;
 }
 
-function killLingeringJobs(dir: string): void {
-  for (const job of getRunningJobsForRepo(dir)) {
-    forceKillJob(job);
-    finalizeJob(job.handle, 'killed');
-  }
-}
-
 type LaunchResult = { handle: string; promise: Promise<RunResult> };
 
 export function launch(
@@ -61,33 +55,48 @@ export function launch(
 ): LaunchResult {
   const handle = newHandle(backend);
   trackLaunched(handle);
-  killLingeringJobs(dir);
-  const lp = workerLogPath(handle, dir);
-  const spec = buildSpec(backend, prompt);
-  const modelToUse = (backend === 'claude' || backend === 'omp' || backend === 'claude_tmux') ? undefined : opts.model;
-  insertJob({ handle, backend, sid: opts.sid, repo: dir, model: modelToUse, task: prompt, log_path: lp, completion_lock: opts.completionLock, server_pid: process.pid, server_started: SERVER_STARTED, server_sid: SERVER_SID });
+  const promise: Promise<RunResult> = (async () => {
+    const wt = join(handleDir(handle, dir), 'tree');
+    const lp = workerLogPath(handle, dir);
+    const spec = buildSpec(backend, prompt);
+    const modelToUse = (backend === 'claude' || backend === 'omp' || backend === 'claude_tmux') ? undefined : opts.model;
+    insertJob({ handle, backend, sid: opts.sid, repo: dir, worktree_path: wt, model: modelToUse, task: prompt, log_path: lp, completion_lock: opts.completionLock, server_pid: process.pid, server_started: SERVER_STARTED, server_sid: SERVER_SID });
 
-  const trackError = (p: Promise<RunResult>): Promise<RunResult> => p.catch((err: unknown) => {
+    try {
+      const [createdWt, , base_sha] = await Promise.all([
+        addWorktreeAsync(dir, handle),
+        loginShellEnvAsync(),
+        new Promise<string | undefined>(resolve => {
+          const chunks: Buffer[] = [];
+          const p = spawn('git', ['-C', dir, 'rev-parse', 'HEAD'], { stdio: ['ignore', 'pipe', 'ignore'] });
+          p.stdout?.on('data', (d: Buffer) => chunks.push(d));
+          p.on('close', () => resolve(Buffer.concat(chunks).toString().trim() || undefined));
+          p.on('error', () => resolve(undefined));
+        }),
+      ]);
+      if (createdWt !== wt) throw new Error(`worktree path mismatch for ${handle}`);
+      if (base_sha) updateJob(handle, { base_sha });
+    } catch (err) {
+      untrackLaunched(handle);
+      throw err;
+    }
+
+    if (backend === 'claude_tmux') {
+      return runClaudeTmux(spec, wt, handle, handle, opts.timeoutMs);
+    }
+    const argv = buildRunArgv(backend, spec, wt, handle, modelToUse, opts.extraArgs);
+    const initToken = backend === 'opencode' ? '' : getResumeToken(backend, handle, lp);
+    const result = await runWorker(argv, wt, handle, backend, lp, initToken, opts.timeoutMs);
+    if (backend === 'opencode') {
+      const tok = getResumeToken('opencode', handle, lp);
+      if (tok) { result.resume_token = tok; updateJob(handle, { resume_token: tok }); }
+    }
+    return result;
+  })().catch((err: unknown) => {
     finalizeJob(handle, 'failed');
     throw err;
-  });
+  }).finally(() => untrackLaunched(handle));
 
-  let promise: Promise<RunResult>;
-  if (backend === 'claude_tmux') {
-    promise = trackError(runClaudeTmux(spec, dir, handle, handle, opts.timeoutMs));
-  } else {
-    const argv = buildRunArgv(backend, spec, dir, handle, modelToUse, opts.extraArgs);
-    const initToken = backend === 'opencode' ? '' : getResumeToken(backend, handle, lp);
-    promise = trackError(runWorker(argv, dir, handle, backend, lp, initToken, opts.timeoutMs))
-      .then(r => {
-        if (backend === 'opencode') {
-          const tok = getResumeToken('opencode', handle, lp);
-          if (tok) { r.resume_token = tok; updateJob(handle, { resume_token: tok }); }
-        }
-        return r;
-      });
-  }
-  promise.then(() => untrackLaunched(handle), () => untrackLaunched(handle));
   return { handle, promise };
 }
 
@@ -104,7 +113,13 @@ export async function shutdown(): Promise<void> {
   for (const handle of toKill) {
     const job = getJob(handle);
     if (!job) continue;
-    if (job.worker_pid > 0) killProcessTree(job.worker_pid, 'SIGKILL');
+    // Dispatch kill by backend type (same logic as forceKillJob) without setting
+    // kill_requested — shutdown finalizes as 'failed' so jobs remain resumable.
+    if (job.backend === 'claude_tmux') {
+      try { spawnSync('tmux', ['kill-session', '-t', handle], { stdio: 'ignore' }); } catch {}
+    } else if (job.worker_pid > 0) {
+      killProcessTree(job.worker_pid, 'SIGKILL');
+    }
     finalizeJob(handle, 'failed', { resume_token: job.resume_token });
     launchedHandles.delete(handle);
   }
@@ -124,26 +139,29 @@ export function resumeLaunch(args: { handle: string; prompt: string; dir: string
     throw err;
   });
 
+  const wtDir = job.worktree_path ?? dir;
+
   if (job.status === 'stopped') {
     const pid = job.worker_pid;
     if (!isProcessAlive(pid, job.started)) {
       const be = job.backend as Backend;
       const lp = workerLogPath(handle);
       const spec = buildSpec(be, prompt);
-      const argv = buildResumeArgv(be, spec, dir, job.resume_token, undefined, extraArgs);
-      const p = runWorker(argv, dir, handle, be, lp,
+      const argv = buildResumeArgv(be, spec, wtDir, job.resume_token, undefined, extraArgs);
+      const p = runWorker(argv, wtDir, handle, be, lp,
         job.resume_token, timeout ? timeout * 1000 : undefined);
       return { handle, promise: trackError(p) };
     }
 
     try { process.kill(-pid, 'SIGCONT'); } catch {}
-    updateJob(handle, { status: 'running' });
+    // Re-arm the deadline on resume — the original is in the past, which would otherwise
+    // trip watchExisting's grace-kill immediately.
+    updateJob(handle, { status: 'running', deadline_at: Date.now() + (timeout ? timeout * 1000 : defaultTimeoutMs()) });
     createLock(handle);
 
     const be = job.backend as Backend;
     const lp = workerLogPath(handle);
-    const deadlineMs = timeout ? timeout * 1000 : defaultTimeoutMs();
-    return { handle, promise: trackError(watchExisting(handle, pid, dir, lp, be, deadlineMs)) };
+    return { handle, promise: trackError(watchExisting(handle, pid, wtDir, lp, be)) };
   }
 
   const be = job.backend as Backend;
@@ -152,8 +170,8 @@ export function resumeLaunch(args: { handle: string; prompt: string; dir: string
   if (be === 'cmd') {
     spec = `A prior attempt already ran in this repo — inspect the working tree, determine what is already done, and complete only the remainder.\n\n` + spec;
   }
-  const argv = buildResumeArgv(be, spec, dir, job.resume_token, undefined, extraArgs);
-  const p = runWorker(argv, dir, handle, be, lp,
+  const argv = buildResumeArgv(be, spec, wtDir, job.resume_token, undefined, extraArgs);
+  const p = runWorker(argv, wtDir, handle, be, lp,
     job.resume_token, timeout ? timeout * 1000 : undefined);
   return { handle, promise: trackError(p) };
 }

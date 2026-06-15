@@ -54,8 +54,12 @@ describe('terminalStatus — ladder (chain lock → audit trail, not rung-0 job.
     const { handle, lockPath } = seedLadder('killed');
     expect(terminalStatus(handle, lockPath)).toBe('killed');
   });
-  it('maps any other last row (failed/stopped/timeout) to exhausted — chain absorbs those internally', () => {
-    for (const last of ['failed', 'stopped', 'timeout']) {
+  it('surfaces a timeout last row as timeout — it is terminal in the chain (no resume/climb)', () => {
+    const { handle, lockPath } = seedLadder('timeout');
+    expect(terminalStatus(handle, lockPath)).toBe('timeout');
+  });
+  it('maps any other last row (failed/stopped) to exhausted — chain absorbs those internally', () => {
+    for (const last of ['failed', 'stopped']) {
       const { handle, lockPath } = seedLadder(last);
       expect(terminalStatus(handle, lockPath)).toBe('exhausted');
     }

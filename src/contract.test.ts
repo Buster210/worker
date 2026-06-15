@@ -1,12 +1,14 @@
 import { describe, it, expect, beforeAll, afterEach, afterAll } from 'bun:test';
 import { spawn, spawnSync } from 'child_process';
-import { writeFileSync, readFileSync, rmSync, mkdtempSync, openSync } from 'fs';
+import { writeFileSync, readFileSync, rmSync, mkdirSync, mkdtempSync, openSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
 // ── Hermetic state: set BEFORE importing state/lifecycle (lazy resolution) ──
 const STATE_DIR = join(tmpdir(), `wcontract-state-${process.pid}`);
 process.env.WORKER_STATE_DIR = STATE_DIR;
+const PLANS_DIR = join(tmpdir(), `wcontract-plans-${process.pid}`);
+process.env.WORKER_PLANS_DIR = PLANS_DIR;
 // Use bash for shell wrappers — zsh caches command lookups which prevents stub binaries
 // from being found when a real binary with the same name exists earlier on PATH.
 process.env.SHELL = '/bin/bash';
@@ -20,17 +22,31 @@ import { workerEnv } from './env.ts';
 // ── Shared state ──
 const REPO = mkdtempSync(join(tmpdir(), 'wcontract-repo-'));
 spawnSync('git', ['init', '-q'], { cwd: REPO });
+// Initial commit so HEAD exists — required by `git worktree add` (G5+)
+spawnSync('git', ['config', 'user.email', 'test@test.com'], { cwd: REPO });
+spawnSync('git', ['config', 'user.name', 'Test'], { cwd: REPO });
+writeFileSync(join(REPO, '.gitkeep'), '');
+spawnSync('git', ['add', '.'], { cwd: REPO });
+spawnSync('git', ['commit', '-m', 'init', '--no-gpg-sign'], { cwd: REPO });
 const tmpFiles: string[] = [];
 const frozenPids: number[] = [];
 const tmpDirs: string[] = [REPO];
 let seq = 0;
+// ── Plans dir: write spec files here; WORKER_PLANS_DIR points here ──
+mkdirSync(PLANS_DIR, { recursive: true });
+tmpDirs.push(PLANS_DIR);
+// Helper: write a spec file and return its bare filename
+function writeSpec(name: string, body: string): string {
+  writeFileSync(join(PLANS_DIR, name), body);
+  return name;
+}
 // ── PATH stub: modify workerEnv after imports so the stub binary is findable ──
 const STUB_DIR = mkdtempSync(join(tmpdir(), 'wcontract-stub-'));
 tmpDirs.push(STUB_DIR);
-workerEnv.PATH = `${STUB_DIR}:${workerEnv.PATH}`;
-// workerEnv is computed at import time from process.env; mutate directly so the shell wrapper
+workerEnv().PATH = `${STUB_DIR}:${workerEnv().PATH}`;
+// workerEnv() is a memoized object; mutate directly so the shell wrapper
 // doesn't source the host's .common rc file.
-workerEnv.WORKER_RC = '';
+workerEnv().WORKER_RC = '';
 
 // ── Poll helper: assert state reaches expectation within a generous ceiling ──
 // Uses real wall-clock because we exercise real subprocesses — fake timers cannot drive them.
@@ -67,9 +83,11 @@ function spawnDetached(body: string, lp: string): number {
 
 // ── Speed knobs per test ──
 afterEach(() => {
-  for (const k of ['WORKER_POLL_MS', 'WORKER_RESUME_POLL_MS', 'WORKER_STALL_MS', 'WORKER_TIMEOUT_MS', 'WORKER_REAP_MS']) {
+  for (const k of ['WORKER_POLL_MS', 'WORKER_RESUME_POLL_MS', 'WORKER_STALL_MS', 'WORKER_TIMEOUT_MS', 'WORKER_REAP_MS', 'WORKER_PLANS_DIR']) {
     delete process.env[k];
   }
+  // Restore plans dir for subsequent tests (deleted by the loop above)
+  process.env.WORKER_PLANS_DIR = PLANS_DIR;
 });
 
 afterAll(() => {
@@ -234,7 +252,8 @@ describe('handleResume — hermetic (stopped + alive pid)', () => {
 
     // handleResume is fire-and-forget (returns {handle, status:'running'}); pass short timeout
     // so the watcher's deadline is tight and the test finishes promptly.
-    const { handle: h, status } = handleResume({ handle, prompt: 'resume test', dir: REPO, timeout: 10 });
+    const specFile = writeSpec('resume-test.md', 'resume test spec');
+    const { handle: h, status } = handleResume({ handle, specFile, dir: REPO, timeout: 10 });
     expect(h).toBe(handle);
     expect(status).toBe('running');
 
@@ -253,7 +272,8 @@ describe('handleResume — hermetic (stopped + alive pid)', () => {
   });
 
   it('throws for unknown handle', () => {
-    expect(() => handleResume({ handle: 'ghost', prompt: 'x', dir: REPO })).toThrow(/No job found/);
+    const ghostSpec = writeSpec('ghost-spec.md', 'ghost spec');
+    expect(() => handleResume({ handle: 'ghost', specFile: ghostSpec, dir: REPO })).toThrow(/No job found/);
   });
 });
 
@@ -270,7 +290,8 @@ describe('handleRun — via PATH stub', () => {
     process.env.WORKER_POLL_MS = '50';
     process.env.WORKER_RESUME_POLL_MS = '50';
 
-    const { handle, status } = handleRun({ backend: 'cmd', prompt: 'test', dir: REPO });
+    const specFile = writeSpec('happy-path.md', 'test spec');
+    const { handle, status } = handleRun({ backend: 'cmd', specFile, dir: REPO });
     expect(status).toBe('running');
     expect(handle).toBeTruthy();
 
@@ -293,7 +314,8 @@ describe('handleRun — via PATH stub', () => {
   it('assertRepo rejects a non-git directory', () => {
     const nonGit = mkdtempSync(join(tmpdir(), 'wcontract-nongit-'));
     tmpDirs.push(nonGit);
-    expect(() => handleRun({ backend: 'cmd', prompt: 'test', dir: nonGit })).toThrow(/Not a git repo/);
+    const specFile = writeSpec('non-git-test.md', 'test spec');
+    expect(() => handleRun({ backend: 'cmd', specFile, dir: nonGit })).toThrow(/Not a git repo/);
     // No job should have been created (insertJob is after assertRepo in launch)
   });
 
@@ -302,7 +324,8 @@ describe('handleRun — via PATH stub', () => {
     process.env.WORKER_POLL_MS = '50';
     process.env.WORKER_RESUME_POLL_MS = '50';
 
-    const { handle, status } = handleRun({ backend: 'cmd', prompt: 'fail test', dir: REPO });
+    const specFile = writeSpec('fail-test.md', 'fail test spec');
+    const { handle, status } = handleRun({ backend: 'cmd', specFile, dir: REPO });
     expect(status).toBe('running');
 
     await waitFor(() => {
@@ -313,69 +336,87 @@ describe('handleRun — via PATH stub', () => {
     expect(finalStatus).toMatch(/^failed/);
   });
 
-  it('one-worker-per-repo: launching B kills lingering A', async () => {
-    // Stub A: sleep long so it stays running when B launches
+  it('parallel workers: launching B on the same repo does NOT kill A (both coexist)', async () => {
+    // A: long-running (stays alive when B launches)
     makeStub('cmd', 'sleep 100');
     process.env.WORKER_POLL_MS = '50';
     process.env.WORKER_RESUME_POLL_MS = '50';
+    // Raise stall timeout so A is not frozen during the test
+    process.env.WORKER_STALL_MS = '30000';
 
-    const a = handleRun({ backend: 'cmd', prompt: 'first job', dir: REPO });
+    const specA = writeSpec('parallel-a.md', 'parallel worker A spec');
+    const a = handleRun({ backend: 'cmd', specFile: specA, dir: REPO });
     expect(a.status).toBe('running');
-    // Wait for A's process to be alive
-    const jobA = getJob(a.handle)!;
-    await waitFor(() => jobA.worker_pid > 0 && isProcessAlive(jobA.worker_pid));
-    const pidA = jobA.worker_pid;
+    // Wait for A's process to appear and be alive
+    await waitFor(() => { const j = getJobFresh(a.handle); return j != null && j.worker_pid > 0 && isProcessAlive(j.worker_pid); });
+    const pidA = getJobFresh(a.handle)!.worker_pid;
     expect(pidA).toBeGreaterThan(0);
+    expect(isProcessAlive(pidA)).toBe(true);
+    // Verify A was NOT killed before B launched
+    expect(getJobFresh(a.handle)?.status).toBe('running');
 
-    // Stub B: complete quickly
+    // B: completes quickly — launching B must NOT kill A
     makeStub('cmd', 'echo DONE; exit 0');
-    const b = handleRun({ backend: 'cmd', prompt: 'second job', dir: REPO });
+    const specB = writeSpec('parallel-b.md', 'parallel worker B spec');
+    const b = handleRun({ backend: 'cmd', specFile: specB, dir: REPO });
     expect(b.status).toBe('running');
 
-    // A should have been killed by killLingeringJobs
-    await waitFor(() => {
-      const j = getJobFresh(a.handle);
-      return j != null && /^(done|failed|killed|timeout)/.test(j.status);
-    }, 5_000);
-    expect(getJobFresh(a.handle)?.status).toBe('killed');
+    // A must still be alive immediately after B launched — killLingeringJobs is gone
+    expect(isProcessAlive(pidA)).toBe(true);
+    expect(getJobFresh(a.handle)?.status).toBe('running');
 
-    // B should complete
+    // B completes
     await waitFor(() => {
       const j = getJobFresh(b.handle);
       return j != null && /^(done|failed|killed|timeout)/.test(j.status);
     }, 8_000);
     expect(getJobFresh(b.handle)?.status).toBe('done');
+
+    // A was never killed by B's launch — A's status never transitioned to 'killed'
+    // (it may have been stopped by stall if the test took > STALL_MS, but not killed by launch)
+    const aStatus = getJobFresh(a.handle)?.status;
+    expect(aStatus).not.toBe('killed');
+
+    // Each worker has its own worktree path
+    expect(getJob(a.handle)?.worktree_path).toBeTruthy();
+    expect(getJob(b.handle)?.worktree_path).toBeTruthy();
+    expect(getJob(a.handle)?.worktree_path).not.toBe(getJob(b.handle)?.worktree_path);
+
+    // Clean up A's process if still alive
+    if (pidA > 0) frozenPids.push(pidA);
   });
 
-  it('one-worker-per-repo: launching B kills lingering stopped A', async () => {
-    // Existing stopped job in same repo should also be killed (not just running)
-    makeStub('cmd', 'sleep 100');
-    process.env.WORKER_POLL_MS = '50';
-    process.env.WORKER_POLL_MS = '50';
-    process.env.WORKER_TIMEOUT_MS = '100'; // short timeout to get stopped quickly
-
-    const a = handleRun({ backend: 'cmd', prompt: 'first job', dir: REPO });
-    await waitFor(() => {
-      const j = getJobFresh(a.handle);
-      return j != null && j.status === 'stopped';
-    }, 5_000);
-    const stoppedPid = getJob(a.handle)!.worker_pid;
-
-    // Stub B: complete quickly - should kill the stopped A
+  it('parallel workers: two concurrent workers each get isolated worktrees on separate branches', async () => {
     makeStub('cmd', 'echo DONE; exit 0');
-    const b = handleRun({ backend: 'cmd', prompt: 'second job', dir: REPO });
-    expect(b.status).toBe('running');
+    process.env.WORKER_POLL_MS = '50';
+    process.env.WORKER_RESUME_POLL_MS = '50';
 
-    // A should have been killed
-    const aJob = getJobFresh(a.handle);
-    expect(aJob?.status).toBe('killed');
+    const specC = writeSpec('parallel-c.md', 'parallel worker C spec');
+    const specD = writeSpec('parallel-d.md', 'parallel worker D spec');
+    const c = handleRun({ backend: 'cmd', specFile: specC, dir: REPO });
+    const d = handleRun({ backend: 'cmd', specFile: specD, dir: REPO });
 
-    // B should complete
+    expect(c.status).toBe('running');
+    expect(d.status).toBe('running');
+    expect(c.handle).not.toBe(d.handle);
+
+    const jobC = getJob(c.handle)!;
+    const jobD = getJob(d.handle)!;
+
+    // Both have distinct worktree paths
+    expect(jobC.worktree_path).toBeTruthy();
+    expect(jobD.worktree_path).toBeTruthy();
+    expect(jobC.worktree_path).not.toBe(jobD.worktree_path);
+
+    // Both workers complete
     await waitFor(() => {
-      const j = getJobFresh(b.handle);
-      return j != null && j.status === 'done';
-    }, 8_000);
-    expect(getJobFresh(b.handle)?.status).toBe('done');
+      const jC = getJobFresh(c.handle);
+      const jD = getJobFresh(d.handle);
+      return jC != null && /^(done|failed|killed|timeout)/.test(jC.status)
+          && jD != null && /^(done|failed|killed|timeout)/.test(jD.status);
+    }, 12_000);
+    expect(getJobFresh(c.handle)?.status).toBe('done');
+    expect(getJobFresh(d.handle)?.status).toBe('done');
   });
 });
 
@@ -395,7 +436,8 @@ describe('handleResume — via PATH stub (dead pid / failed retry)', () => {
     const deadPid = spawnSync('true').pid!;
     updateJob(handle, { status: 'stopped', worker_pid: deadPid, stopped_at: new Date().toISOString() });
 
-    const { handle: h, status: s1 } = handleResume({ handle, prompt: 'resume dead', dir: REPO });
+    const specFile = writeSpec('resume-dead.md', 'resume dead spec');
+    const { handle: h, status: s1 } = handleResume({ handle, specFile, dir: REPO });
     expect(h).toBe(handle);
     expect(s1).toBe('running');
 
@@ -422,7 +464,8 @@ describe('handleResume — via PATH stub (dead pid / failed retry)', () => {
     const deadPid = spawnSync('true').pid!;
     updateJob(handle, { status: 'failed', worker_pid: deadPid });
 
-    const { handle: h, status: s1 } = handleResume({ handle, prompt: 'retry failed', dir: REPO });
+    const specFile = writeSpec('retry-failed.md', 'retry failed spec');
+    const { handle: h, status: s1 } = handleResume({ handle, specFile, dir: REPO });
     expect(h).toBe(handle);
     expect(s1).toBe('running');
 
@@ -459,7 +502,8 @@ describe('handleResume — via PATH stub (dead pid / failed retry)', () => {
     const deadPid = spawnSync('true').pid!;
     updateJob(handle, { status: 'timeout', worker_pid: deadPid });
 
-    const { handle: h, status: s1 } = handleResume({ handle, prompt: 'retry timeout', dir: REPO });
+    const specFile = writeSpec('retry-timeout.md', 'retry timeout spec');
+    const { handle: h, status: s1 } = handleResume({ handle, specFile, dir: REPO });
     expect(h).toBe(handle);
     expect(s1).toBe('running');
 

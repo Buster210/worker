@@ -5,7 +5,7 @@ import { tailCapped } from './logParse.ts';
 
 export type Backend = 'pool' | 'omp' | 'opencode' | 'cmd' | 'claude' | 'claude_tmux' | 'codex';
 
-export const ALL_BACKENDS: readonly Backend[] = ['omp', 'opencode', 'pool', 'cmd', 'codex', 'claude', 'claude_tmux'];
+export const ALL_BACKENDS: readonly Backend[] = ['codex', 'cmd', 'pool', 'omp', 'opencode', 'claude', 'claude_tmux'];
 
 export function computeLadder(): Backend[] {
   const validSet = new Set<string>(ALL_BACKENDS);
@@ -44,14 +44,12 @@ export function computeLadder(): Backend[] {
 
 export const LADDER: Backend[] = computeLadder();
 
-const STANDARDS = `You are a coding worker. BINDING STANDARDS: priority correctness > security > clarity > performance > brevity. Make surgical, minimal changes — touch only what the task needs, no drive-by refactors. When changing code that already works, stay behaviorally lossless. Validate inputs at trust boundaries; never put secrets in code or logs. Match the surrounding code conventions; idiomatic to the language; prefer stdlib/maintained deps over hand-rolling.`;
+const PREAMBLE = `You are a senior coding worker. Deliver mature, pragmatic, production-grade code. Work in order: (1) understand the task; touch only what it requires. (2) Take the laziest solution that works — does it need to exist (YAGNI)? → stdlib → native feature → already-installed dep → one line → minimal code; stop at the first rung that holds. No speculative abstraction, no boilerplate-for-later; deletion over addition; shortest working diff. (3) Write least-code, optimal, non-over-engineered, idiomatic code matching surrounding conventions. (4) Validate inputs at trust boundaries; never log or commit secrets; never simplify away error handling or security. (5) Test → run → verify; signal DONE only when everything is green, else FAILED:<reason>. Do NOT commit — the harness makes the atomic commit on green. Priorities: correctness > security > clarity > performance > brevity. Full standards: ~/.claude/skills/coding-standards/SKILL.md.`;
 const CONTRACT = `\nMake only the changes the task requires. Stop when done. Final reply = ONE line: "DONE" or "FAILED:<reason>". Nothing else.`;
 
 export function buildSpec(backend: Backend, userPrompt: string): string {
-  if (backend === 'claude' || backend === 'claude_tmux' || backend === 'codex') {
-    return `${userPrompt}${CONTRACT}`;
-  }
-  return `${STANDARDS}\n\n${userPrompt}${CONTRACT}`;
+  void backend;
+  return `${PREAMBLE}\n\n${userPrompt}${CONTRACT}`;
 }
 
 export function buildRunArgv(backend: Backend, spec: string, repo: string, sid: string, model?: string, extraArgs?: string[]): string[] {
@@ -69,7 +67,7 @@ export function buildRunArgv(backend: Backend, spec: string, repo: string, sid: 
     case 'codex':
       return ['codex', 'exec', '--json', '--cd', repo, '--skip-git-repo-check', '--dangerously-bypass-approvals-and-sandbox', ...(model ? ['-m', model] : []), spec];
     default:
-      throw new Error(`Unknown backend: ${backend}`);
+      throw new Error(`Unknown backend: ${backend}. Valid: ${ALL_BACKENDS.join(', ')}`);
   }
 }
 
@@ -80,7 +78,7 @@ export function buildResumeArgv(backend: Backend, spec: string, repo: string, to
     case 'omp':
       return ['omp', '-p', spec, '--session-dir', handleDir(token, repo), '--continue', '--approval-mode=yolo', '--mode=json', ...(extraArgs ?? [])];
     case 'opencode':
-      return ['opencode', 'run', spec, '-s', token, '--dir', repo, '--dangerously-skip-permissions', ...(extraArgs ?? [])];
+      return ['opencode', 'run', spec, '-s', token, '--dir', repo, '--dangerously-skip-permissions', '--format', 'json', ...(extraArgs ?? [])];
     case 'pool':
       return ['pool', 'exec', '-p', spec, '-d', repo, '--unsafe-auto-allow', '--continue', token, ...(extraArgs ?? [])];
     case 'cmd':
@@ -88,7 +86,7 @@ export function buildResumeArgv(backend: Backend, spec: string, repo: string, to
     case 'codex':
       return ['codex', 'exec', 'resume', '--last', '--json', '--skip-git-repo-check', '--dangerously-bypass-approvals-and-sandbox', ...(model ? ['-m', model] : []), spec];
     default:
-      throw new Error(`Unknown backend: ${backend}`);
+      throw new Error(`Unknown backend: ${backend}. Valid: ${ALL_BACKENDS.join(', ')}`);
   }
 }
 

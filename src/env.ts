@@ -1,4 +1,4 @@
-import { spawnSync } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
 import { statSync, writeFileSync, readFileSync, renameSync } from 'fs';
 import { workersDir } from './state.ts';
 
@@ -12,6 +12,8 @@ export function watchdogMs(): number { return envMs('WORKER_WATCHDOG_MS', 5_000)
 export function stallTimeoutMs(): number { return envMs('WORKER_STALL_MS', 60_000); }
 export function quietStallMs(): number { return envMs('WORKER_STALL_MS_QUIET', 240_000); }
 export function reapAgeMs(): number { return envMs('WORKER_REAP_MS', 900_000); }
+export function nearExpiryMs(): number { return envMs('WORKER_NEAR_EXPIRY_MS', 30_000); }
+export function graceMs(): number { return envMs('WORKER_GRACE_MS', 60_000); }
 
 const HOME = process.env.HOME ?? '';
 
@@ -40,7 +42,9 @@ export function loginEnvSig(shell: string): string {
 export function loginEnvCachePath(): string { return `${workersDir()}/.login-env.json`; }
 export function __resetLoginEnvCache(): void {
   _loginEnvCache = undefined;
+  _workerEnv = undefined;
 }
+export function __isWorkerEnvBuilt(): boolean { return _workerEnv !== undefined; }
 
 export function loginShellEnv(): Record<string, string> | null {
   if (process.env.WORKER_LOGIN_SHELL === '0') return null;
@@ -77,20 +81,65 @@ export function loginShellEnv(): Record<string, string> | null {
   }
 }
 
-const _loginEnv = loginShellEnv();
-export const workerEnv: NodeJS.ProcessEnv = {
-  ...(_loginEnv ?? {}),
-  ...process.env,
-  WORKER_RC: process.env.WORKER_RC ?? `${HOME}/.common`,
-  PATH: [
-    `${HOME}/.bun/bin`,
-    `${HOME}/.local/bin`,
-    `${HOME}/.cargo/bin`,
-    '/opt/homebrew/bin',
-    '/opt/homebrew/sbin',
-    '/usr/local/bin',
-    '/usr/bin',
-    '/bin',
-    _loginEnv?.PATH ?? process.env.PATH ?? '',
-  ].join(':'),
-};
+export async function loginShellEnvAsync(): Promise<Record<string, string> | null> {
+  if (process.env.WORKER_LOGIN_SHELL === '0') return null;
+  if (_loginEnvCache !== undefined) return _loginEnvCache;
+  const shell = process.env.SHELL ?? '/bin/zsh';
+  const sig = loginEnvSig(shell);
+  const cachePath = loginEnvCachePath();
+  try {
+    const cached = JSON.parse(readFileSync(cachePath, 'utf8')) as { shell?: string; sig?: string; env?: Record<string, string> };
+    if (cached.shell === shell && cached.sig === sig && cached.env) {
+      _loginEnvCache = cached.env;
+      return cached.env;
+    }
+  } catch {}
+  const bunPath = process.execPath;
+  const snippet = `printf '%s\\n' '${LOGIN_ENV_MARKER}'; exec "${bunPath}" -e 'process.stdout.write(JSON.stringify(process.env))'`;
+  return new Promise<Record<string, string> | null>(resolve => {
+    const chunks: Buffer[] = [];
+    let settled = false;
+    const finish = (stdout: string) => {
+      if (settled) return;
+      settled = true;
+      const parsed = parseEnvSnapshot(stdout, LOGIN_ENV_MARKER);
+      _loginEnvCache = parsed;
+      if (parsed) {
+        try {
+          const tmp = `${cachePath}.${process.pid}.tmp`;
+          writeFileSync(tmp, JSON.stringify({ shell, sig, env: parsed }));
+          renameSync(tmp, cachePath);
+        } catch {}
+      }
+      resolve(parsed);
+    };
+    const p = spawn(shell, ['-l', '-c', snippet], { stdio: ['ignore', 'pipe', 'ignore'] });
+    p.stdout?.on('data', (d: Buffer) => chunks.push(d));
+    const kill = setTimeout(() => { p.kill(); finish(''); }, 5000);
+    p.on('close', () => { clearTimeout(kill); finish(Buffer.concat(chunks).toString()); });
+    p.on('error', () => { clearTimeout(kill); _loginEnvCache = null; finish(''); });
+  });
+}
+
+let _workerEnv: NodeJS.ProcessEnv | undefined;
+export function workerEnv(): NodeJS.ProcessEnv {
+  if (_workerEnv) return _workerEnv;
+  const loginEnv = loginShellEnv();
+  _workerEnv = {
+    ...(loginEnv ?? {}),
+    ...process.env,
+    WORKER_RC: process.env.WORKER_RC ?? `${HOME}/.common`,
+    PATH: [
+      `${HOME}/.bun/bin`,
+      `${HOME}/.local/bin`,
+      `${HOME}/.cargo/bin`,
+      '/opt/homebrew/bin',
+      '/opt/homebrew/sbin',
+      '/usr/local/bin',
+      '/usr/bin',
+      '/bin',
+      loginEnv?.PATH ?? process.env.PATH ?? '',
+    ].join(':'),
+  };
+  return _workerEnv;
+}

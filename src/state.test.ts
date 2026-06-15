@@ -7,11 +7,15 @@ import { tmpdir } from 'os';
 // read/write the real ~/.claude/workers and the cache test below would delete live job dirs.
 const STATE_DIR = join(tmpdir(), `wstate-state-${process.pid}`);
 process.env.WORKER_STATE_DIR = STATE_DIR;
+const PLANS_DIR = join(tmpdir(), `wstate-plans-${process.pid}`);
+process.env.WORKER_PLANS_DIR = PLANS_DIR;
+mkdirSync(PLANS_DIR, { recursive: true });
 
-import { finalizeJob, insertJob, getJob, getJobFresh, updateJob, workersDir, handleDir, resolveHandleDir, pruneOldJobs } from './state.ts';
+import { finalizeJob, insertJob, getJob, getJobFresh, updateJob, workersDir, handleDir, resolveHandleDir, pruneOldJobs, readSpec, plansDir } from './state.ts';
 
 afterAll(() => {
   try { rmSync(STATE_DIR, { recursive: true, force: true }); } catch {}
+  try { rmSync(PLANS_DIR, { recursive: true, force: true }); } catch {}
 });
 
 describe('finalizeJob', () => {
@@ -175,5 +179,55 @@ describe('pruneOldJobs', () => {
     expect(getJob(handle)).not.toBeNull();
     // Clean up
     rmSync(handleDir(handle), { recursive: true, force: true });
+  });
+});
+
+describe('plansDir + readSpec', () => {
+  it('plansDir() returns WORKER_PLANS_DIR when set', () => {
+    expect(plansDir()).toBe(PLANS_DIR);
+  });
+
+  it('reads a valid spec file by bare filename', () => {
+    writeFileSync(join(PLANS_DIR, 'my-spec.md'), 'hello world');
+    expect(readSpec('my-spec.md')).toBe('hello world');
+  });
+
+  it('throws for a missing file with path in the error message', () => {
+    expect(() => readSpec('does-not-exist.md')).toThrow(/spec not found:/);
+    expect(() => readSpec('does-not-exist.md')).toThrow(join(PLANS_DIR, 'does-not-exist.md'));
+  });
+
+  it('rejects empty string', () => {
+    expect(() => readSpec('')).toThrow(/empty/);
+  });
+
+  it('rejects whitespace-only string', () => {
+    expect(() => readSpec('   ')).toThrow(/empty/);
+  });
+
+  it('rejects filenames with forward slash (path traversal)', () => {
+    expect(() => readSpec('a/b')).toThrow(/bare filename/);
+  });
+
+  it('rejects filenames with backslash', () => {
+    expect(() => readSpec('a\\b')).toThrow(/bare filename/);
+  });
+
+  it('rejects ".."', () => {
+    expect(() => readSpec('..')).toThrow(/path traversal/);
+  });
+
+  it('rejects "."', () => {
+    expect(() => readSpec('.')).toThrow(/path traversal/);
+  });
+
+  it('rejects filenames containing ".." segment', () => {
+    expect(() => readSpec('../escape')).toThrow();
+  });
+
+  // ".." with no path separator — must trip the traversal guard, not the slash guard.
+  it('rejects a bare filename containing ".." (no separator)', () => {
+    expect(() => readSpec('foo..bar')).toThrow(/path traversal/);
+    expect(() => readSpec('..foo')).toThrow(/path traversal/);
   });
 });

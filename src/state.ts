@@ -1,5 +1,6 @@
 import { mkdirSync, readFileSync, writeFileSync, readdirSync, appendFileSync, unlinkSync, renameSync, rmSync, existsSync } from 'fs';
-import { join } from 'path';
+import { join, basename } from 'path';
+import { removeWorktree } from './worktree.ts';
 
 const _ensuredDirs = new Set<string>();
 export function workersDir(): string {
@@ -10,6 +11,24 @@ export function workersDir(): string {
     _ensuredDirs.add(dir);
   }
   return dir;
+}
+
+export function plansDir(): string {
+  return process.env.WORKER_PLANS_DIR ?? `${process.env.HOME}/.claude/plans`;
+}
+
+export function readSpec(specFile: string): string {
+  const trimmed = specFile.trim();
+  if (trimmed.length === 0) throw new Error('specFile must not be empty');
+  if (trimmed.includes('/') || trimmed.includes('\\')) throw new Error('specFile must be a bare filename (no path separators)');
+  if (trimmed === '.' || trimmed === '..' || trimmed.includes('..')) throw new Error('specFile must not contain path traversal');
+  if (basename(trimmed) !== trimmed) throw new Error('specFile must be a bare filename');
+  const resolved = join(plansDir(), trimmed);
+  try {
+    return readFileSync(resolved, 'utf8');
+  } catch {
+    throw new Error(`spec not found: ${resolved}`);
+  }
 }
 
 const _jobs = new Map<string, Job>();
@@ -74,7 +93,9 @@ function jobJsonPath(handle: string, repo?: string): string {
 function ladderPath(sid: string)  { return join(workersDir(), 'ladder', `${sid}.jsonl`); }
 
 export function chainLockPath(sid: string) { return join(workersDir(), 'ladder', `${sid}.chain.lock`); }
-export function createChainLock(sid: string) { try { writeFileSync(chainLockPath(sid), ''); } catch {} }
+export function createChainLock(sid: string, ownerPid?: number, ownerStarted?: string) {
+  try { writeFileSync(chainLockPath(sid), ownerPid != null ? `${ownerPid}\n${ownerStarted ?? ''}` : ''); } catch {}
+}
 export function removeChainLock(sid: string) { try { unlinkSync(chainLockPath(sid)); } catch {} }
 
 export type Job = {
@@ -87,13 +108,17 @@ export type Job = {
   server_pid: number;
   server_started: string;
   server_sid: string;
+  deadline_at?: number;
+  worktree_path?: string;
+  base_sha?: string;
 };
 
 export function insertJob(j: {
   handle: string; backend: string; sid: string;
   worker_pid?: number; resume_token?: string; repo: string; model?: string;
   task?: string; log_path: string; completion_lock?: string;
-  server_pid?: number; server_started?: string; server_sid?: string;
+  server_pid?: number; server_started?: string; server_sid?: string; deadline_at?: number;
+  worktree_path?: string; base_sha?: string;
 }) {
   const job: Job = {
     handle: j.handle, backend: j.backend,
@@ -105,6 +130,9 @@ export function insertJob(j: {
     server_pid: j.server_pid ?? 0,
     server_started: j.server_started ?? '',
     server_sid: j.server_sid ?? '',
+    deadline_at: j.deadline_at,
+    worktree_path: j.worktree_path,
+    base_sha: j.base_sha,
   };
   mkdirSync(handleDir(j.handle, j.repo), { recursive: true });
   _jobs.set(job.handle, job);
@@ -191,10 +219,6 @@ export function getAllRunningJobs(): Job[] { return collectJobs(j => j.status ==
 export function getAllStoppedJobs(): Job[] { return collectJobs(j => j.status === 'stopped'); }
 export function getAllJobs(): Job[] { ensureBootstrapped(); return Array.from(_jobs.values()); }
 
-export function getRunningJobsForRepo(repo: string): Job[] {
-  return collectJobs(j => (j.status === 'running' || j.status === 'stopped') && j.repo === repo);
-}
-
 function retainMs(): number {
   const v = Number(process.env.WORKER_RETAIN_MS);
   return Number.isFinite(v) && v > 0 ? v : 604_800_000;
@@ -209,6 +233,7 @@ export function pruneOldJobs(now: number = Date.now()): number {
     if (!TERMINAL_RE.test(job.status)) continue;
     const finishedAt = Date.parse(job.finished ?? '');
     if (!Number.isFinite(finishedAt) || finishedAt > cutoff) continue;
+    if (job.worktree_path) { try { removeWorktree(job.repo, job.worktree_path); } catch {} }
     try { rmSync(handleDir(job.handle, job.repo), { recursive: true, force: true }); } catch {}
     _jobs.delete(job.handle);
     _handleDirCache.delete(job.handle);
@@ -216,6 +241,14 @@ export function pruneOldJobs(now: number = Date.now()): number {
   }
   if (pruned > 0) console.error(`worker: pruned ${pruned} terminal job(s) past retention`);
   return pruned;
+}
+
+/** Test-only: reset module-level singletons so state is hermetic across test files. */
+export function __resetStateForTest(): void {
+  _jobs.clear();
+  _jobsBootstrapped = false;
+  _handleDirCache.clear();
+  _ensuredDirs.clear();
 }
 
 export function appendLadder(sid: string, turn: number, worker: string, result: string) {

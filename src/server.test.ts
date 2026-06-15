@@ -1,11 +1,13 @@
 import { describe, it, expect, afterAll } from 'bun:test';
-import { writeFileSync, rmSync, mkdtempSync } from 'fs';
+import { writeFileSync, rmSync, mkdirSync, mkdtempSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
 // Throwaway state store, set BEFORE importing server/state (resolution is lazy).
 const STATE_DIR = join(tmpdir(), `wserver-state-${process.pid}`);
 process.env.WORKER_STATE_DIR = STATE_DIR;
+const PLANS_DIR = join(tmpdir(), `wserver-plans-${process.pid}`);
+process.env.WORKER_PLANS_DIR = PLANS_DIR;
 
 // server.ts only boots the stdio transport under `import.meta.main`, so importing it
 // here registers the tools as a side effect but does NOT connect/hang the test runner.
@@ -13,6 +15,7 @@ import { reply, handleStatus, handleKill, handleResume, handleList, handleDoctor
 import { insertJob, updateJob, finalizeJob, getJob, logPath as stateLogPath } from './state.ts';
 import { workerEnv } from './env.ts';
 
+mkdirSync(PLANS_DIR, { recursive: true });
 const REPO = '/tmp/wserver-repo';
 const handles: string[] = [];
 let seq = 0;
@@ -27,6 +30,7 @@ function seedJob(status: string, fields: Parameters<typeof updateJob>[1] = {}): 
 
 afterAll(() => {
   try { rmSync(STATE_DIR, { recursive: true, force: true }); } catch {}
+  try { rmSync(PLANS_DIR, { recursive: true, force: true }); } catch {}
 });
 
 describe('handleDoctor', () => {
@@ -88,7 +92,9 @@ describe('handleKill', () => {
 
 describe('handleResume', () => {
   it('throws when the handle is unknown', () => {
-    expect(() => handleResume({ handle: 'ghost', prompt: 'x', dir: REPO })).toThrow(/No job found/);
+    const specFile = 'ghost-spec.md';
+    writeFileSync(join(PLANS_DIR, specFile), 'ghost spec');
+    expect(() => handleResume({ handle: 'ghost', specFile, dir: REPO })).toThrow(/No job found/);
   });
 });
 
@@ -153,12 +159,12 @@ describe('handleDoctor — success path', () => {
     const stubDir = mkdtempSync(join(tmpdir(), `wserver-stub-${process.pid}-${seq++}`));
     const stubPath = join(stubDir, 'test-be');
     writeFileSync(stubPath, '#!/bin/bash\nexit 0\n', { mode: 0o755 });
-    const savedPath = workerEnv.PATH;
-    workerEnv.PATH = `${stubDir}:${savedPath}`;
+    const savedPath = workerEnv().PATH;
+    workerEnv().PATH = `${stubDir}:${savedPath}`;
     try {
       expect(handleDoctor({ backend: 'test-be' })).toBe('All workers operational.');
     } finally {
-      workerEnv.PATH = savedPath;
+      workerEnv().PATH = savedPath;
       try { rmSync(stubDir, { recursive: true, force: true }); } catch {}
     }
   });

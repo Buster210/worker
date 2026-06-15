@@ -1,7 +1,7 @@
 import { appendLadder, chainLockPath, createChainLock, removeChainLock } from './state.ts';
 import { LADDER, type Backend } from './backends.ts';
 import { type RunResult } from './runner.ts';
-import { launch, resumeLaunch } from './lifecycle.ts';
+import { launch, resumeLaunch, SERVER_STARTED } from './lifecycle.ts';
 
 type LadderResult = { handle: string; status: string } | { status: 'exhausted'; note: string };
 
@@ -16,7 +16,7 @@ export function handleLadder(args: { sid: string; prompt: string; dir: string; t
 
   if (LADDER.length === 0) return { status: 'exhausted', note: 'no workers available' };
 
-  createChainLock(sid);
+  createChainLock(sid, process.pid, SERVER_STARTED);
   const timeoutSec = args.timeout;
   const first = launch(LADDER[0], prompt, dir, { sid, timeoutMs, completionLock: chainLockPath(sid) });
   const drivers: LadderDrivers = {
@@ -46,12 +46,13 @@ export async function runLadderChain(
   appendLadder(sid, turn++, LADDER[i], result.status);
 
   for (;;) {
-    if (result.status === 'done' || result.status === 'killed') return result;
+    // timeout is terminal: deadline+grace expired with no extend → no resume, no climb.
+    if (result.status === 'done' || result.status === 'killed' || result.status === 'timeout') return result;
 
-    if (result.status === 'stopped' || result.status === 'timeout') {
+    if (result.status === 'stopped') {
       const r2 = await drivers.resumeRung(result.handle);
       appendLadder(sid, turn++, LADDER[i], r2.status);
-      if (r2.status === 'done' || r2.status === 'killed') return r2;
+      if (r2.status === 'done' || r2.status === 'killed' || r2.status === 'timeout') return r2;
       result = r2;
     }
 

@@ -62,6 +62,12 @@ export function killProcessTree(pid: number, sig: NodeJS.Signals | number = 'SIG
   for (const child of descendants) {
     try { process.kill(child, sig); } catch {}
   }
+  // One extra post-kill pass: re-enumerate descendants and re-SIGKILL any survivors
+  // (darwin reparenting — a child may have reparented to launchd between snapshot and kill).
+  // No loop, no sleep — a single extra pass is enough.
+  for (const survivor of listDescendants(pid)) {
+    try { process.kill(survivor, sig); } catch {}
+  }
 }
 
 export function killGroup(pid: number, sig: 'SIGTERM' | 'SIGKILL' | 'SIGSTOP' = 'SIGTERM') {

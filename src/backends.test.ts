@@ -6,24 +6,48 @@ import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 
 describe('buildSpec', () => {
-  it('returns prompt with CONTRACT for claude', () => {
-    const spec = buildSpec('claude', 'test prompt');
-    expect(spec).toContain('test prompt');
-    expect(spec).toContain('DONE');
-  });
-
-  it('returns prompt without STANDARDS for codex', () => {
-    const spec = buildSpec('codex', 'test prompt');
-    expect(spec).toContain('test prompt');
-    expect(spec).toContain('DONE');
-    expect(spec).not.toContain('BINDING STANDARDS');
-  });
-
-  it('returns prompt with standards and CONTRACT for non-claude', () => {
+  it('wraps prompt with PREAMBLE and CONTRACT for non-claude backend (cmd)', () => {
     const spec = buildSpec('cmd', 'test prompt');
     expect(spec).toContain('test prompt');
-    expect(spec).toContain('BINDING STANDARDS');
+    expect(spec).toContain('senior coding worker');
     expect(spec).toContain('DONE');
+    expect(spec.startsWith('You are a senior coding worker.')).toBe(true);
+    expect(spec.endsWith('Nothing else.')).toBe(true);
+  });
+
+  it('wraps prompt with PREAMBLE and CONTRACT for claude backend', () => {
+    const spec = buildSpec('claude', 'test prompt');
+    expect(spec).toContain('test prompt');
+    expect(spec).toContain('senior coding worker');
+    expect(spec).toContain('DONE');
+    expect(spec.startsWith('You are a senior coding worker.')).toBe(true);
+    expect(spec.endsWith('Nothing else.')).toBe(true);
+  });
+
+  it('wraps prompt with PREAMBLE and CONTRACT for codex backend', () => {
+    const spec = buildSpec('codex', 'test prompt');
+    expect(spec).toContain('test prompt');
+    expect(spec).toContain('senior coding worker');
+    expect(spec).toContain('DONE');
+    expect(spec.startsWith('You are a senior coding worker.')).toBe(true);
+    expect(spec.endsWith('Nothing else.')).toBe(true);
+  });
+
+  it('all backends produce identical structure (preamble + task + contract)', () => {
+    const backends: Backend[] = ['codex', 'cmd', 'pool', 'omp', 'opencode', 'claude', 'claude_tmux'];
+    const specs = backends.map(be => buildSpec(be, 'my task'));
+    // All specs are identical — backend param is unused
+    for (const spec of specs) {
+      expect(spec).toBe(specs[0]);
+    }
+  });
+
+  it('PREAMBLE step-5 tells the agent NOT to commit (harness owns the commit)', () => {
+    const spec = buildSpec('claude', 'my task');
+    expect(spec).toContain('Do NOT commit');
+    expect(spec).toContain('harness makes the atomic commit on green');
+    // The old instruction must be gone
+    expect(spec).not.toContain('make ONE atomic commit only when all green');
   });
 });
 
@@ -73,6 +97,11 @@ describe('buildRunArgv', () => {
     expect(argv).toContain('o4-mini');
     expect(argv[argv.length - 1]).toBe('spec');
   });
+
+  it('throws for unknown backend and lists valid backends', () => {
+    expect(() => buildRunArgv('bogus' as Backend, 'spec', '/repo', 'sid'))
+      .toThrow(`Unknown backend: bogus. Valid: ${ALL_BACKENDS.join(', ')}`);
+  });
 });
 
 describe('buildResumeArgv', () => {
@@ -91,7 +120,7 @@ describe('buildResumeArgv', () => {
 
   it('builds opencode resume argv with token and skips permissions like run', () => {
     const argv = buildResumeArgv('opencode', 'spec', '/repo', 'token123');
-    expect(argv).toEqual(['opencode', 'run', 'spec', '-s', 'token123', '--dir', '/repo', '--dangerously-skip-permissions']);
+    expect(argv).toEqual(['opencode', 'run', 'spec', '-s', 'token123', '--dir', '/repo', '--dangerously-skip-permissions', '--format', 'json']);
   });
 
   it('builds codex resume argv', () => {
@@ -100,6 +129,11 @@ describe('buildResumeArgv', () => {
       'codex', 'exec', 'resume', '--last', '--json', '--skip-git-repo-check',
       '--dangerously-bypass-approvals-and-sandbox', 'spec'
     ]);
+  });
+
+  it('throws for unknown backend and lists valid backends', () => {
+    expect(() => buildResumeArgv('bogus' as Backend, 'spec', '/repo', 'token'))
+      .toThrow(`Unknown backend: bogus. Valid: ${ALL_BACKENDS.join(', ')}`);
   });
 });
 
@@ -188,24 +222,24 @@ describe('computeLadder', () => {
     expect(result).toEqual([...ALL_BACKENDS]);
   });
 
-  it('reorders: ["claude","codex"] puts them first, rest appended', () => {
+  it('reorders: ["claude","codex"] puts them first, rest appended in ALL_BACKENDS order', () => {
     writeFileSync(join(tempDir, 'ladder.json'), JSON.stringify(['claude', 'codex']));
     const result = computeLadder();
-    const expected: Backend[] = ['claude', 'codex', 'omp', 'opencode', 'pool', 'cmd', 'claude_tmux'];
+    const expected: Backend[] = ['claude', 'codex', 'cmd', 'pool', 'omp', 'opencode', 'claude_tmux'];
     expect(result).toEqual(expected);
   });
 
   it('drops unknown names, keeps valid ones in file order', () => {
     writeFileSync(join(tempDir, 'ladder.json'), JSON.stringify(['bogus', 'omp']));
     const result = computeLadder();
-    const expected: Backend[] = ['omp', 'opencode', 'pool', 'cmd', 'codex', 'claude', 'claude_tmux'];
+    const expected: Backend[] = ['omp', 'codex', 'cmd', 'pool', 'opencode', 'claude', 'claude_tmux'];
     expect(result).toEqual(expected);
   });
 
   it('deduplicates: ["omp","omp"] -> single omp', () => {
     writeFileSync(join(tempDir, 'ladder.json'), JSON.stringify(['omp', 'omp']));
     const result = computeLadder();
-    const expected: Backend[] = ['omp', 'opencode', 'pool', 'cmd', 'codex', 'claude', 'claude_tmux'];
+    const expected: Backend[] = ['omp', 'codex', 'cmd', 'pool', 'opencode', 'claude', 'claude_tmux'];
     expect(result).toEqual(expected);
   });
 
@@ -227,11 +261,12 @@ describe('computeLadder', () => {
     writeFileSync(join(tempDir, 'ladder.json'), JSON.stringify(['codex', 'omp']));
     try {
       const result = computeLadder();
-      const expected: Backend[] = ['codex', 'omp', 'opencode', 'cmd', 'claude', 'claude_tmux'];
+      const expected: Backend[] = ['codex', 'omp', 'cmd', 'opencode', 'claude', 'claude_tmux'];
       expect(result).toEqual(expected);
     } finally {
       if (origSkip === undefined) delete process.env.SKIP_pool;
       else process.env.SKIP_pool = origSkip;
     }
   });
+
 });

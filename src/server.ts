@@ -5,14 +5,14 @@ import { randomUUID } from 'crypto';
 import { spawnSync } from 'child_process';
 
 import {
-  getJob, updateJob, finalizeJob, getAllJobs, pruneOldJobs,
+  getJob, updateJob, finalizeJob, getAllJobs, pruneOldJobs, readSpec,
 } from './state.ts';
 import { LADDER, ALL_BACKENDS, type Backend } from './backends.ts';
 import { backendShellArgv } from './runner.ts';
 import { workerEnv } from './env.ts';
 import { resolveStatus } from './status.ts';
 import { isProcessAlive } from './process.ts';
-import { sweepStaleJobs, reapStoppedJobs } from './maintenance.ts';
+import { sweepStaleJobs, reapStoppedJobs, sweepChainLocks } from './maintenance.ts';
 import { launch, forceKillJob, assertRepo, resumeLaunch as lifecycleResumeLaunch, shutdown } from './lifecycle.ts';
 import { handleLadder } from './chain.ts';
 
@@ -23,17 +23,19 @@ export function reply(r: unknown) {
   return { content: [{ type: 'text' as const, text }] };
 }
 
-export function handleRun(args: { backend: Backend; prompt: string; model?: string; dir: string; timeout?: number; extraArgs?: string[] }): { handle: string; status: string } {
+export function handleRun(args: { backend: Backend; specFile: string; model?: string; dir: string; timeout?: number; extraArgs?: string[] }): { handle: string; status: string } {
   assertRepo(args.dir);
+  const prompt = readSpec(args.specFile);
   const sid = randomUUID();
-  const { handle, promise } = launch(args.backend, args.prompt, args.dir,
+  const { handle, promise } = launch(args.backend, prompt, args.dir,
     { sid, model: args.model, extraArgs: args.extraArgs, timeoutMs: args.timeout ? args.timeout * 1000 : undefined });
   void promise.catch(() => {});
   return { handle, status: 'running' };
 }
 
-export function handleResume(args: { handle: string; prompt: string; dir: string; timeout?: number; extraArgs?: string[] }): { handle: string; status: string } {
-  const { handle, promise } = lifecycleResumeLaunch(args);
+export function handleResume(args: { handle: string; specFile: string; dir: string; timeout?: number; extraArgs?: string[] }): { handle: string; status: string } {
+  const prompt = readSpec(args.specFile);
+  const { handle, promise } = lifecycleResumeLaunch({ handle: args.handle, prompt, dir: args.dir, timeout: args.timeout, extraArgs: args.extraArgs });
   void promise.catch(() => {});
   return { handle, status: 'running' };
 }
@@ -59,7 +61,7 @@ export function handleKill(args: { handle: string }): string {
   }
   if (job.worker_pid) {
     try { process.kill(-job.worker_pid, 'SIGTERM'); } catch {}
-    setTimeout(() => { try { process.kill(-job.worker_pid, 'SIGKILL'); } catch {} }, 3_000);
+    setTimeout(() => { try { process.kill(-job.worker_pid, 'SIGKILL'); } catch {} }, 3_000).unref?.();
   }
   if (!isProcessAlive(job.worker_pid, job.started)) {
     const final = finalizeJob(handle, resolveStatus(job.backend, 0, job.log_path, false));
@@ -83,7 +85,7 @@ export function handleDoctor(args: { backend?: string }): string {
   const backends = args.backend ? [args.backend] : ALL_BACKENDS.filter(be => be !== 'claude_tmux');
   const down = backends.filter(be => {
     const [cmd, ...probeArgs] = backendShellArgv([be, '--version']);
-    const r = spawnSync(cmd, probeArgs, { stdio: 'ignore', env: workerEnv, timeout: 10_000 });
+    const r = spawnSync(cmd, probeArgs, { stdio: 'ignore', env: workerEnv(), timeout: 10_000 });
     return r.status !== 0 || r.error != null;
   });
   return down.length === 0 ? 'All workers operational.' : `Not operational: ${down.join(', ')}`;
@@ -98,35 +100,52 @@ export function handleList(args: { status?: string; limit?: number }): Record<st
     .map(j => ({ handle: j.handle, status: j.status, repo: j.repo, task: j.task, started: j.started }));
 }
 
+export function handleExtend(args: { handle: string; seconds: number }): { handle: string; deadline_at: number } {
+  const { handle, seconds } = args;
+  if (!Number.isInteger(seconds) || seconds < 1 || seconds > 86400) {
+    throw new Error('seconds must be an integer between 1 and 86400');
+  }
+  const job = getJob(handle);
+  if (!job) throw new Error(`No job found: ${handle}`);
+  if (job.status !== 'running') throw new Error(`Job ${handle} is not running (status: ${job.status})`);
+  const now = Date.now();
+  const newDeadline = Math.max(job.deadline_at ?? 0, now) + seconds * 1000;
+  updateJob(handle, { deadline_at: newDeadline });
+  return { handle, deadline_at: newDeadline };
+}
+
 const WORKER_INSTRUCTIONS = `# worker — delegate a coding task to a background agent
 
-Hand a coding task to a background agent that edits a repo, then check, resume, and report on it. One task = one running worker.
+Hand a coding task to a background agent that edits a repo, then check, resume, and report on it. One call = one background worker, isolated in its own git worktree.
 
 ## Rules
-- \`worker_ladder(sid, prompt, dir)\` is the DEFAULT — use it for every task. \`worker_run\` only when the user names a specific worker.
+- \`worker_ladder(sid, specFile, dir)\` is the DEFAULT — use it for every task. \`worker_run\` only when the user names a specific worker.
 - \`dir\` is REQUIRED on every call — the absolute repo path.
+- \`specFile\` is a BARE filename (no slashes); spec files live in \`~/.claude/plans/\`. The server reads the file and uses its content as the task spec.
 - \`sid\` = your session id (e.g. \$CLAUDE_CODE_SESSION_ID).
-- ONE worker per repo at a time — a new call on a busy repo replaces the one already there.
-- Read a worker's output from git: \`git -C <dir> diff\`.
+- N workers can run in PARALLEL on the same repo — each is isolated in its own git worktree on branch \`worker/<handle>\`. A new call does NOT kill an existing one.
+- On a completed (green) run the worker makes ONE atomic commit on its own \`worker/<handle>\` branch (never pushes, never merges). The authoritative result is the \`worker-report <handle>\` bundle (full diff vs the pre-work base already included). To read git directly, use \`git -C <worktree_path> show\` or \`git -C <worktree_path> diff <base_sha>\` — a plain \`git diff\` will be empty after the commit.
 
 ## Run a task
-1. Call \`worker_ladder(sid, prompt, dir)\`. It returns at once: \`{ handle, status:"running" }\`, then works in the background — it keeps trying until the task is done or no worker can do it. You don't drive it.
+1. Call \`worker_ladder(sid, specFile, dir)\`. It returns at once: \`{ handle, status:"running" }\`, then works in the background — it keeps trying until the task is done or no worker can do it. You don't drive it.
 2. Wait for completion in the BACKGROUND — run (just the handle):
        worker-report <handle>
   When the job ends it prints one bundle to stdout:
        line 1 = outcome — one of: completed · failed[:reason] · timeout · stopped · exhausted · killed
        completed / failed / timeout / exhausted → blank line, then the full \`git diff\`
        stopped / killed → just the one line
+  If the job is still running and near its deadline, you'll get a NEAR_TIMEOUT status line instead — use \`worker_extend\` to push the deadline out.
   This bundle is your completion signal AND the result — don't also run \`git diff\` / \`worker_status\`.
 3. Act on the outcome:
   - \`completed\` → review the diff against the spec.
   - \`failed\` / \`timeout\` → inspect the diff; \`worker_resume\` to retry, or report.
-  - \`stopped\` → the worker paused with its work preserved; \`worker_resume(handle, prompt, dir)\` to finish it.
+  - \`stopped\` → the worker paused with its work preserved; \`worker_resume(handle, specFile, dir)\` to finish it.
   - \`exhausted\` → no worker could do it; report and stop.
   - \`killed\` → stop.
 
 ## Other tools
-- \`worker_resume(handle, prompt, dir)\` — continue a \`stopped\` worker, or retry a \`failed\`/\`timeout\` one.
+- \`worker_extend(handle, seconds)\` — push a running worker's deadline out by \`seconds\` (1..86400). Repeatable. The deadline is soft within a grace window: ~30s before it the report emits \`NEAR_TIMEOUT\` so you can extend; if nobody extends, the worker is hard-killed (status \`timeout\`) ~60s past the deadline. Stall-freeze applies independently as a backstop.
+- \`worker_resume(handle, specFile, dir)\` — continue a \`stopped\` worker, or retry a \`failed\`/\`timeout\` one. \`specFile\` is a bare filename in \`~/.claude/plans/\`.
 - \`worker_kill(handle)\` — stop a running worker.
 - \`worker_status(handle)\` — mid-run check only; never your completion signal (use the report command above).
 - \`worker_list(status?, limit?)\` — recent jobs. Optionally filter by status.
@@ -137,26 +156,31 @@ const server = new McpServer(
   { instructions: WORKER_INSTRUCTIONS },
 );
 
+const bareFilename = (s: string) => !s.includes('/') && !s.includes('\\') && s !== '.' && s !== '..' && !s.includes('..');
+
 server.tool('worker_ladder',
-  `DEFAULT way to run a coding task: hands it to a background agent that edits the repo and runs it to completion on its own, until the task is done or no worker can do it. Returns at once { handle, status:"running" }; get the result via the report command \`bun report.ts <handle>\` (see instructions).`,
+  `DEFAULT way to run a coding task: hands it to a background agent that edits the repo and runs it to completion on its own, until the task is done or no worker can do it. Pass \`specFile\` (bare filename in ~/.claude/plans/) + \`dir\` (absolute repo path). Returns at once { handle, status:"running" }; get the result via the report command \`bun report.ts <handle>\` (see instructions).`,
   {
     sid: z.string().describe('Session ID ($CLAUDE_CODE_SESSION_ID)'),
-    prompt: z.string().describe('Task spec'),
-    dir: z.string().describe('Repo directory (absolute path, required)'),
-    timeout: z.number().optional().describe('Hard timeout seconds (default 600)'),
+    specFile: z.string().min(1).refine(bareFilename, 'bare filename only (no path separators or ..)').describe('Spec filename (bare, no slashes) from ~/.claude/plans/'),
+    dir: z.string().min(1).refine(s => s.startsWith('/'), 'absolute path required').describe('Repo directory (absolute path, required)'),
+    timeout: z.number().int().min(1).max(3600).optional().describe('Hard timeout seconds (1..3600, default 600)'),
   },
-  async (args) => reply(handleLadder(args))
+  async ({ sid, specFile, dir, timeout }) => {
+    const prompt = readSpec(specFile);
+    return reply(handleLadder({ sid, prompt, dir, timeout }));
+  }
 );
 
 server.tool('worker_run',
-  `Run a coding task on a SPECIFIC worker — only when the user explicitly names one; otherwise use worker_ladder. Returns at once { handle, status:"running" }; get the result via the report command \`bun report.ts <handle>\` (see instructions).`,
+  `Run a coding task on a SPECIFIC worker — only when the user explicitly names one; otherwise use worker_ladder. Pass \`specFile\` (bare filename in ~/.claude/plans/) + \`dir\` (absolute repo path). Returns at once { handle, status:"running" }; get the result via the report command \`bun report.ts <handle>\` (see instructions).`,
   {
     backend: z.string().describe('The specific worker to run (default to worker_ladder unless the user named one).'),
-    prompt: z.string(),
-    model: z.string().optional().describe('Model override. Ignored by workers that pin their own model.'),
-    dir: z.string().describe('Repo directory (absolute path, required)'),
-    timeout: z.number().optional().describe('Hard timeout seconds (default 600)'),
-    extraArgs: z.array(z.string()).optional().describe('Raw extra args forwarded verbatim to the worker. Omit unless you know the worker CLI.'),
+    specFile: z.string().min(1).refine(bareFilename, 'bare filename only (no path separators or ..)').describe('Spec filename (bare, no slashes) from ~/.claude/plans/'),
+    model: z.string().regex(/^[A-Za-z0-9._:-]+$/).optional().describe('Model override. Ignored by workers that pin their own model.'),
+    dir: z.string().min(1).refine(s => s.startsWith('/'), 'absolute path required').describe('Repo directory (absolute path, required)'),
+    timeout: z.number().int().min(1).max(3600).optional().describe('Hard timeout seconds (1..3600, default 600)'),
+    extraArgs: z.array(z.string().max(4096)).optional().describe('Raw extra args forwarded verbatim to the worker. Omit unless you know the worker CLI.'),
   },
   async ({ backend, ...rest }) => {
     if (!LADDER.includes(backend as Backend)) return reply(`Unknown worker: ${backend}`);
@@ -165,13 +189,13 @@ server.tool('worker_run',
 );
 
 server.tool('worker_resume',
-  'Continue a stopped worker, or retry a failed/timeout one.',
+  'Continue a stopped worker, or retry a failed/timeout one. Pass the same specFile (bare filename in ~/.claude/plans/) used when the job was started.',
   {
     handle: z.string(),
-    prompt: z.string(),
-    dir: z.string().describe('Repo directory (absolute path, required)'),
-    timeout: z.number().optional(),
-    extraArgs: z.array(z.string()).optional().describe('Raw extra args forwarded to the worker.'),
+    specFile: z.string().min(1).refine(bareFilename, 'bare filename only (no path separators or ..)').describe('Spec filename (bare, no slashes) from ~/.claude/plans/'),
+    dir: z.string().min(1).refine(s => s.startsWith('/'), 'absolute path required').describe('Repo directory (absolute path, required)'),
+    timeout: z.number().int().min(1).max(3600).optional(),
+    extraArgs: z.array(z.string().max(4096)).optional().describe('Raw extra args forwarded to the worker.'),
   },
   async (args) => reply(handleResume(args))
 );
@@ -186,6 +210,15 @@ server.tool('worker_status',
   'Check a running worker mid-task. Not a completion signal — use the report command.',
   { handle: z.string() },
   async (args) => reply(handleStatus(args))
+);
+
+server.tool('worker_extend',
+  'Push a running worker\'s deadline out by N seconds (1..86400). Repeatable. The deadline is soft within a grace window (~30s pre-deadline NEAR_TIMEOUT warning), but if nobody extends, the worker is hard-killed (status "timeout") ~60s past the deadline.',
+  {
+    handle: z.string().describe('Worker handle'),
+    seconds: z.number().describe('Seconds to extend the deadline (1..86400)'),
+  },
+  async (args) => reply(handleExtend(args))
 );
 
 server.tool('worker_doctor',
@@ -205,10 +238,12 @@ server.tool('worker_list',
 );
 
 if (import.meta.main) {
+  workerEnv();
   sweepStaleJobs();
   reapStoppedJobs();
+  sweepChainLocks();
   pruneOldJobs();
-  setInterval(() => { reapStoppedJobs(); sweepStaleJobs(); }, 60_000).unref();
+  setInterval(() => { reapStoppedJobs(); sweepStaleJobs(); sweepChainLocks(); }, 60_000).unref();
   const transport = new StdioServerTransport();
   await server.connect(transport);
   process.on('SIGTERM', shutdown);

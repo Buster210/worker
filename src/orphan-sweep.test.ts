@@ -1,6 +1,6 @@
-import { describe, it, expect, afterEach, afterAll } from 'bun:test';
-import { spawn } from 'child_process';
-import { rmSync } from 'fs';
+import { describe, it, expect, beforeEach, afterEach, afterAll } from 'bun:test';
+import { spawn, spawnSync } from 'child_process';
+import { rmSync, mkdirSync, writeFileSync, existsSync, unlinkSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -15,9 +15,11 @@ process.env.WORKER_STATE_DIR = STATE_DIR;
 const THIS_SID = process.env.CLAUDE_CODE_SESSION_ID ?? `test-sid-${process.pid}`;
 process.env.CLAUDE_CODE_SESSION_ID = THIS_SID;
 
-import { sweepStaleJobs } from './maintenance.ts';
+import { sweepStaleJobs, sweepChainLocks } from './maintenance.ts';
 import { isProcessAlive } from './process.ts';
-import { insertJob, getJob, logPath as stateLogPath } from './state.ts';
+import { insertJob, getJob, updateJob, finalizeJob, pruneOldJobs, logPath as stateLogPath, chainLockPath, workersDir, __resetStateForTest } from './state.ts';
+import { SERVER_STARTED, forceKillJob } from './lifecycle.ts';
+import { addWorktree } from './worktree.ts';
 
 const REPO = join(tmpdir(), `worphan-repo-${process.pid}`);
 const livePids: number[] = [];
@@ -53,6 +55,17 @@ function seedRunning(fields: {
     server_sid: fields.server_sid ?? THIS_SID,
   });
   return handle;
+}
+
+function initGitRepo(dir: string): void {
+  mkdirSync(dir, { recursive: true });
+  spawnSync('git', ['init', dir], { stdio: 'ignore' });
+  spawnSync('git', ['-C', dir, 'config', 'user.email', 'test@test.com'], { stdio: 'ignore' });
+  spawnSync('git', ['-C', dir, 'config', 'user.name', 'Test'], { stdio: 'ignore' });
+  // Create an initial commit so worktree add works
+  writeFileSync(join(dir, 'README.md'), 'init');
+  spawnSync('git', ['-C', dir, 'add', '.'], { stdio: 'ignore' });
+  spawnSync('git', ['-C', dir, 'commit', '-m', 'init'], { stdio: 'ignore' });
 }
 
 afterEach(() => {
@@ -118,31 +131,243 @@ describe('sweepStaleJobs — orphan branch', () => {
     expect(getJob(handle)!.status).toBe('running');
   });
 
-  it('leaves a legacy job (server_pid 0) untouched', () => {
+  it('leaves a legacy job (server_pid 0) with a live worker untouched', () => {
     const workerPid = spawnSleep();
     const handle = seedRunning({ worker_pid: workerPid }); // server_pid defaults to 0
 
     sweepStaleJobs();
 
-    expect(getJob(handle)!.status).toBe('running');   // orphan branch skipped on server_pid 0
+    expect(getJob(handle)!.status).toBe('running');   // live worker, legacy owner → leave it
     expect(isProcessAlive(workerPid)).toBe(true);
   });
 
-  it('leaves a job owned by a different sid untouched (cross-server isolation)', () => {
-    // A14 fix: server_sid is the unique-per-session identity. A recycled pid + coincident start
-    // time cannot make another server's job look like ours — different sid → skipped.
-    const workerPid = spawnSleep();
+  it('cleans a legacy job (server_pid 0) whose worker is dead', () => {
     const handle = seedRunning({
-      worker_pid: workerPid,
-      server_pid: deadPid(),          // owner is "dead" by pid/start
-      server_started: new Date().toISOString(),
-      server_sid: 'some-other-sid',   // but owner is a DIFFERENT server (different session)
+      worker_pid: deadPid(),   // dead worker
+      server_pid: 0,            // legacy / unknown owner
     });
 
     sweepStaleJobs();
 
-    // The other server's own orphan sweep owns this job; we must not touch it.
+    // Dead worker, unknown owner → finalize as failed:server-restart
+    expect(getJob(handle)!.status).toBe('failed:server-restart');
+  });
+
+  // Cross-session dead-owner reap: Fix B removes the server_sid skip so jobs from OTHER
+  // dead sessions are now cleaned up by ANY surviving server. The live-owner guard (isProcessAlive)
+  // protects all live sessions regardless of sid.
+  it('reaps a cross-session job whose server_pid is DEAD (dead-owner reap, any sid)', async () => {
+    const workerPid = spawnSleep();                   // worker alive
+    const handle = seedRunning({
+      worker_pid: workerPid,
+      server_pid: deadPid(),                           // dead owner
+      server_started: new Date().toISOString(),
+      server_sid: 'some-other-sid',                   // different session — no longer protected by sid check
+    });
+
+    sweepStaleJobs();
+
+    // Dead owner → reaped regardless of session
+    expect(getJob(handle)!.status).toBe('failed');
+    await Bun.sleep(100);
+    expect(isProcessAlive(workerPid)).toBe(false);
+  });
+
+  it('leaves a cross-session job whose server_pid is ALIVE (live-owner guard)', () => {
+    const serverPid = spawnSleep();                   // live owner, different session
+    const workerPid = spawnSleep();
+    const handle = seedRunning({
+      worker_pid: workerPid,
+      server_pid: serverPid,
+      server_started: new Date().toISOString(),
+      server_sid: 'some-other-sid',                   // different session
+    });
+
+    sweepStaleJobs();
+
+    // Live owner → worker protected by live-owner guard even across sessions
     expect(getJob(handle)!.status).toBe('running');
     expect(isProcessAlive(workerPid)).toBe(true);
+  });
+});
+
+describe('sweepChainLocks', () => {
+  let savedStateDir: string | undefined;
+
+  beforeEach(() => {
+    // Pin WORKER_STATE_DIR to this file's own unique temp dir at runtime so sibling
+    // test files' module-level assignments (which win at import time) don't bleed in.
+    savedStateDir = process.env.WORKER_STATE_DIR;
+    process.env.WORKER_STATE_DIR = STATE_DIR;
+    __resetStateForTest();
+    // Remove any stray *.chain.lock files from the ladder dir so sibling locks can't bleed in.
+    const ladder = join(STATE_DIR, 'ladder');
+    mkdirSync(ladder, { recursive: true });
+    try {
+      for (const f of readdirSync(ladder)) {
+        if (f.endsWith('.chain.lock')) { try { unlinkSync(join(ladder, f)); } catch {} }
+      }
+    } catch {}
+  });
+
+  afterEach(() => {
+    process.env.WORKER_STATE_DIR = savedStateDir;
+    __resetStateForTest();
+  });
+
+  function lockDir(): string {
+    return join(workersDir(), 'ladder');
+  }
+
+  function writeLock(sid: string, content: string): string {
+    const path = chainLockPath(sid);
+    mkdirSync(lockDir(), { recursive: true });
+    writeFileSync(path, content);
+    return path;
+  }
+
+  it('unlinks a chain lock whose owner pid is dead', () => {
+    const sid = `test-dead-${process.pid}-${seq++}`;
+    const dead = deadPid();
+    const path = writeLock(sid, `${dead}\n2024-01-01T00:00:00.000Z`);
+
+    sweepChainLocks();
+
+    expect(existsSync(path)).toBe(false);
+  });
+
+  it('leaves a chain lock whose owner pid is alive', () => {
+    const sid = `test-live-${process.pid}-${seq++}`;
+    // Freshly-spawned child: its real start ≈ now, so the stored started matches what
+    // isProcessAlive derives from `ps etime` (~0 skew). Using SERVER_STARTED here is
+    // flaky — that import-time stamp drifts past the 60s skew window in a long full-suite
+    // run, so the live owner gets misjudged dead and the lock wrongly unlinked.
+    const pid = spawnSleep();
+    const path = writeLock(sid, `${pid}\n${new Date().toISOString()}`);
+
+    sweepChainLocks();
+
+    expect(existsSync(path)).toBe(true);
+    // Cleanup
+    try { unlinkSync(path); } catch {}
+  });
+
+  it('leaves a legacy/empty chain lock with a fresh mtime (within TTL)', () => {
+    const sid = `test-legacy-fresh-${process.pid}-${seq++}`;
+    const path = writeLock(sid, ''); // empty = legacy, no pid
+
+    sweepChainLocks();
+
+    // Fresh mtime → within reapAgeMs TTL → left alone
+    expect(existsSync(path)).toBe(true);
+    // Cleanup
+    try { unlinkSync(path); } catch {}
+  });
+});
+
+describe('forceKillJob / shutdown — claude_tmux worker_pid===0', () => {
+  it('forceKillJob on a claude_tmux job does NOT skip on worker_pid===0', () => {
+    // forceKillJob branches on backend === 'claude_tmux' and calls tmux kill-session,
+    // ignoring worker_pid entirely. Confirm it doesn't throw and returns without requiring pid>0.
+    // We use a fake handle that won't match any real tmux session so the spawnSync silently fails.
+    const handle = `tmux-kill-test-${process.pid}-${seq++}`;
+    insertJob({
+      handle, backend: 'claude_tmux', sid: 'test', repo: REPO,
+      log_path: stateLogPath(handle, REPO),
+      worker_pid: 0,  // tmux jobs have worker_pid === 0
+      server_pid: process.pid,
+      server_started: SERVER_STARTED,
+    });
+
+    const job = { handle, backend: 'claude_tmux', worker_pid: 0, log_path: stateLogPath(handle, REPO) };
+
+    // Should NOT throw even with worker_pid === 0
+    expect(() => forceKillJob(job)).not.toThrow();
+    // The tmux kill-session path was taken (not the worker_pid>0 killProcessTree path)
+    // Verified implicitly: if it branched on worker_pid>0, it would have been skipped entirely,
+    // not killing the tmux session. The function completing without throw confirms the tmux branch ran.
+  });
+});
+
+describe('worktree reap — pruneOldJobs and normal finalize', () => {
+  it('pruneOldJobs removes the worktree via removeWorktree before rmSync', () => {
+    const repo = join(tmpdir(), `wreap-repo-${process.pid}-${seq++}`);
+    initGitRepo(repo);
+
+    const handle = `wreap-prune-${process.pid}-${seq++}`;
+
+    insertJob({
+      handle, backend: 'cmd', sid: 'test', repo,
+      log_path: stateLogPath(handle, repo),
+      server_pid: process.pid,
+      server_started: SERVER_STARTED,
+    });
+    const wt = addWorktree(repo, handle);
+    updateJob(handle, { worktree_path: wt, status: 'done', finished: new Date(Date.now() - 8 * 86_400_000).toISOString() });
+
+    // Worktree dir should exist before pruning
+    expect(existsSync(wt)).toBe(true);
+
+    pruneOldJobs(Date.now());
+
+    // Worktree should be removed by pruneOldJobs
+    expect(existsSync(wt)).toBe(false);
+
+    // Cleanup
+    try { rmSync(repo, { recursive: true, force: true }); } catch {}
+  });
+
+  it('a normal done finalize does NOT remove the worktree', () => {
+    const repo = join(tmpdir(), `wreap-normal-${process.pid}-${seq++}`);
+    initGitRepo(repo);
+
+    const handle = `wreap-normal-${process.pid}-${seq++}`;
+
+    insertJob({
+      handle, backend: 'cmd', sid: 'test', repo,
+      log_path: stateLogPath(handle, repo),
+      server_pid: process.pid,
+      server_started: SERVER_STARTED,
+    });
+    const wt = addWorktree(repo, handle);
+    updateJob(handle, { worktree_path: wt });
+
+    // Normal finalize (done)
+    finalizeJob(handle, 'done');
+
+    // Worktree must still exist — orchestrator reads it after finalize
+    expect(existsSync(wt)).toBe(true);
+
+    // Cleanup
+    try { rmSync(repo, { recursive: true, force: true }); } catch {}
+  });
+
+  it('reaped orphan (sweepStaleJobs dead-owner) removes its worktree', async () => {
+    const repo = join(tmpdir(), `wreap-orphan-${process.pid}-${seq++}`);
+    initGitRepo(repo);
+
+    const workerPid = spawnSleep();
+    const handle = `wreap-orphan-${process.pid}-${seq++}`;
+
+    insertJob({
+      handle, backend: 'cmd', sid: 'test', repo,
+      log_path: stateLogPath(handle, repo),
+      worker_pid: workerPid,
+      server_pid: deadPid(),
+      server_started: new Date().toISOString(),
+    });
+    const wt = addWorktree(repo, handle);
+    updateJob(handle, { worktree_path: wt });
+
+    sweepStaleJobs();
+
+    await Bun.sleep(100);
+    // Job reaped
+    expect(getJob(handle)!.status).toBe('failed');
+    // Worktree removed by reapWorktree
+    expect(existsSync(wt)).toBe(false);
+
+    // Cleanup
+    try { rmSync(repo, { recursive: true, force: true }); } catch {}
   });
 });

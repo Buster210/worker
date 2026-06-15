@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'bun:test';
-import { parseEnvSnapshot, loginShellEnv } from './env.ts';
+import { parseEnvSnapshot, loginShellEnv, graceMs, defaultTimeoutMs, workerEnv, __resetLoginEnvCache, __isWorkerEnvBuilt } from './env.ts';
 import { spawnSync } from 'child_process';
 import { writeFileSync, chmodSync, mkdirSync } from 'fs';
 import { join } from 'path';
@@ -85,6 +85,35 @@ describe('loginShellEnv opt-out', () => {
     } finally {
       if (prev === undefined) delete process.env.WORKER_LOGIN_SHELL;
       else process.env.WORKER_LOGIN_SHELL = prev;
+    }
+  });
+});
+
+describe('workerEnv laziness', () => {
+  test('env helpers do NOT build workerEnv (lazy); only an explicit workerEnv() call builds it, memoized', () => {
+    const prev = process.env.WORKER_LOGIN_SHELL;
+    process.env.WORKER_LOGIN_SHELL = '0';
+    __resetLoginEnvCache(); // freshly unbuilt state
+    try {
+      // After reset, the env object is not built.
+      expect(__isWorkerEnvBuilt()).toBe(false);
+      // Using pure env-read helpers must NOT build workerEnv / trigger a login-shell spawn.
+      graceMs();
+      defaultTimeoutMs();
+      expect(__isWorkerEnvBuilt()).toBe(false); // proves laziness — helpers didn't build it
+      // Only the explicit call builds it.
+      const env = workerEnv();
+      expect(__isWorkerEnvBuilt()).toBe(true);
+      // PATH must contain the hardcoded bin dirs regardless of login shell.
+      expect(env.PATH).toContain('/.bun/bin');
+      expect(env.PATH).toContain('/opt/homebrew/bin');
+      expect(env.PATH).toContain('/usr/local/bin');
+      // Same instance is returned on repeated calls (memoized).
+      expect(workerEnv()).toBe(env);
+    } finally {
+      if (prev === undefined) delete process.env.WORKER_LOGIN_SHELL;
+      else process.env.WORKER_LOGIN_SHELL = prev;
+      __resetLoginEnvCache(); // restore for subsequent tests
     }
   });
 });

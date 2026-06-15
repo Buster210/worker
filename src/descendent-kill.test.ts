@@ -154,7 +154,9 @@ describe('killProcessTree', () => {
 
     try {
       killProcessTree(FAKE, 'SIGKILL');
-      expect(order).toEqual(['enumerate', 'killgroup', 'killchild']);
+      // Fix E: one extra post-kill pass re-enumerates descendants and re-SIGKILLs survivors.
+      // The mock always returns CHILD as a descendant, so we get a second enumerate+killchild.
+      expect(order).toEqual(['enumerate', 'killgroup', 'killchild', 'enumerate', 'killchild']);
     } finally {
       psSpy.mockRestore();
       killSpy.mockRestore();

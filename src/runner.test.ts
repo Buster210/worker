@@ -50,7 +50,7 @@ function spawnDetached(body: string, lp: string): number {
 }
 
 afterEach(() => {
-  for (const k of ['WORKER_POLL_MS', 'WORKER_RESUME_POLL_MS', 'WORKER_STALL_MS', 'WORKER_TIMEOUT_MS', 'WORKER_REAP_MS']) {
+  for (const k of ['WORKER_POLL_MS', 'WORKER_RESUME_POLL_MS', 'WORKER_STALL_MS', 'WORKER_TIMEOUT_MS', 'WORKER_REAP_MS', 'WORKER_GRACE_MS']) {
     delete process.env[k];
   }
 });
@@ -88,37 +88,54 @@ describe('runWorker lifecycle (real subprocess)', () => {
     expect(r.status).toBe('failed:boom');
   });
 
-  it('freezes a quiet but alive worker to "stopped" when it blows the deadline (no false kill)', async () => {
-    const handle = `dl-quiet-${seq}`;
+  it('freezes a quiet idle worker to "stopped" when it stalls (no false kill)', async () => {
+    const handle = `stall-quiet-${seq}`;
     const lp = seedJob(handle);
-    process.env.WORKER_POLL_MS = '100';
-    // Silent + alive + not self-failed → frozen for recovery, not killed (the B-wide contract).
-    const r = await runWorker(fakeScript('sleep 20'), REPO, handle, 'cmd', lp, '', 800);
+    process.env.WORKER_POLL_MS = '50';
+    process.env.WORKER_STALL_MS = '200';
+    // Silent + alive + not self-failed, idle past the stall window → frozen for recovery, not killed.
+    // Deadline far off (60s) so the stall, not the deadline+grace kill, is what ends it.
+    const r = await runWorker(fakeScript('sleep 20'), REPO, handle, 'cmd', lp, '', 60_000);
     expect(r.status).toBe('stopped');
     expect(getJob(handle)?.status).toBe('stopped');
     const pid = getJob(handle)?.worker_pid;
     if (pid) frozenPids.push(pid);
   });
 
-  it('kills a self-failed worker that lingers past the deadline to "timeout"', async () => {
-    const handle = `dl-failed-${seq}`;
+  it('kills a self-failed worker that stalls to "timeout" (SIGKILL, not frozen)', async () => {
+    const handle = `stall-failed-${seq}`;
     const lp = seedJob(handle);
-    process.env.WORKER_POLL_MS = '100';
-    // Declared FAILED but still alive at the deadline → terminal SIGKILL, not a frozen corpse.
-    const r = await runWorker(fakeScript('echo; echo FAILED; sleep 20'), REPO, handle, 'cmd', lp, '', 800);
+    process.env.WORKER_POLL_MS = '50';
+    process.env.WORKER_STALL_MS = '200';
+    // Declared FAILED but still alive and idle → terminal SIGKILL, not a frozen corpse.
+    const r = await runWorker(fakeScript('echo; echo FAILED; sleep 20'), REPO, handle, 'cmd', lp, '', 60_000);
     expect(r.status).toBe('timeout');
     expect(r.exit_code).toBe(124);
   });
 
-  it('resolves "stopped" (frozen, resumable) when a productive worker blows the deadline', async () => {
-    const handle = `stopped-${seq}`;
+  it('kills a productive worker at deadline+grace when nobody extends → "timeout"', async () => {
+    const handle = `grace-${seq}`;
     const lp = seedJob(handle);
-    process.env.WORKER_POLL_MS = '100';
-    const r = await runWorker(fakeScript('while true; do echo working; sleep 0.1; done'), REPO, handle, 'cmd', lp, '', 800);
-    expect(r.status).toBe('stopped');
-    expect(getJob(handle)?.status).toBe('stopped');
-    const pid = getJob(handle)?.worker_pid;
-    if (pid) frozenPids.push(pid); // frozen by SIGSTOP — afterAll reaps it
+    process.env.WORKER_POLL_MS = '50';
+    process.env.WORKER_GRACE_MS = '150';
+    // Productive (never stalls), but the deadline passes and no worker_extend lands within the
+    // grace window → hard terminal kill, no freeze, no resume.
+    const r = await runWorker(fakeScript('while true; do echo working; sleep 0.1; done'), REPO, handle, 'cmd', lp, '', 200);
+    expect(r.status).toBe('timeout');
+    expect(r.exit_code).toBe(124);
+    expect(getJob(handle)?.status).toBe('timeout');
+  });
+
+  it('does NOT kill when the deadline is pushed out (worker_extend) before grace expires', async () => {
+    const handle = `extend-${seq}`;
+    const lp = seedJob(handle);
+    process.env.WORKER_POLL_MS = '50';
+    process.env.WORKER_GRACE_MS = '150';
+    // deadline 100 + grace 150 = kill at ~250ms, but at 120ms we bump deadline_at far out
+    // (what worker_extend does) and the watchdog reads it fresh → the worker runs to "done".
+    setTimeout(() => updateJob(handle, { deadline_at: Date.now() + 60_000 }), 120).unref?.();
+    const r = await runWorker(fakeScript('for i in 1 2 3; do echo working $i; sleep 0.1; done; echo; echo DONE'), REPO, handle, 'cmd', lp, '', 100);
+    expect(r.status).toBe('done');
   });
 
   it('resolves "killed" when kill_requested is set and the worker ends non-done (kill precedence)', async () => {
@@ -152,36 +169,36 @@ describe('watchExisting (resume watcher, real process)', () => {
     const pid = spawnDetached('echo; echo DONE', lp);
     updateJob(handle, { worker_pid: pid });
     await Bun.sleep(150); // resume attaches to an already-running process, not a just-spawned pid
-    const r = await watchExisting(handle, pid, REPO, lp, 'cmd', 10_000);
+    const r = await watchExisting(handle, pid, REPO, lp, 'cmd');
     expect(r.status).toBe('done');
     expect(getJob(handle)?.status).toBe('done');
   });
 
-  it('freezes to "stopped" when the re-armed deadline fires on a still-productive process', async () => {
-    const handle = `we-stopped-${seq}`;
+  it('kills a still-productive process at deadline+grace when nobody extends → "timeout"', async () => {
+    const handle = `we-grace-${seq}`;
     const lp = seedJob(handle);
     process.env.WORKER_RESUME_POLL_MS = '50';
+    process.env.WORKER_GRACE_MS = '150';
     const pid = spawnDetached('while true; do echo working; sleep 0.1; done', lp);
-    updateJob(handle, { worker_pid: pid });
+    // deadline_at already past+grace window: 100ms ahead, grace 150 → terminal kill ~250ms in.
+    updateJob(handle, { worker_pid: pid, deadline_at: Date.now() + 100 });
     await Bun.sleep(150); // let the process come up so the watcher attaches to a live pid (as on real resume)
-    const r = await watchExisting(handle, pid, REPO, lp, 'cmd', 400);
-    expect(r.status).toBe('stopped');
-    expect(getJob(handle)?.status).toBe('stopped');
-    frozenPids.push(pid); // SIGSTOP'd by suspendAndEval — afterAll reaps it
+    const r = await watchExisting(handle, pid, REPO, lp, 'cmd');
+    expect(r.status).toBe('timeout');
+    expect(getJob(handle)?.status).toBe('timeout');
   });
 
   it('freezes a stalled but alive worker to "stopped", regardless of log staleness', async () => {
-    // Under B-wide a stall no longer kills: the process is alive and never self-failed, so a stale
-    // log (it emitted once, then went silent past the stall window) freezes for recovery, not death.
+    // A stall no longer kills: the process is alive and never self-failed, so a stale log (it
+    // emitted once, then went silent past the stall window) freezes for recovery, not death.
     const handle = `we-stall-${seq}`;
     const lp = seedJob(handle);
     process.env.WORKER_RESUME_POLL_MS = '50';
     process.env.WORKER_STALL_MS = '200'; // stall trips after 200ms of an unchanged activity sig
     const pid = spawnDetached('echo working; sleep 100', lp); // emits once, then goes silent
-    updateJob(handle, { worker_pid: pid });
+    updateJob(handle, { worker_pid: pid }); // no deadline_at → grace-kill disabled; stall is what ends it
     await Bun.sleep(150);
-    // Deadline is far off (10s) so the stall timer, not the deadline, is what ends the watch.
-    const r = await watchExisting(handle, pid, REPO, lp, 'cmd', 10_000);
+    const r = await watchExisting(handle, pid, REPO, lp, 'cmd');
     expect(r.status).toBe('stopped');
     expect(getJob(handle)?.status).toBe('stopped');
     frozenPids.push(pid);
@@ -197,12 +214,15 @@ describe('watchExisting (resume watcher, real process)', () => {
     const lp = seedJob(handle);
     process.env.WORKER_POLL_MS = '100';
     process.env.WORKER_RESUME_POLL_MS = '50';
-    const r1 = await runWorker(fakeScript('echo working; sleep 1; echo; echo DONE'), REPO, handle, 'cmd', lp, '', 300);
+    process.env.WORKER_STALL_MS = '200'; // r1 freezes via stall (the surviving freeze path)
+    // Deadline far off (60s) so it's the stall, not the deadline+grace kill, that freezes r1.
+    const r1 = await runWorker(fakeScript('echo working; sleep 1; echo; echo DONE'), REPO, handle, 'cmd', lp, '', 60_000);
     expect(r1.status).toBe('stopped');
     const pid = getJob(handle)!.worker_pid!;
     frozenPids.push(pid); // defensive: it should exit on its own below, but reap if it flakes
+    process.env.WORKER_STALL_MS = '60000'; // raise so the post-resume silent tail doesn't re-freeze
     process.kill(-pid, 'SIGCONT'); // mirror resumeLaunch: thaw the group, then hand to the watcher
-    const r2 = await watchExisting(handle, pid, REPO, lp, 'cmd', 10_000);
+    const r2 = await watchExisting(handle, pid, REPO, lp, 'cmd');
     expect(r2.status).toBe('done');
     expect(getJob(handle)?.status).toBe('done');
     expect(readFileSync(lp, 'utf8')).toContain('DONE'); // post-resume output reached the log
@@ -216,9 +236,9 @@ describe('watchExisting (resume watcher, real process)', () => {
     process.env.WORKER_RESUME_POLL_MS = '50';
     process.env.WORKER_STALL_MS = '200';
     const pid = spawnDetached('echo; echo FAILED; sleep 100', lp);
-    updateJob(handle, { worker_pid: pid });
+    updateJob(handle, { worker_pid: pid }); // no deadline_at → stall is the terminal trigger
     await Bun.sleep(150);
-    const r = await watchExisting(handle, pid, REPO, lp, 'cmd', 10_000);
+    const r = await watchExisting(handle, pid, REPO, lp, 'cmd');
     expect(r.status).toBe('timeout');
     expect(getJob(handle)?.status).toBe('timeout');
     frozenPids.push(pid); // SIGKILLed by evalAfterStop; reap defensively

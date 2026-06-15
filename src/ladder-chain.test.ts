@@ -60,14 +60,14 @@ describe('runLadderChain (auto-climb controller)', () => {
     expect(getLadderHistory(sid).map(h => h.result)).toEqual(['failed', 'done']);
   });
 
-  it('on timeout: resumes the SAME backend once, and stops if the resume succeeds (no climb)', async () => {
+  it('on timeout: terminal — no resume, no climb (deadline+grace kill is final)', async () => {
     const sid = nextSid();
     const d = scriptedDrivers({ rungs: ['done'], resume: () => 'done' });
     const final = await runLadderChain(sid, Promise.resolve(res('timeout', 'rung0')), d);
-    expect(final.status).toBe('done');
-    expect(d.resumeCalls).toEqual(['rung0']);      // resumed the timed-out handle once
-    expect(d.runCalls).toEqual([]);                // resume succeeded → never climbed
-    expect(getLadderHistory(sid).map(h => h.result)).toEqual(['timeout', 'done']);
+    expect(final.status).toBe('timeout');
+    expect(d.resumeCalls).toEqual([]);             // timeout is a hard dead-end → never resumed
+    expect(d.runCalls).toEqual([]);                // never climbed
+    expect(getLadderHistory(sid).map(h => h.result)).toEqual(['timeout']);
   });
 
   it('on stopped: resumes once, then climbs when the resume also fails', async () => {

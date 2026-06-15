@@ -4,6 +4,7 @@ import { updateJob, finalizeJob, workersDir, logPath as workerLogPath } from './
 import { resolveStatus } from './status.ts';
 import { defaultTimeoutMs, workerEnv } from './env.ts';
 import { type RunResult } from './runner.ts';
+import { maybeVerifyAndCommit } from './commit.ts';
 
 type TrustEntry = { hasTrustDialogAccepted?: boolean; hasCompletedProjectOnboarding?: boolean; projectOnboardingSeenCount?: number; [k: string]: unknown };
 type ClaudeConfig = { projects?: Record<string, TrustEntry>; [k: string]: unknown };
@@ -81,7 +82,7 @@ export async function runClaudeTmux(
   try { execSync(`tmux kill-session -t ${sid} 2>/dev/null`, { stdio: 'ignore' }); } catch {}
 
   const tmuxSpawn = spawnSync('tmux', ['new-session', '-d', '-s', sid, '-x', '220', '-y', '50', '-c', repo, `bash "${launchScript}"`], {
-    env: workerEnv, encoding: 'utf8',
+    env: workerEnv(), encoding: 'utf8',
   });
 
   if (tmuxSpawn.status !== 0) {
@@ -105,7 +106,7 @@ export async function runClaudeTmux(
   }
 
   try {
-    const pane = execSync(`tmux capture-pane -t ${sid} -p -S -5000 2>/dev/null`, { encoding: 'utf8', env: workerEnv });
+    const pane = execSync(`tmux capture-pane -t ${sid} -p -S -5000 2>/dev/null`, { encoding: 'utf8', env: workerEnv() });
     writeFileSync(logPath, pane);
   } catch {}
 
@@ -113,7 +114,9 @@ export async function runClaudeTmux(
   for (const f of [settingsFile, specFile, launchScript, doneFile]) { try { unlinkSync(f); } catch {} }
 
   const timedOut = !stopped;
-  const status = finalizeJob(handle, resolveStatus('claude_tmux', 0, logPath, timedOut));
+  const natural = resolveStatus('claude_tmux', 0, logPath, timedOut);
+  const gated = maybeVerifyAndCommit(handle, repo, natural);
+  const status = finalizeJob(handle, gated);
 
   return { status, exit_code: timedOut ? 124 : 0, backend: 'claude_tmux', handle, resume_token: '', repo, log: logPath };
 }
