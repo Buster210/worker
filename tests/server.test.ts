@@ -11,9 +11,9 @@ process.env.WORKER_PLANS_DIR = PLANS_DIR;
 
 // server.ts only boots the stdio transport under `import.meta.main`, so importing it
 // here registers the tools as a side effect but does NOT connect/hang the test runner.
-import { reply, handleStatus, handleKill, handleResume, handleList, handleDoctor } from './server.ts';
-import { insertJob, updateJob, finalizeJob, getJob, logPath as stateLogPath } from './state.ts';
-import { workerEnv } from './env.ts';
+import { reply, handleStatus, handleKill, handleResume, handleList, handleDoctor } from '../src/server.ts';
+import { insertJob, updateJob, finalizeJob, getJob, logPath as stateLogPath } from '../src/state.ts';
+import { workerEnv } from '../src/env.ts';
 
 mkdirSync(PLANS_DIR, { recursive: true });
 const REPO = '/tmp/wserver-repo';

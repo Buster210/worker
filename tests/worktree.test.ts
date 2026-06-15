@@ -11,7 +11,7 @@ mkdirSync(STATE_DIR_RAW, { recursive: true });
 const STATE_DIR = realpathSync(STATE_DIR_RAW);
 process.env.WORKER_STATE_DIR = STATE_DIR;
 
-import { addWorktree, addWorktreeAsync, removeWorktree, listWorktrees } from './worktree.ts';
+import { addWorktree, addWorktreeAsync, removeWorktree, listWorktrees } from '../src/worktree.ts';
 
 // Set up a temp repo WITH an initial commit so HEAD exists (worktree add requires HEAD).
 // realpathSync resolves /var → /private/var on macOS so paths match git worktree list output.

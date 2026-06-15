@@ -9,9 +9,9 @@ process.env.WORKER_STATE_DIR = STATE_DIR;
 process.env.WORKER_LOGIN_SHELL = '0';
 process.env.WORKER_RC = '';
 
-import { assertRepo } from './lifecycle.ts';
-import { isProcessAlive } from './process.ts';
-import { loginShellEnv, loginEnvSig, loginEnvCachePath, __resetLoginEnvCache } from './env.ts';
+import { assertRepo } from '../src/lifecycle.ts';
+import { isProcessAlive } from '../src/process.ts';
+import { loginShellEnv, loginEnvSig, loginEnvCachePath, __resetLoginEnvCache } from '../src/env.ts';
 
 afterAll(() => {
   try { rmSync(STATE_DIR, { recursive: true, force: true }); } catch {}

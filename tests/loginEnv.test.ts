@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'bun:test';
-import { parseEnvSnapshot, loginShellEnv, graceMs, defaultTimeoutMs, workerEnv, __resetLoginEnvCache, __isWorkerEnvBuilt } from './env.ts';
+import { parseEnvSnapshot, loginShellEnv, graceMs, defaultTimeoutMs, workerEnv, __resetLoginEnvCache, __isWorkerEnvBuilt } from '../src/env.ts';
 import { spawnSync } from 'child_process';
 import { writeFileSync, chmodSync, mkdirSync } from 'fs';
 import { join } from 'path';

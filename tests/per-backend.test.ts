@@ -14,8 +14,8 @@ process.env.WORKER_STATE_DIR = STATE_DIR;
 process.env.WORKER_RC = '';
 process.env.WORKER_LOGIN_SHELL = '0';
 
-import { resolveStatus } from './status.ts';
-import { emitsJsonLog } from './backends.ts';
+import { resolveStatus } from '../src/status.ts';
+import { emitsJsonLog } from '../src/backends.ts';
 
 const REPO = mkdtempSync(join(tmpdir(), 'wperbe-repo-'));
 const tmpFiles: string[] = [];

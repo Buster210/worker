@@ -11,7 +11,7 @@ const PLANS_DIR = join(tmpdir(), `wstate-plans-${process.pid}`);
 process.env.WORKER_PLANS_DIR = PLANS_DIR;
 mkdirSync(PLANS_DIR, { recursive: true });
 
-import { finalizeJob, insertJob, getJob, getJobFresh, updateJob, workersDir, handleDir, resolveHandleDir, pruneOldJobs, readSpec, plansDir } from './state.ts';
+import { finalizeJob, insertJob, getJob, getJobFresh, updateJob, workersDir, handleDir, resolveHandleDir, pruneOldJobs, readSpec, plansDir } from '../src/state.ts';
 
 afterAll(() => {
   try { rmSync(STATE_DIR, { recursive: true, force: true }); } catch {}

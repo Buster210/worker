@@ -15,11 +15,11 @@ process.env.WORKER_STATE_DIR = STATE_DIR;
 const THIS_SID = process.env.CLAUDE_CODE_SESSION_ID ?? `test-sid-${process.pid}`;
 process.env.CLAUDE_CODE_SESSION_ID = THIS_SID;
 
-import { sweepStaleJobs, sweepChainLocks } from './maintenance.ts';
-import { isProcessAlive } from './process.ts';
-import { insertJob, getJob, updateJob, finalizeJob, pruneOldJobs, logPath as stateLogPath, chainLockPath, workersDir, __resetStateForTest } from './state.ts';
-import { SERVER_STARTED, forceKillJob } from './lifecycle.ts';
-import { addWorktree } from './worktree.ts';
+import { sweepStaleJobs, sweepChainLocks } from '../src/maintenance.ts';
+import { isProcessAlive } from '../src/process.ts';
+import { insertJob, getJob, updateJob, finalizeJob, pruneOldJobs, logPath as stateLogPath, chainLockPath, workersDir, __resetStateForTest } from '../src/state.ts';
+import { SERVER_STARTED, forceKillJob } from '../src/lifecycle.ts';
+import { addWorktree } from '../src/worktree.ts';
 
 const REPO = join(tmpdir(), `worphan-repo-${process.pid}`);
 const livePids: number[] = [];

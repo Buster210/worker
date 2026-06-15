@@ -9,8 +9,8 @@ const STATE_DIR = join(tmpdir(), `wreport-state-${process.pid}`);
 process.env.WORKER_STATE_DIR = STATE_DIR;
 process.env.WORKER_REPORT_POLL_MS = '20';
 
-import { terminalStatus, statusLine, wantsDiff, renderReport, waitForUnlock } from './report.ts';
-import { insertJob, updateJob, appendLadder, chainLockPath } from './state.ts';
+import { terminalStatus, statusLine, wantsDiff, renderReport, waitForUnlock } from '../src/report.ts';
+import { insertJob, updateJob, appendLadder, chainLockPath } from '../src/state.ts';
 
 let seq = 0;
 const uniq = (p: string) => `${p}-${process.pid}-${seq++}`;

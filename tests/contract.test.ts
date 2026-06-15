@@ -14,10 +14,10 @@ process.env.WORKER_PLANS_DIR = PLANS_DIR;
 process.env.SHELL = '/bin/bash';
 process.env.WORKER_RC = '';
 process.env.WORKER_LOGIN_SHELL = '0';
-import { insertJob, updateJob, getJob, getJobFresh, finalizeJob, logPath as stateLogPath } from './state.ts';
-import { handleKill, handleStatus, handleResume, handleRun } from './server.ts';
-import { isProcessAlive, listDescendants } from './process.ts';
-import { workerEnv } from './env.ts';
+import { insertJob, updateJob, getJob, getJobFresh, finalizeJob, logPath as stateLogPath } from '../src/state.ts';
+import { handleKill, handleStatus, handleResume, handleRun } from '../src/server.ts';
+import { isProcessAlive, listDescendants } from '../src/process.ts';
+import { workerEnv } from '../src/env.ts';
 
 // ── Shared state ──
 const REPO = mkdtempSync(join(tmpdir(), 'wcontract-repo-'));

@@ -11,11 +11,11 @@ process.env.WORKER_STATE_DIR = STATE_DIR;
 // Hermetic: empty WORKER_RC so the backend shell sources no host rc (fakeScripts need no env/keys).
 process.env.WORKER_RC = '';
 
-import { runWorker, watchExisting, type RunResult } from './runner.ts';
-import { reapStoppedJobs } from './maintenance.ts';
-import { isProcessAlive, parseEtimeSeconds } from './process.ts';
-import { activitySig } from './monitor.ts';
-import { insertJob, getJob, updateJob, logPath as stateLogPath } from './state.ts';
+import { runWorker, watchExisting, type RunResult } from '../src/runner.ts';
+import { reapStoppedJobs } from '../src/maintenance.ts';
+import { isProcessAlive, parseEtimeSeconds } from '../src/process.ts';
+import { activitySig } from '../src/monitor.ts';
+import { insertJob, getJob, updateJob, logPath as stateLogPath } from '../src/state.ts';
 
 // Real subprocess fakes: a short bash script we spawn for real, so the tests exercise
 // genuine signal/timing/process-control — not mocks. argv[0] is the command the non-interactive

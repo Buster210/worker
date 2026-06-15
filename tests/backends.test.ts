@@ -1,6 +1,6 @@
 import { describe, it, expect, test, beforeEach, afterEach } from 'bun:test';
-import { buildSpec, buildRunArgv, buildResumeArgv, getResumeToken, emitsJsonLog, computeLadder, ALL_BACKENDS, type Backend } from './backends.ts';
-import { handleDir } from './state.ts';
+import { buildSpec, buildRunArgv, buildResumeArgv, getResumeToken, emitsJsonLog, computeLadder, ALL_BACKENDS, type Backend } from '../src/backends.ts';
+import { handleDir } from '../src/state.ts';
 import { join } from 'path';
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';

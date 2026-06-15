@@ -7,10 +7,10 @@ import { tmpdir } from 'os';
 const STATE_DIR = join(tmpdir(), `wladder-state-${process.pid}`);
 process.env.WORKER_STATE_DIR = STATE_DIR;
 
-import { runLadderChain, type LadderDrivers } from './chain.ts';
-import { LADDER, type Backend } from './backends.ts';
-import { getLadderHistory } from './state.ts';
-import type { RunResult } from './runner.ts';
+import { runLadderChain, type LadderDrivers } from '../src/chain.ts';
+import { LADDER, type Backend } from '../src/backends.ts';
+import { getLadderHistory } from '../src/state.ts';
+import type { RunResult } from '../src/runner.ts';
 
 let sidSeq = 0;
 const nextSid = () => `chain-test-${process.pid}-${sidSeq++}`;

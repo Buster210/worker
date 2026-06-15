@@ -10,10 +10,10 @@ process.env.WORKER_STATE_DIR = STATE_DIR;
 process.env.WORKER_RC = '';
 process.env.WORKER_LOGIN_SHELL = '0';
 
-import { isProcessAlive, killProcessTree, listDescendants, __resetPidCache } from './process.ts';
-import { startActivityMonitor, __resetActivityMonitors } from './monitor.ts';
-import { runWorker } from './runner.ts';
-import { insertJob, logPath as stateLogPath } from './state.ts';
+import { isProcessAlive, killProcessTree, listDescendants, __resetPidCache } from '../src/process.ts';
+import { startActivityMonitor, __resetActivityMonitors } from '../src/monitor.ts';
+import { runWorker } from '../src/runner.ts';
+import { insertJob, logPath as stateLogPath } from '../src/state.ts';
 
 const REPO = mkdtempSync(join(tmpdir(), 'wsnappy-repo-'));
 const tmpFiles: string[] = [];
