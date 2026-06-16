@@ -21,6 +21,12 @@ import { insertJob, getJob, updateJob, logPath as stateLogPath } from '../src/st
 // genuine signal/timing/process-control — not mocks. argv[0] is the command the non-interactive
 // shell wrapper invokes ($0); ['bash', path] runs `bash <path>`.
 const REPO = mkdtempSync(join(tmpdir(), 'wrunner-repo-'));
+spawnSync('git', ['-C', REPO, 'init', '-q'], { encoding: 'utf8' });
+spawnSync('git', ['-C', REPO, 'config', 'user.email', 'test@test.com'], { encoding: 'utf8' });
+spawnSync('git', ['-C', REPO, 'config', 'user.name', 'Test'], { encoding: 'utf8' });
+writeFileSync(join(REPO, 'README.md'), 'init\n');
+spawnSync('git', ['-C', REPO, 'add', '.'], { encoding: 'utf8' });
+spawnSync('git', ['-C', REPO, 'commit', '-m', 'init', '--no-gpg-sign'], { encoding: 'utf8' });
 const tmpFiles: string[] = [];
 const frozenPids: number[] = [];
 const tmpDirs: string[] = [];
@@ -69,7 +75,7 @@ describe('runWorker lifecycle (real subprocess)', () => {
   it('resolves "done" when the worker prints DONE and exits 0', async () => {
     const handle = `done-${seq}`;
     const lp = seedJob(handle);
-    const r = await runWorker(fakeScript('echo; echo DONE'), REPO, handle, 'cmd', lp, '');
+    const r = await runWorker(fakeScript(`echo work > ${handle}.out; echo; echo DONE`), REPO, handle, 'cmd', lp, '');
     expect(r.status).toBe('done');
     expect(getJob(handle)?.status).toBe('done');
   });
@@ -143,7 +149,7 @@ describe('runWorker lifecycle (real subprocess)', () => {
     // deadline 100 + grace 150 = kill at ~250ms, but at 120ms we bump deadline_at far out
     // (what worker_extend does) and the watchdog reads it fresh → the worker runs to "done".
     setTimeout(() => updateJob(handle, { deadline_at: Date.now() + 60_000 }), 120).unref?.();
-    const r = await runWorker(fakeScript('for i in 1 2 3; do echo working $i; sleep 0.1; done; echo; echo DONE'), REPO, handle, 'cmd', lp, '', 100);
+    const r = await runWorker(fakeScript(`for i in 1 2 3; do echo working $i; sleep 0.1; done; echo work > ${handle}.out; echo; echo DONE`), REPO, handle, 'cmd', lp, '', 100);
     expect(r.status).toBe('done');
   });
 

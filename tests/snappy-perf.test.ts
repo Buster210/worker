@@ -16,6 +16,12 @@ import { runWorker } from '../src/runner.ts';
 import { insertJob, logPath as stateLogPath } from '../src/state.ts';
 
 const REPO = mkdtempSync(join(tmpdir(), 'wsnappy-repo-'));
+spawnSync('git', ['-C', REPO, 'init', '-q'], { encoding: 'utf8' });
+spawnSync('git', ['-C', REPO, 'config', 'user.email', 'test@test.com'], { encoding: 'utf8' });
+spawnSync('git', ['-C', REPO, 'config', 'user.name', 'Test'], { encoding: 'utf8' });
+writeFileSync(join(REPO, 'README.md'), 'init\n');
+spawnSync('git', ['-C', REPO, 'add', '.'], { encoding: 'utf8' });
+spawnSync('git', ['-C', REPO, 'commit', '-m', 'init', '--no-gpg-sign'], { encoding: 'utf8' });
 const tmpFiles: string[] = [];
 const frozenPids: number[] = [];
 let seq = 0;
@@ -157,15 +163,17 @@ describe('runWorker — no ps on the watchdog hot path', () => {
     process.env.WORKER_POLL_MS = '50';
 
     const psCalls: string[] = [];
-    const spy = spyOn(childProcess, 'spawnSync').mockImplementation(((cmd: string, args: string[]) => {
+    const realSpawnSync = spawnSync;
+    const spy = spyOn(childProcess, 'spawnSync').mockImplementation(((...callArgs: Parameters<typeof spawnSync>) => {
+      const [cmd, args] = callArgs;
       if (cmd === 'ps' || cmd === 'pgrep') psCalls.push([cmd, ...(args ?? [])].join(' '));
       if (cmd === 'ps') return { status: 0, stdout: '00:01', stderr: '' } as ReturnType<typeof spawnSync>;
       if (cmd === 'pgrep') return { status: 0, stdout: '', stderr: '' } as ReturnType<typeof spawnSync>;
-      return { status: 0, stdout: '', stderr: '' } as ReturnType<typeof spawnSync>;
+      return realSpawnSync(...callArgs);
     }) as typeof spawnSync);
 
     try {
-      const r = await runWorker(fakeScript('echo; echo DONE'), REPO, handle, 'cmd', lp, '');
+      const r = await runWorker(fakeScript('echo hi > snappy-output.txt; echo DONE'), REPO, handle, 'cmd', lp, '');
       expect(r.status).toBe('done');
       expect(psCalls).toHaveLength(0);
     } finally {

@@ -88,11 +88,15 @@ describe('wantsDiff', () => {
 describe('renderReport (diff injected — no real git)', () => {
   it('done → "completed" + blank line + full diff', () => {
     const { handle, lockPath } = seedRun('done');
-    expect(renderReport(handle, lockPath, () => 'DIFFBODY')).toBe('completed\n\nDIFFBODY');
+    expect(renderReport(handle, lockPath, () => 'DIFFBODY')).toBe(`completed\nworktree: /repo/x\nbranch: worker/${handle}\n\nDIFFBODY`);
   });
   it('exhausted ladder → "exhausted" + diff', () => {
     const { handle, lockPath } = seedLadder('failed');
-    expect(renderReport(handle, lockPath, () => 'DIFFBODY')).toBe('exhausted\n\nDIFFBODY');
+    expect(renderReport(handle, lockPath, () => 'DIFFBODY')).toBe(`exhausted\nworktree: /repo/y\nbranch: worker/${handle}\n\nDIFFBODY`);
+  });
+  it('done with empty diff emits a warning', () => {
+    const { handle, lockPath } = seedRun('done');
+    expect(renderReport(handle, lockPath, () => '(no tracked changes)')).toBe(`completed\nworktree: /repo/x\nbranch: worker/${handle}\n\n(no tracked changes)\n\nWARNING: completed but worktree has no changes vs base — work may be missing.`);
   });
   it('stopped → single line, diff fn never invoked', () => {
     const { handle, lockPath } = seedRun('stopped');

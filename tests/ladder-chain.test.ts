@@ -1,19 +1,42 @@
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect, afterAll } from 'bun:test';
+import { spawnSync } from 'child_process';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'fs';
 
 // Throwaway state store, set BEFORE importing server/state (resolution is lazy). The chain writes
 // its ladder audit trail under <STATE_DIR>/ladder; we read it back to assert turn-by-turn behavior.
 const STATE_DIR = join(tmpdir(), `wladder-state-${process.pid}`);
 process.env.WORKER_STATE_DIR = STATE_DIR;
 
-import { runLadderChain, type LadderDrivers } from '../src/chain.ts';
+import { runLadderChain, reparentWinningCommit, type LadderDrivers } from '../src/chain.ts';
 import { LADDER, type Backend } from '../src/backends.ts';
-import { getLadderHistory } from '../src/state.ts';
+import { getLadderHistory, insertJob } from '../src/state.ts';
 import type { RunResult } from '../src/runner.ts';
 
 let sidSeq = 0;
 const nextSid = () => `chain-test-${process.pid}-${sidSeq++}`;
+const tmpDirs: string[] = [];
+
+function makeRepo(prefix: string): string {
+  const raw = mkdtempSync(join(tmpdir(), prefix));
+  const dir = realpathSync(raw);
+  tmpDirs.push(dir);
+  const git = (...args: string[]) => spawnSync('git', ['-C', dir, ...args], { encoding: 'utf8' });
+  git('init', '-q');
+  git('config', 'user.email', 'test@test.com');
+  git('config', 'user.name', 'Test');
+  writeFileSync(join(dir, 'README.md'), 'init\n');
+  git('add', '.');
+  git('commit', '-m', 'init', '--no-gpg-sign');
+  return dir;
+}
+
+afterAll(() => {
+  for (const dir of tmpDirs) {
+    try { rmSync(dir, { recursive: true, force: true }); } catch {}
+  }
+});
 
 function res(status: string, handle = 'h'): RunResult {
   return { status, exit_code: 0, backend: 'cmd' as Backend, handle, resume_token: handle, repo: '/x', log: '' };
@@ -111,6 +134,29 @@ describe('runLadderChain (auto-climb controller)', () => {
     const final = await runLadderChain(sid, Promise.resolve(res('killed', 'rung0')), d);
     expect(final.status).toBe('killed');
     expect(d.runCalls).toEqual([]);                // killed → chain stops, no climb
+  });
+
+  it('reparents the first worktree to the winning commit when the winner handle differs', () => {
+    const repo = makeRepo('wladder-reparent-');
+    const firstHandle = `first-${process.pid}-${sidSeq++}`;
+    const winnerHandle = `winner-${process.pid}-${sidSeq++}`;
+    const firstWt = join(repo, 'first-tree');
+    const winnerWt = join(repo, 'winner-tree');
+    spawnSync('git', ['-C', repo, 'worktree', 'add', '-b', `worker/${firstHandle}`, firstWt, 'HEAD'], { encoding: 'utf8' });
+    spawnSync('git', ['-C', repo, 'worktree', 'add', '-b', `worker/${winnerHandle}`, winnerWt, 'HEAD'], { encoding: 'utf8' });
+
+    insertJob({ handle: firstHandle, backend: 'cmd', sid: 'sid-a', repo, log_path: '/tmp/first.log', worktree_path: firstWt });
+    insertJob({ handle: winnerHandle, backend: 'cmd', sid: 'sid-b', repo, log_path: '/tmp/winner.log', worktree_path: winnerWt });
+
+    writeFileSync(join(winnerWt, 'feature.txt'), 'winner work\n');
+    spawnSync('git', ['-C', winnerWt, 'add', '.'], { encoding: 'utf8' });
+    spawnSync('git', ['-C', winnerWt, 'commit', '-m', 'winner'], { encoding: 'utf8' });
+
+    const winnerSha = spawnSync('git', ['-C', winnerWt, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+    reparentWinningCommit(repo, firstHandle, { ...res('done', winnerHandle), handle: winnerHandle });
+
+    expect(spawnSync('git', ['-C', firstWt, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim()).toBe(winnerSha);
+    expect(spawnSync('git', ['-C', repo, 'rev-parse', `worker/${firstHandle}`], { encoding: 'utf8' }).stdout.trim()).toBe(winnerSha);
   });
 
   it('KNOWN GAP: no total wall-clock cap — retries + climbs every rung, each with the FULL per-rung timeout', async () => {

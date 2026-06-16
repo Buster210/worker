@@ -1,6 +1,6 @@
 import { describe, it, expect, afterAll, beforeEach, afterEach } from 'bun:test';
 import { spawnSync } from 'child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync, realpathSync } from 'fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, realpathSync, symlinkSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -108,15 +108,11 @@ describe('maybeVerifyAndCommit — commits on done', () => {
     expect(isClean()).toBe(true);
   });
 
-  it('with nothing to commit (already clean): returns "done" and swallows the no-op', () => {
-    // Ensure the tree is clean first
+  it('with nothing to commit (already clean): returns "failed:no-changes" and makes no commit', () => {
     const before = commitCount();
-    // Confirm clean
-    git('add', '-A');
     const handle = seedJob();
     const result = maybeVerifyAndCommit(handle, REPO, 'done');
-    expect(result).toBe('done');
-    // commit count must NOT go up (nothing to commit)
+    expect(result).toBe('failed:no-changes');
     expect(commitCount()).toBe(before);
   });
 });
@@ -158,6 +154,26 @@ describe('maybeVerifyAndCommit — WORKER_VERIFY_CMD gate', () => {
     const result = maybeVerifyAndCommit(handle, REPO, 'done');
     expect(result).toBe('done');
     expect(commitCount()).toBe(before + 1);
+  });
+});
+
+describe('maybeVerifyAndCommit — excludes .codegraph', () => {
+  it('does not commit the .codegraph symlink when real changes exist', () => {
+    const handle = seedJob('codegraph exclusion test');
+    const before = commitCount();
+    const fileName = `codegraph-${seq}.txt`;
+    writeFileSync(join(REPO, fileName), 'real change\n');
+    symlinkSync(REPO, join(REPO, '.codegraph'));
+
+    const result = maybeVerifyAndCommit(handle, REPO, 'done');
+    expect(result).toBe('done');
+    expect(commitCount()).toBe(before + 1);
+
+    const show = spawnSync('git', ['-C', REPO, 'show', '--pretty=format:', '--name-only', 'HEAD'], { encoding: 'utf8' });
+    expect(show.stdout).toContain(fileName);
+    expect(show.stdout).not.toContain('.codegraph');
+
+    unlinkSync(join(REPO, '.codegraph'));
   });
 });
 

@@ -48,7 +48,11 @@ export function renderReport(handle: string, lockPath: string, diff: (repo: stri
   const job = getJobFresh(handle);
   if (!job?.repo) return `${line}\n\n(diff unavailable: unknown handle ${handle})`;
   const diffDir = job.worktree_path ?? job.repo;
-  return `${line}\n\n${diff(diffDir, job.base_sha)}`;
+  const body = diff(diffDir, job.base_sha);
+  const warn = status === 'done' && body === '(no tracked changes)'
+    ? '\n\nWARNING: completed but worktree has no changes vs base — work may be missing.'
+    : '';
+  return `${line}\nworktree: ${diffDir}\nbranch: worker/${handle}\n\n${body}${warn}`;
 }
 
 function ownerDead(serverPid: number): boolean {
