@@ -4,10 +4,12 @@ import { basename } from 'path';
 import { spawnSync } from 'child_process';
 import { getJobFresh, getLadderHistory, lockPath } from './state.ts';
 import { nearExpiryMs, graceMs } from './env.ts';
+import { FILE_CONFIG } from './config.ts';
 
 function reportPollMs(): number {
   const v = Number(process.env.WORKER_REPORT_POLL_MS);
-  return Number.isFinite(v) && v > 0 ? v : 150;
+  if (Number.isFinite(v) && v > 0) return v;
+  return FILE_CONFIG.reportPollMs ?? 150;
 }
 
 export function terminalStatus(handle: string, lockPath: string): string {

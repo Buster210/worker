@@ -1,10 +1,11 @@
 import { mkdirSync, readFileSync, writeFileSync, readdirSync, appendFileSync, unlinkSync, renameSync, rmSync, existsSync } from 'fs';
 import { join, basename } from 'path';
 import { removeWorktree } from './worktree.ts';
+import { FILE_CONFIG } from './config.ts';
 
 const _ensuredDirs = new Set<string>();
 export function workersDir(): string {
-  const dir = process.env.WORKER_STATE_DIR ?? `${process.env.HOME}/.claude/workers`;
+  const dir = process.env.WORKER_STATE_DIR ?? FILE_CONFIG.stateDir ?? `${process.env.HOME}/.claude/workers`;
   if (!_ensuredDirs.has(dir)) {
     mkdirSync(dir, { recursive: true });
     mkdirSync(join(dir, 'ladder'), { recursive: true });
@@ -14,7 +15,7 @@ export function workersDir(): string {
 }
 
 export function plansDir(): string {
-  return process.env.WORKER_PLANS_DIR ?? `${process.env.HOME}/.claude/plans`;
+  return process.env.WORKER_PLANS_DIR ?? FILE_CONFIG.plansDir ?? `${process.env.HOME}/.claude/plans`;
 }
 
 export function reaperPidPath(): string {
@@ -226,7 +227,8 @@ export function getAllJobs(): Job[] { ensureBootstrapped(); return Array.from(_j
 
 function retainMs(): number {
   const v = Number(process.env.WORKER_RETAIN_MS);
-  return Number.isFinite(v) && v > 0 ? v : 604_800_000;
+  if (Number.isFinite(v) && v > 0) return v;
+  return FILE_CONFIG.retainMs ?? 604_800_000;
 }
 const TERMINAL_RE = /^(done|failed|timeout|killed|stalled)/;
 

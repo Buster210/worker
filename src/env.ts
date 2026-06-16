@@ -1,6 +1,7 @@
 import { spawn, spawnSync } from 'child_process';
 import { statSync, writeFileSync, readFileSync, renameSync } from 'fs';
 import { workersDir } from './state.ts';
+import { FILE_CONFIG } from './config.ts';
 
 export function envMs(key: string, def: number): number {
   const v = Number(process.env[key]);
@@ -47,7 +48,9 @@ export function __resetLoginEnvCache(): void {
 export function __isWorkerEnvBuilt(): boolean { return _workerEnv !== undefined; }
 
 export function loginShellEnv(): Record<string, string> | null {
-  if (process.env.WORKER_LOGIN_SHELL === '0') return null;
+  // Disabled when WORKER_LOGIN_SHELL='0' OR (WORKER_LOGIN_SHELL unset AND FILE_CONFIG.loginShell === false)
+  const loginShellEnvRaw = process.env.WORKER_LOGIN_SHELL;
+  if (loginShellEnvRaw === '0' || (loginShellEnvRaw === undefined && FILE_CONFIG.loginShell === false)) return null;
   if (_loginEnvCache !== undefined) return _loginEnvCache;
   const shell = process.env.SHELL ?? '/bin/zsh';
   const sig = loginEnvSig(shell);
@@ -82,7 +85,9 @@ export function loginShellEnv(): Record<string, string> | null {
 }
 
 export async function loginShellEnvAsync(): Promise<Record<string, string> | null> {
-  if (process.env.WORKER_LOGIN_SHELL === '0') return null;
+  // Disabled when WORKER_LOGIN_SHELL='0' OR (WORKER_LOGIN_SHELL unset AND FILE_CONFIG.loginShell === false)
+  const loginShellEnvRaw = process.env.WORKER_LOGIN_SHELL;
+  if (loginShellEnvRaw === '0' || (loginShellEnvRaw === undefined && FILE_CONFIG.loginShell === false)) return null;
   if (_loginEnvCache !== undefined) return _loginEnvCache;
   const shell = process.env.SHELL ?? '/bin/zsh';
   const sig = loginEnvSig(shell);
@@ -128,7 +133,7 @@ export function workerEnv(): NodeJS.ProcessEnv {
   _workerEnv = {
     ...(loginEnv ?? {}),
     ...process.env,
-    WORKER_RC: process.env.WORKER_RC ?? `${HOME}/.common`,
+    WORKER_RC: process.env.WORKER_RC ?? FILE_CONFIG.rc ?? `${HOME}/.common`,
     PATH: [
       `${HOME}/.bun/bin`,
       `${HOME}/.local/bin`,

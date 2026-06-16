@@ -1,27 +1,40 @@
 import { handleDir, workersDir } from './state.ts';
 import { join } from 'path';
-import { readFileSync } from 'fs';
+import { existsSync } from 'fs';
 import { tailCapped } from './logParse.ts';
+import { FILE_CONFIG, type FileConfig } from './config.ts';
 
 export type Backend = 'pool' | 'omp' | 'opencode' | 'cmd' | 'claude' | 'claude_tmux' | 'codex';
 
 export const ALL_BACKENDS: readonly Backend[] = ['codex', 'cmd', 'pool', 'omp', 'opencode', 'claude', 'claude_tmux'];
 
-export function computeLadder(): Backend[] {
-  const validSet = new Set<string>(ALL_BACKENDS);
-  const defaultOrder: Backend[] = ALL_BACKENDS.filter(be => process.env[`SKIP_${be}`] !== '1');
+// Check for legacy ladder.json and warn once
+let _ladderJsonWarned = false;
+function checkLegacyLadder(): void {
+  if (_ladderJsonWarned) return;
+  if (existsSync(join(workersDir(), 'ladder.json'))) {
+    console.error('[config] Legacy ladder.json found. Move its contents to config.json ladder/skip keys.');
+    _ladderJsonWarned = true;
+  }
+}
 
-  let raw: unknown;
-  try {
-    raw = JSON.parse(readFileSync(join(workersDir(), 'ladder.json'), 'utf-8'));
-  } catch (e: any) {
-    if (e?.code === 'ENOENT') return defaultOrder;
-    console.error(`[ladder] failed to read ladder.json: ${e?.message ?? e}`);
-    return defaultOrder;
+export function computeLadder(cfg: FileConfig = FILE_CONFIG): Backend[] {
+  checkLegacyLadder();
+  const validSet = new Set<string>(ALL_BACKENDS);
+  // Build skip set: union of env SKIP_<be>='1' and cfg.skip
+  const skipSet = new Set<string>();
+  for (const be of ALL_BACKENDS) {
+    if (process.env[`SKIP_${be}`] === '1') skipSet.add(be);
+  }
+  for (const be of cfg.skip ?? []) {
+    if (typeof be === 'string' && validSet.has(be)) skipSet.add(be);
   }
 
+  const defaultOrder: Backend[] = ALL_BACKENDS.filter(be => !skipSet.has(be));
+
+  const raw = cfg.ladder;
+
   if (!Array.isArray(raw)) {
-    console.error('[ladder] ladder.json is not an array, falling back to default');
     return defaultOrder;
   }
 
@@ -39,7 +52,7 @@ export function computeLadder(): Backend[] {
     if (!seen.has(be)) ordered.push(be);
   }
 
-  return ordered.filter(be => process.env[`SKIP_${be}`] !== '1');
+  return ordered.filter(be => !skipSet.has(be));
 }
 
 export const LADDER: Backend[] = computeLadder();

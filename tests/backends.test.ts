@@ -217,50 +217,39 @@ describe('computeLadder', () => {
   beforeEach(setup);
   afterEach(teardown);
 
-  it('returns default ALL_BACKENDS when no ladder.json exists', () => {
-    const result = computeLadder();
+  it('returns default ALL_BACKENDS when config has no ladder', () => {
+    const result = computeLadder({});
     expect(result).toEqual([...ALL_BACKENDS]);
   });
 
   it('reorders: ["claude","codex"] puts them first, rest appended in ALL_BACKENDS order', () => {
-    writeFileSync(join(tempDir, 'ladder.json'), JSON.stringify(['claude', 'codex']));
-    const result = computeLadder();
+    const result = computeLadder({ ladder: ['claude', 'codex'] });
     const expected: Backend[] = ['claude', 'codex', 'cmd', 'pool', 'omp', 'opencode', 'claude_tmux'];
     expect(result).toEqual(expected);
   });
 
   it('drops unknown names, keeps valid ones in file order', () => {
-    writeFileSync(join(tempDir, 'ladder.json'), JSON.stringify(['bogus', 'omp']));
-    const result = computeLadder();
+    const result = computeLadder({ ladder: ['bogus', 'omp'] });
     const expected: Backend[] = ['omp', 'codex', 'cmd', 'pool', 'opencode', 'claude', 'claude_tmux'];
     expect(result).toEqual(expected);
   });
 
   it('deduplicates: ["omp","omp"] -> single omp', () => {
-    writeFileSync(join(tempDir, 'ladder.json'), JSON.stringify(['omp', 'omp']));
-    const result = computeLadder();
+    const result = computeLadder({ ladder: ['omp', 'omp'] });
     const expected: Backend[] = ['omp', 'codex', 'cmd', 'pool', 'opencode', 'claude', 'claude_tmux'];
     expect(result).toEqual(expected);
   });
 
-  it('falls back to default on malformed JSON', () => {
-    writeFileSync(join(tempDir, 'ladder.json'), '{bad json');
-    const result = computeLadder();
+  it('falls back to default when ladder is absent', () => {
+    const result = computeLadder({ ladder: undefined });
     expect(result).toEqual([...ALL_BACKENDS]);
   });
 
-  it('falls back to default on non-array JSON value', () => {
-    writeFileSync(join(tempDir, 'ladder.json'), '{}');
-    const result = computeLadder();
-    expect(result).toEqual([...ALL_BACKENDS]);
-  });
-
-  it('SKIP_pool=1 with reorder file removes pool, keeps order', () => {
+  it('SKIP_pool=1 with reorder config removes pool, keeps order', () => {
     const origSkip = process.env.SKIP_pool;
     process.env.SKIP_pool = '1';
-    writeFileSync(join(tempDir, 'ladder.json'), JSON.stringify(['codex', 'omp']));
     try {
-      const result = computeLadder();
+      const result = computeLadder({ ladder: ['codex', 'omp'] });
       const expected: Backend[] = ['codex', 'omp', 'cmd', 'opencode', 'claude', 'claude_tmux'];
       expect(result).toEqual(expected);
     } finally {

@@ -1,5 +1,6 @@
 import { spawnSync } from 'child_process';
 import { getJob } from './state.ts';
+import { FILE_CONFIG } from './config.ts';
 
 function commitMessage(handle: string): string {
   const task = getJob(handle)?.task ?? '';
@@ -51,7 +52,7 @@ function commitWork(worktree: string, handle: string): 'done' | 'failed:commit' 
 export function maybeVerifyAndCommit(handle: string, worktree: string, natural: string): string {
   if (natural !== 'done') return natural;
 
-  const cmd = process.env.WORKER_VERIFY_CMD;
+  const cmd = process.env.WORKER_VERIFY_CMD ?? FILE_CONFIG.verifyCmd;
   if (cmd && cmd.length > 0) {
     const shell = process.env.SHELL ?? '/bin/zsh';
     const result = spawnSync(shell, ['-c', cmd], { cwd: worktree, timeout: 120_000, stdio: 'ignore' });
