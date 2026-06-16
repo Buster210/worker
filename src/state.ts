@@ -17,6 +17,10 @@ export function plansDir(): string {
   return process.env.WORKER_PLANS_DIR ?? `${process.env.HOME}/.claude/plans`;
 }
 
+export function reaperPidPath(): string {
+  return join(workersDir(), '.reaper.pid');
+}
+
 export function readSpec(specFile: string): string {
   const trimmed = specFile.trim();
   if (trimmed.length === 0) throw new Error('specFile must not be empty');
@@ -216,6 +220,7 @@ function collectJobs(predicate: (j: Job) => boolean): Job[] {
 }
 
 export function getAllRunningJobs(): Job[] { return collectJobs(j => j.status === 'running'); }
+export function getAllRunningJobsFresh(): Job[] { return scanAllJobs().filter(j => j.status === 'running'); }
 export function getAllStoppedJobs(): Job[] { return collectJobs(j => j.status === 'stopped'); }
 export function getAllJobs(): Job[] { ensureBootstrapped(); return Array.from(_jobs.values()); }
 
@@ -223,7 +228,7 @@ function retainMs(): number {
   const v = Number(process.env.WORKER_RETAIN_MS);
   return Number.isFinite(v) && v > 0 ? v : 604_800_000;
 }
-const TERMINAL_RE = /^(done|failed|timeout|killed)/;
+const TERMINAL_RE = /^(done|failed|timeout|killed|stalled)/;
 
 export function pruneOldJobs(now: number = Date.now()): number {
   ensureBootstrapped();

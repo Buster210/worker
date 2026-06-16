@@ -1,14 +1,14 @@
 import { spawn } from 'child_process';
 import { openSync, closeSync, writeSync } from 'fs';
-import { updateJob, getJob, removeLock, finalizeJob } from './state.ts';
+import { updateJob, getJob, finalizeJob } from './state.ts';
 import { emitsJsonLog, type Backend } from './backends.ts';
 import { readSentinel } from './logParse.ts';
 import { resolveStatus } from './status.ts';
-import { killProcessTree, killGroup, isProcessAlive } from './process.ts';
+import { killProcessTree } from './process.ts';
 import { startActivityMonitor } from './monitor.ts';
 import { maybeVerifyAndCommit } from './commit.ts';
 
-import { defaultTimeoutMs, workerEnv, pollIntervalMs, resumePollIntervalMs, stallTimeoutMs, graceMs } from './env.ts';
+import { defaultTimeoutMs, workerEnv, watchdogMs, stallTimeoutMs, graceMs } from './env.ts';
 
 export type RunResult = {
   status: string;
@@ -19,25 +19,14 @@ export type RunResult = {
   repo: string;
   log: string;
 };
-
-
-function decideFateAfterFreeze(handle: string, pid: number, logPath: string, backend: string): boolean {
-  const { status } = readSentinel(logPath, emitsJsonLog(backend));
-  const isFailed = status !== null && status.startsWith('failed');
-
-  if (!isFailed) {
-    updateJob(handle, { status: 'stopped', stopped_at: new Date().toISOString() });
-    removeLock(handle);
-    return true;
-  }
+function markStallOutcome(handle: string, pid: number, logPath: string, backend: string): boolean {
   killProcessTree(pid, 'SIGKILL');
-  setTimeout(() => killProcessTree(pid, 'SIGKILL'), 5_000).unref?.();
-  return false;
-}
-
-function freezeThenDecide(handle: string, pid: number, logPath: string, backend: string): boolean {
-  killGroup(pid, 'SIGSTOP');
-  return decideFateAfterFreeze(handle, pid, logPath, backend);
+  const { status } = readSentinel(logPath, emitsJsonLog(backend));
+  if (status !== null && status.startsWith('failed')) {
+    return false;
+  }
+  finalizeJob(handle, 'stalled');
+  return true;
 }
 
 export function backendShellArgv(argv: string[]): string[] {
@@ -52,7 +41,7 @@ function launchAndWait(
   backend: Backend,
   logPath: string,
   timeoutMs: number = defaultTimeoutMs(),
-): Promise<{ rc: number; timedOut: boolean; stopped: boolean }> {
+): Promise<{ rc: number; timedOut: boolean; stalled: boolean }> {
   return new Promise((resolve) => {
     const logFd = openSync(logPath, 'a');
     const [cmd, ...args] = backendShellArgv(argv);
@@ -69,31 +58,27 @@ function launchAndWait(
     }
 
     let rc = 0;
-    let stopped = false;
+    let stalled = false;
     let settled = false;
     let exiting = false;
     const mon = startActivityMonitor(repo, logPath);
     let lastSig = mon.sig;
     let lastActivityAt = mon.at;
 
-    const finish = (code: number, timed: boolean, stoppedJob: boolean) => {
+    const finish = (code: number, timed: boolean, stalledJob: boolean) => {
       if (settled) return;
       settled = true;
       clearInterval(watchdog);
       try { mon.dispose(); } catch {}
       try { closeSync(logFd); } catch {}
-      resolve({ rc: code, timedOut: timed, stopped: stoppedJob });
+      resolve({ rc: code, timedOut: timed, stalled: stalledJob });
     };
 
-    const freezeAndFinish = () => {
+    const killOnStallAndFinish = () => {
       if (settled || exiting) return;
-      killGroup(proc.pid!, 'SIGSTOP');
-      setTimeout(() => {
-        if (settled || exiting) return;
-        if (!isProcessAlive(proc.pid!)) { exiting = true; finish(124, true, false); return; }
-        stopped = decideFateAfterFreeze(handle, proc.pid!, logPath, backend);
-        finish(124, true, stopped);
-      }, 20).unref?.();
+      exiting = true;
+      stalled = markStallOutcome(handle, proc.pid!, logPath, backend);
+      finish(124, false, stalled);
     };
 
     // Hard backstop: if the deadline passes and nobody calls worker_extend within the
@@ -114,10 +99,10 @@ function launchAndWait(
 
       if (mon.sig !== lastSig) { lastSig = mon.sig; lastActivityAt = mon.at; }
       else if (now - lastActivityAt >= stallTimeoutMs()) {
-        freezeAndFinish();
+        killOnStallAndFinish();
         return;
       }
-    }, pollIntervalMs());
+    }, watchdogMs());
     watchdog.unref?.();
 
     proc.on('exit', (code, signal) => {
@@ -142,10 +127,10 @@ export async function runWorker(
   resumeToken: string,
   timeoutMs?: number,
 ): Promise<RunResult> {
-  const { rc, timedOut, stopped } = await launchAndWait(argv, repo, handle, backend, logPath, timeoutMs);
+  const { rc, timedOut, stalled } = await launchAndWait(argv, repo, handle, backend, logPath, timeoutMs);
   let status: string;
-  if (stopped) {
-    status = 'stopped';
+  if (stalled) {
+    status = 'stalled';
   } else {
     const natural = resolveStatus(backend, rc, logPath, timedOut);
     const gated = maybeVerifyAndCommit(handle, repo, natural);
@@ -156,63 +141,4 @@ export async function runWorker(
     resume_token: resumeToken, repo,
     log: logPath,
   };
-}
-
-export function watchExisting(
-  handle: string,
-  pid: number,
-  repo: string,
-  logPath: string,
-  backend: Backend,
-): Promise<RunResult> {
-  const job = getJob(handle);
-  const resumeToken = job?.resume_token ?? '';
-  const mon = startActivityMonitor(repo, logPath);
-  let lastSig = mon.sig;
-  let lastActivityAt = mon.at;
-
-  return new Promise((resolve) => {
-    let resolved = false;
-    const buildResult = (status: string): RunResult => ({
-      status, exit_code: 0, backend, handle,
-      resume_token: resumeToken, repo, log: logPath,
-    });
-    const finish = (status: string) => {
-      if (resolved) return;
-      resolved = true;
-      try { mon.dispose(); } catch {}
-      resolve(buildResult(status));
-    };
-
-    const suspend = () => {
-      if (freezeThenDecide(handle, pid, logPath, backend)) {
-        finish('stopped');
-      } else {
-        finish(finalizeJob(handle, resolveStatus(backend, 124, logPath, true)));
-      }
-    };
-
-    // Same hard backstop as launchAndWait: deadline + grace with no extend → terminal kill.
-    const killAtGrace = () => {
-      killProcessTree(pid, 'SIGKILL');
-      finish(finalizeJob(handle, resolveStatus(backend, 124, logPath, true)));
-    };
-
-    const check = () => {
-      if (resolved) return;
-      if (!isProcessAlive(pid)) {
-        const natural = resolveStatus(backend, 0, logPath, false);
-        const gated = maybeVerifyAndCommit(handle, repo, natural);
-        finish(finalizeJob(handle, gated));
-        return;
-      }
-      const now = Date.now();
-      const deadline = getJob(handle)?.deadline_at;
-      if (deadline && now >= deadline + graceMs()) { killAtGrace(); return; }
-      if (mon.sig !== lastSig) { lastSig = mon.sig; lastActivityAt = mon.at; }
-      else if (now - lastActivityAt >= stallTimeoutMs()) { suspend(); return; }
-      setTimeout(check, resumePollIntervalMs()).unref?.();
-    };
-    check();
-  });
 }

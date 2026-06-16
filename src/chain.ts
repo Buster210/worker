@@ -1,13 +1,12 @@
 import { appendLadder, chainLockPath, createChainLock, removeChainLock } from './state.ts';
 import { LADDER, type Backend } from './backends.ts';
 import { type RunResult } from './runner.ts';
-import { launch, resumeLaunch, SERVER_STARTED } from './lifecycle.ts';
+import { launch, SERVER_STARTED } from './lifecycle.ts';
 
 type LadderResult = { handle: string; status: string } | { status: 'exhausted'; note: string };
 
 export type LadderDrivers = {
   runRung: (backend: Backend) => Promise<RunResult>;
-  resumeRung: (handle: string) => Promise<RunResult>;
 };
 
 export function handleLadder(args: { sid: string; prompt: string; dir: string; timeout?: number }): LadderResult {
@@ -17,11 +16,9 @@ export function handleLadder(args: { sid: string; prompt: string; dir: string; t
   if (LADDER.length === 0) return { status: 'exhausted', note: 'no workers available' };
 
   createChainLock(sid, process.pid, SERVER_STARTED);
-  const timeoutSec = args.timeout;
   const first = launch(LADDER[0], prompt, dir, { sid, timeoutMs, completionLock: chainLockPath(sid) });
   const drivers: LadderDrivers = {
     runRung: (backend) => launch(backend, prompt, dir, { sid, timeoutMs }).promise,
-    resumeRung: (handle) => resumeLaunch({ handle, prompt, dir, timeout: timeoutSec }).promise,
   };
 
   const chainPromise = runLadderChain(sid, first.promise, drivers)
@@ -46,14 +43,14 @@ export async function runLadderChain(
   appendLadder(sid, turn++, LADDER[i], result.status);
 
   for (;;) {
-    // timeout is terminal: deadline+grace expired with no extend → no resume, no climb.
+    // timeout is terminal: deadline+grace expired with no extend → no retry, no climb.
     if (result.status === 'done' || result.status === 'killed' || result.status === 'timeout') return result;
 
-    if (result.status === 'stopped') {
-      const r2 = await drivers.resumeRung(result.handle);
-      appendLadder(sid, turn++, LADDER[i], r2.status);
-      if (r2.status === 'done' || r2.status === 'killed' || r2.status === 'timeout') return r2;
-      result = r2;
+    if (result.status === 'stalled') {
+      // one fresh re-run of the SAME backend (new worktree, no resume)
+      result = await drivers.runRung(LADDER[i]);
+      appendLadder(sid, turn++, LADDER[i], result.status);
+      if (result.status === 'done' || result.status === 'killed' || result.status === 'timeout') return result;
     }
 
     i++;

@@ -1,5 +1,5 @@
 import { reapAgeMs } from './env.ts';
-import { getAllRunningJobs, getAllStoppedJobs, finalizeJob, workersDir } from './state.ts';
+import { getAllRunningJobs, getAllRunningJobsFresh, getAllStoppedJobs, finalizeJob, workersDir } from './state.ts';
 import { isProcessAlive, killProcessTree } from './process.ts'
 import { resolveStatus } from './status.ts'
 import { removeWorktree } from './worktree.ts';
@@ -16,8 +16,9 @@ function reapWorktree(job: { repo: string; worktree_path?: string }): void {
   }
 }
 
-export function sweepStaleJobs() {
-  for (const job of getAllRunningJobs()) {
+export function sweepStaleJobs(opts?: { fresh?: boolean }) {
+  const jobs = opts?.fresh ? getAllRunningJobsFresh() : getAllRunningJobs();
+  for (const job of jobs) {
     // Never reap a job we ourselves own (self-server guard)
     const selfOwner = job.server_pid > 0 && job.server_pid === SELF_PID && job.server_started === SELF_STARTED;
     if (selfOwner) continue;

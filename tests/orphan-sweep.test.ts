@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, afterAll } from 'bun:test';
+import { spyOn } from 'bun:test';
 import { spawn, spawnSync } from 'child_process';
-import { rmSync, mkdirSync, writeFileSync, existsSync, unlinkSync, readdirSync } from 'fs';
+import * as childProcess from 'child_process';
+import { rmSync, mkdirSync, writeFileSync, readFileSync, existsSync, unlinkSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -17,9 +19,10 @@ process.env.CLAUDE_CODE_SESSION_ID = THIS_SID;
 
 import { sweepStaleJobs, sweepChainLocks } from '../src/maintenance.ts';
 import { isProcessAlive } from '../src/process.ts';
-import { insertJob, getJob, updateJob, finalizeJob, pruneOldJobs, logPath as stateLogPath, chainLockPath, workersDir, __resetStateForTest } from '../src/state.ts';
-import { SERVER_STARTED, forceKillJob } from '../src/lifecycle.ts';
+import { insertJob, getJob, getJobFresh, updateJob, finalizeJob, pruneOldJobs, logPath as stateLogPath, chainLockPath, workersDir, handleDir, __resetStateForTest, getAllRunningJobs, getAllRunningJobsFresh } from '../src/state.ts';
+import { SERVER_STARTED, forceKillJob, spawnReaper, resetShutdownState } from '../src/lifecycle.ts';
 import { addWorktree } from '../src/worktree.ts';
+import { reaperPidPath } from '../src/state.ts';
 
 const REPO = join(tmpdir(), `worphan-repo-${process.pid}`);
 const livePids: number[] = [];
@@ -289,6 +292,25 @@ describe('forceKillJob / shutdown — claude_tmux worker_pid===0', () => {
   });
 });
 
+describe('spawnReaper single-instance guard', () => {
+  afterEach(() => {
+    resetShutdownState();
+    try { unlinkSync(reaperPidPath()); } catch {}
+  });
+
+  it('does not spawn a second reaper when a live pidfile already exists', () => {
+    resetShutdownState();
+    writeFileSync(reaperPidPath(), `${process.pid}\n`);
+    const spawnSpy = spyOn(childProcess, 'spawn');
+
+    spawnReaper();
+    spawnReaper();
+
+    expect(spawnSpy).not.toHaveBeenCalled();
+    expect(readFileSync(reaperPidPath(), 'utf8').trim()).toBe(String(process.pid));
+  });
+});
+
 describe('worktree reap — pruneOldJobs and normal finalize', () => {
   it('pruneOldJobs removes the worktree via removeWorktree before rmSync', () => {
     const repo = join(tmpdir(), `wreap-repo-${process.pid}-${seq++}`);
@@ -369,5 +391,99 @@ describe('worktree reap — pruneOldJobs and normal finalize', () => {
 
     // Cleanup
     try { rmSync(repo, { recursive: true, force: true }); } catch {}
+  });
+});
+
+describe('getAllRunningJobsFresh — stale cache regression', () => {
+  it('returns jobs created after cache bootstrap while cached getAllRunningJobs does not', () => {
+    // Prime the cache by calling getAllRunningJobs once (returns whatever exists)
+    getAllRunningJobs();
+
+    // Now write a new running job to disk directly (simulating reaper starting before any worker)
+    const handle = `fresh-orphan-${process.pid}-${seq++}`;
+    const jobDir = join(workersDir(), 'default', handle);
+    mkdirSync(jobDir, { recursive: true });
+    const job = {
+      handle,
+      backend: 'cmd',
+      sid: 'test',
+      worker_pid: deadPid(),
+      resume_token: '',
+      repo: REPO,
+      started: new Date().toISOString(),
+      status: 'running',
+      model: '',
+      task: '',
+      log_path: join(jobDir, 'run.log'),
+      completion_lock: join(jobDir, '.lock'),
+      server_pid: deadPid(),
+      server_started: new Date().toISOString(),
+      server_sid: THIS_SID,
+    };
+    writeFileSync(join(jobDir, 'job.json'), JSON.stringify(job));
+
+    // Cached getAllRunningJobs does NOT see it (empty in-memory map from bootstrap)
+    expect(getAllRunningJobs().some(j => j.handle === handle)).toBe(false);
+    // Fresh scan DOES see it (reads disk)
+    expect(getAllRunningJobsFresh().some(j => j.handle === handle)).toBe(true);
+
+    // Cleanup
+    try { rmSync(jobDir, { recursive: true, force: true }); } catch {}
+  });
+
+  it('sweepStaleJobs({ fresh: true }) reaps orphan created after cache bootstrap', async () => {
+    // Prime the cache first
+    getAllRunningJobs();
+
+    // Create a git repo for worktree test
+    const repo = join(tmpdir(), `fresh-reap-repo-${process.pid}-${seq++}`);
+    initGitRepo(repo);
+
+    // Write a running orphan job directly to disk. Use handleDir(handle, repo) —
+    // the same path addWorktree resolves — so finalizeJob's write and
+    // getJobFresh's read (both via the repo-derived/cached handle dir) agree.
+    const handle = `fresh-reap-${process.pid}-${seq++}`;
+    const jobDir = handleDir(handle, repo);
+    mkdirSync(jobDir, { recursive: true });
+    const wt = addWorktree(repo, handle);
+    const workerPid = spawnSleep();
+    const job = {
+      handle,
+      backend: 'cmd',
+      sid: 'test',
+      worker_pid: workerPid,
+      resume_token: '',
+      repo,
+      started: new Date().toISOString(),
+      status: 'running',
+      model: '',
+      task: '',
+      log_path: join(jobDir, 'run.log'),
+      completion_lock: join(jobDir, '.lock'),
+      server_pid: deadPid(),
+      server_started: new Date().toISOString(),
+      server_sid: THIS_SID,
+      worktree_path: wt,
+    };
+    writeFileSync(join(jobDir, 'job.json'), JSON.stringify(job));
+
+    // Sweep with fresh=true (simulates what reaper does)
+    sweepStaleJobs({ fresh: true });
+
+    await Bun.sleep(100);
+
+    // Assert the orphan job is finalized (use getJobFresh since we wrote directly to disk)
+    const orphanedJob = getJobFresh(handle);
+    expect(orphanedJob!.status).toBe('failed');
+    // Assert worktree was removed
+    expect(existsSync(wt)).toBe(false);
+
+    // Cleanup
+    try { rmSync(repo, { recursive: true, force: true }); } catch {}
+  });
+
+  it('sweepStaleJobs() with no args still uses cached path (existing behavior)', () => {
+    // Verify no-arg call still works (uses cached path)
+    expect(() => sweepStaleJobs()).not.toThrow();
   });
 });

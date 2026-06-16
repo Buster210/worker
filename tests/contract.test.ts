@@ -238,38 +238,10 @@ describe('handleStatus — hermetic', () => {
   });
 });
 
-describe('handleResume — hermetic (stopped + alive pid)', () => {
-  it('thaws a frozen stopped job via SIGCONT, worker writes DONE, status becomes done', async () => {
-    const handle = `hr-frozen-${seq++}`;
-    const lp = seedJob(handle);
-    process.env.WORKER_RESUME_POLL_MS = '50';
-    process.env.WORKER_POLL_MS = '50';
-    // Script emits work, sleeps briefly, then emits DONE — fast enough to finish within the timeout
-    const pid = spawnDetached('echo working; sleep 1; echo; echo DONE', lp);
-    updateJob(handle, { worker_pid: pid, status: 'stopped', stopped_at: new Date().toISOString(), backend: 'cmd' });
-    await waitFor(() => isProcessAlive(pid));
-    try { process.kill(-pid, 'SIGSTOP'); } catch {}
-
-    // handleResume is fire-and-forget (returns {handle, status:'running'}); pass short timeout
-    // so the watcher's deadline is tight and the test finishes promptly.
-    const specFile = writeSpec('resume-test.md', 'resume test spec');
-    const { handle: h, status } = handleResume({ handle, specFile, dir: REPO, timeout: 10 });
-    expect(h).toBe(handle);
-    expect(status).toBe('running');
-
-    // Thaw the process (mirrors resumeLaunch: SIGCONT)
-    try { process.kill(-pid, 'SIGCONT'); } catch {}
-
-    // Poll until the job reaches a terminal status (not 'running' or 'stopped')
-    await waitFor(() => {
-      const j = getJobFresh(handle);
-      return j != null && /^(done|failed|killed|timeout)/.test(j.status);
-    }, 15_000);
-    expect(getJobFresh(handle)?.status).toBe('done');
-    // Post-resume output captured in the log
-    const log = readFileSync(lp, 'utf8');
-    expect(log).toContain('DONE');
-  });
+describe('handleResume — hermetic', () => {
+  // Note: there is no longer a "thaw a frozen stopped job via SIGCONT" path — stall now KILLs
+  // (never freezes), so resume always re-runs fresh from the resume token. The fresh-re-run
+  // behavior is covered by the PATH-stub suite ('stopped job with dead pid → fresh re-run').
 
   it('throws for unknown handle', () => {
     const ghostSpec = writeSpec('ghost-spec.md', 'ghost spec');

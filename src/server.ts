@@ -13,7 +13,7 @@ import { workerEnv } from './env.ts';
 import { resolveStatus } from './status.ts';
 import { isProcessAlive } from './process.ts';
 import { sweepStaleJobs, reapStoppedJobs, sweepChainLocks } from './maintenance.ts';
-import { launch, forceKillJob, assertRepo, resumeLaunch as lifecycleResumeLaunch, shutdown } from './lifecycle.ts';
+import { launch, forceKillJob, assertRepo, resumeLaunch as lifecycleResumeLaunch, shutdown, spawnReaper } from './lifecycle.ts';
 import { handleLadder } from './chain.ts';
 
 // --- MCP tool handlers (keep in server.ts) ---
@@ -244,6 +244,7 @@ if (import.meta.main) {
   sweepChainLocks();
   pruneOldJobs();
   setInterval(() => { reapStoppedJobs(); sweepStaleJobs(); sweepChainLocks(); }, 60_000).unref();
+  spawnReaper();
   const transport = new StdioServerTransport();
   await server.connect(transport);
   process.on('SIGTERM', shutdown);

@@ -1,15 +1,17 @@
 import { randomUUID } from 'crypto';
 import { spawn, spawnSync } from 'child_process';
+import { readFileSync, unlinkSync, writeFileSync } from 'fs';
 import { join } from 'path';
-import { killProcessTree, isProcessAlive } from './process.ts';
+import { killProcessTree } from './process.ts';
 import {
-  handleDir, insertJob, getJob, updateJob, createLock, logPath as workerLogPath, finalizeJob,
+  handleDir, insertJob, getJob, updateJob, logPath as workerLogPath, finalizeJob, reaperPidPath,
 } from './state.ts';
 import { addWorktreeAsync } from './worktree.ts';
 import { buildSpec, buildRunArgv, buildResumeArgv, getResumeToken, type Backend } from './backends.ts';
-import { runWorker, watchExisting, type RunResult } from './runner.ts';
+import { runWorker, type RunResult } from './runner.ts';
 import { runClaudeTmux } from './claudeTmux.ts';
-import { defaultTimeoutMs, loginShellEnvAsync } from './env.ts';
+import { loginShellEnvAsync } from './env.ts';
+import { isProcessAlive } from './process.ts';
 
 // --- Server lifecycle state ---
 export const SERVER_STARTED = new Date().toISOString();
@@ -18,6 +20,43 @@ const launchedHandles = new Set<string>();
 
 export function trackLaunched(handle: string) { launchedHandles.add(handle); }
 function untrackLaunched(handle: string) { launchedHandles.delete(handle); }
+// --- External reaper (detached background orphan sweeper) ---
+let _reaperPid: number | undefined;
+let _reaperOwned = false;
+
+function readReaperPid(pidPath: string): number | null {
+  try {
+    const parsed = Number(readFileSync(pidPath, 'utf8').trim());
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+export function spawnReaper(): void {
+  try {
+    if (_reaperPid && isProcessAlive(_reaperPid)) return;
+    const reaperPath = new URL('./reaper.ts', import.meta.url).pathname;
+    const pidPath = reaperPidPath();
+    const existing = readReaperPid(pidPath);
+    if (existing && isProcessAlive(existing)) {
+      _reaperPid = existing;
+      _reaperOwned = false;
+      return;
+    }
+    try { unlinkSync(pidPath); } catch {}
+    const child = spawn('bun', ['run', reaperPath], {
+      detached: true,
+      stdio: 'ignore',
+    });
+    child.unref();
+    _reaperPid = child.pid;
+    _reaperOwned = true;
+    if (child.pid) {
+      try { writeFileSync(pidPath, `${child.pid}\n`); } catch {}
+    }
+  } catch {}
+}
 
 // --- Repo guard ---
 const _repoChecked = new Set<string>();
@@ -123,10 +162,14 @@ export async function shutdown(): Promise<void> {
     finalizeJob(handle, 'failed', { resume_token: job.resume_token });
     launchedHandles.delete(handle);
   }
+  // Kill the external reaper so it doesn't outlive us
+  if (_reaperOwned && _reaperPid) {
+    try { process.kill(_reaperPid, 'SIGTERM'); } catch {}
+  }
   process.exit(0);
 }
 let _shuttingDown = false;
-export function resetShutdownState(): void { _shuttingDown = false; launchedHandles.clear(); }
+export function resetShutdownState(): void { _shuttingDown = false; launchedHandles.clear(); _reaperPid = undefined; _reaperOwned = false; }
 
 export function resumeLaunch(args: { handle: string; prompt: string; dir: string; timeout?: number; extraArgs?: string[] }): { handle: string; promise: Promise<RunResult> } {
   const { handle, prompt, dir, timeout, extraArgs } = args;
@@ -140,29 +183,6 @@ export function resumeLaunch(args: { handle: string; prompt: string; dir: string
   });
 
   const wtDir = job.worktree_path ?? dir;
-
-  if (job.status === 'stopped') {
-    const pid = job.worker_pid;
-    if (!isProcessAlive(pid, job.started)) {
-      const be = job.backend as Backend;
-      const lp = workerLogPath(handle);
-      const spec = buildSpec(be, prompt);
-      const argv = buildResumeArgv(be, spec, wtDir, job.resume_token, undefined, extraArgs);
-      const p = runWorker(argv, wtDir, handle, be, lp,
-        job.resume_token, timeout ? timeout * 1000 : undefined);
-      return { handle, promise: trackError(p) };
-    }
-
-    try { process.kill(-pid, 'SIGCONT'); } catch {}
-    // Re-arm the deadline on resume — the original is in the past, which would otherwise
-    // trip watchExisting's grace-kill immediately.
-    updateJob(handle, { status: 'running', deadline_at: Date.now() + (timeout ? timeout * 1000 : defaultTimeoutMs()) });
-    createLock(handle);
-
-    const be = job.backend as Backend;
-    const lp = workerLogPath(handle);
-    return { handle, promise: trackError(watchExisting(handle, pid, wtDir, lp, be)) };
-  }
 
   const be = job.backend as Backend;
   const lp = workerLogPath(handle);

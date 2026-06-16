@@ -2,7 +2,7 @@ import { spawn, spawnSync } from 'child_process';
 import { statSync, writeFileSync, readFileSync, renameSync } from 'fs';
 import { workersDir } from './state.ts';
 
-function envMs(key: string, def: number): number {
+export function envMs(key: string, def: number): number {
   const v = Number(process.env[key]);
   return Number.isFinite(v) && v > 0 ? v : def;
 }

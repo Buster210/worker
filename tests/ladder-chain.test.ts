@@ -19,19 +19,16 @@ function res(status: string, handle = 'h'): RunResult {
   return { status, exit_code: 0, backend: 'cmd' as Backend, handle, resume_token: handle, repo: '/x', log: '' };
 }
 
-// A driver that scripts each rung's outcome by call order. runRung pulls the next scripted result;
-// resumeRung returns whatever `resume` yields. Both record their calls for assertion.
+// A driver that scripts each runRung outcome by call order. A stall now re-runs the SAME backend
+// fresh (no resume) — both the retry and the climb go through runRung, scripted in call order.
 function scriptedDrivers(opts: {
-  rungs: string[];                 // status returned by each successive runRung (rung 1, 2, ...)
-  resume?: (handle: string) => string; // status returned by resumeRung (default: same failure → 'failed')
-}): LadderDrivers & { runCalls: Backend[]; resumeCalls: string[] } {
+  rungs: string[];                 // status returned by each successive runRung call, in order
+}): LadderDrivers & { runCalls: Backend[] } {
   const runCalls: Backend[] = [];
-  const resumeCalls: string[] = [];
   let idx = 0;
   return {
-    runCalls, resumeCalls,
+    runCalls,
     runRung: async (backend: Backend) => { runCalls.push(backend); return res(opts.rungs[idx++] ?? 'failed', `run-${backend}`); },
-    resumeRung: async (handle: string) => { resumeCalls.push(handle); return res(opts.resume ? opts.resume(handle) : 'failed', `resumed-${handle}`); },
   };
 }
 
@@ -45,39 +42,46 @@ describe('runLadderChain (auto-climb controller)', () => {
     expect(final.status).toBe('done');
     expect(final.handle).toBe('first');
     expect(d.runCalls).toEqual([]);       // never climbed
-    expect(d.resumeCalls).toEqual([]);    // never resumed
     expect(getLadderHistory(sid).length).toBe(1);
   });
 
-  it('climbs to the next backend on a hard failure (no resume on failed)', async () => {
+  it('climbs to the next backend on a hard failure (no retry on failed)', async () => {
     const sid = nextSid();
     // rung 0 = failed; first runRung (rung 1 = LADDER[1]) succeeds.
     const d = scriptedDrivers({ rungs: ['done'] });
     const final = await runLadderChain(sid, Promise.resolve(res('failed')), d);
     expect(final.status).toBe('done');
-    expect(d.resumeCalls).toEqual([]);             // failed never resumes
-    expect(d.runCalls).toEqual([LADDER[1]]);       // climbed exactly once, to rung 1
+    expect(d.runCalls).toEqual([LADDER[1]]);       // climbed exactly once, to rung 1 (no same-backend retry)
     expect(getLadderHistory(sid).map(h => h.result)).toEqual(['failed', 'done']);
   });
 
-  it('on timeout: terminal — no resume, no climb (deadline+grace kill is final)', async () => {
+  it('on timeout: terminal — no retry, no climb (deadline+grace kill is final)', async () => {
     const sid = nextSid();
-    const d = scriptedDrivers({ rungs: ['done'], resume: () => 'done' });
+    const d = scriptedDrivers({ rungs: ['done'] });
     const final = await runLadderChain(sid, Promise.resolve(res('timeout', 'rung0')), d);
     expect(final.status).toBe('timeout');
-    expect(d.resumeCalls).toEqual([]);             // timeout is a hard dead-end → never resumed
     expect(d.runCalls).toEqual([]);                // never climbed
     expect(getLadderHistory(sid).map(h => h.result)).toEqual(['timeout']);
   });
 
-  it('on stopped: resumes once, then climbs when the resume also fails', async () => {
+  it('on stalled: fresh re-runs the SAME backend once, succeeds → no climb', async () => {
     const sid = nextSid();
-    const d = scriptedDrivers({ rungs: ['done'], resume: () => 'stopped' });
-    const final = await runLadderChain(sid, Promise.resolve(res('stopped', 'rung0')), d);
+    // rung 0 stalls; the fresh retry of the SAME backend (LADDER[0]) succeeds.
+    const d = scriptedDrivers({ rungs: ['done'] });
+    const final = await runLadderChain(sid, Promise.resolve(res('stalled', 'rung0')), d);
     expect(final.status).toBe('done');
-    expect(d.resumeCalls).toEqual(['rung0']);      // resumed exactly once
-    expect(d.runCalls).toEqual([LADDER[1]]);       // resume failed → climbed to rung 1
-    expect(getLadderHistory(sid).map(h => h.result)).toEqual(['stopped', 'stopped', 'done']);
+    expect(d.runCalls).toEqual([LADDER[0]]);       // retried the SAME backend, not a climb
+    expect(getLadderHistory(sid).map(h => h.result)).toEqual(['stalled', 'done']);
+  });
+
+  it('on stalled: re-runs same backend once, then climbs when the retry also stalls', async () => {
+    const sid = nextSid();
+    // rung 0 stalls → fresh retry of LADDER[0] stalls again → climb to LADDER[1] (done).
+    const d = scriptedDrivers({ rungs: ['stalled', 'done'] });
+    const final = await runLadderChain(sid, Promise.resolve(res('stalled', 'rung0')), d);
+    expect(final.status).toBe('done');
+    expect(d.runCalls).toEqual([LADDER[0], LADDER[1]]); // retry same backend, then climb to next
+    expect(getLadderHistory(sid).map(h => h.result)).toEqual(['stalled', 'stalled', 'done']);
   });
 
   it('returns "exhausted" when every backend fails, climbing through the whole ladder once', async () => {
@@ -90,16 +94,15 @@ describe('runLadderChain (auto-climb controller)', () => {
     expect(getLadderHistory(sid).length).toBe(LADDER.length);
   });
 
-  it('exhausting on a last-rung resume failure reports the resume attempt, not the stale pre-resume result', async () => {
+  it('exhausting on a last-rung stall reports the retry attempt, not the stale pre-retry result', async () => {
     const sid = nextSid();
-    // Every climbable rung fails, and the LAST rung returns stopped → resume → resume fails → exhausted.
-    // The exhausted result must carry the post-resume attempt (handle `resumed-...`), not the stale stopped one.
-    const rungs = [...Array(LADDER.length - 2).fill('failed'), 'stopped'];
-    const d = scriptedDrivers({ rungs, resume: () => 'failed' });
+    // Every climbable rung fails until the LAST rung, which stalls → fresh retry of the last
+    // backend also stalls → ladder exhausted. The exhausted result must carry the retry attempt.
+    const rungs = [...Array(LADDER.length - 2).fill('failed'), 'stalled', 'stalled'];
+    const d = scriptedDrivers({ rungs });
     const final = await runLadderChain(sid, Promise.resolve(res('failed')), d);
     expect(final.status).toBe('exhausted');
-    expect(d.resumeCalls).toEqual([`run-${LADDER[LADDER.length - 1]}`]); // resumed only the last rung
-    expect(final.handle).toBe(`resumed-run-${LADDER[LADDER.length - 1]}`); // carried r2 forward (regression guard)
+    expect(final.handle).toBe(`run-${LADDER[LADDER.length - 1]}`); // carried the retry result forward
   });
 
   it('stops without climbing when a rung is killed (operator intent honored)', async () => {
@@ -108,26 +111,23 @@ describe('runLadderChain (auto-climb controller)', () => {
     const final = await runLadderChain(sid, Promise.resolve(res('killed', 'rung0')), d);
     expect(final.status).toBe('killed');
     expect(d.runCalls).toEqual([]);                // killed → chain stops, no climb
-    expect(d.resumeCalls).toEqual([]);
   });
 
-  it('KNOWN GAP: no total wall-clock cap — resumes + climbs every rung, each with the FULL per-rung timeout', async () => {
-    // The caller's `timeout` is applied PER RUNG, not across the chain: handleLadder (chain.ts:15)
-    // computes timeoutMs once and hands the SAME value to every launch/resume (chain.ts:21-24).
-    // runLadderChain has no notion of a cumulative deadline — given stops/failures it resumes rung 0
-    // and then climbs through EVERY remaining backend, each receiving a fresh full timeout. So
-    // worst-case cumulative runtime ≈ (#climbs + #resumes) × timeout, far exceeding the caller's
-    // `timeout` (the real bug: a `timeout:900` ladder ran well past 900s). NO source fix in this
-    // scope — when the chain grows a total budget that short-circuits early, this assertion changes.
+  it('KNOWN GAP: no total wall-clock cap — retries + climbs every rung, each with the FULL per-rung timeout', async () => {
+    // The caller's `timeout` is applied PER RUNG, not across the chain: handleLadder computes
+    // timeoutMs once and hands the SAME value to every launch (chain.ts). runLadderChain has no
+    // notion of a cumulative deadline — given a stall it re-runs the same backend and then climbs
+    // through EVERY remaining backend, each receiving a fresh full timeout. So worst-case cumulative
+    // runtime ≈ (#retries + #climbs) × timeout, far exceeding the caller's `timeout`. NO source fix
+    // in this scope — when the chain grows a total budget that short-circuits early, this changes.
     const sid = nextSid();
-    // rung 0 stops → resume (also stops) → climb; every climbed rung fails → exhausts the whole ladder.
-    const d = scriptedDrivers({ rungs: Array(LADDER.length).fill('failed'), resume: () => 'stopped' });
-    const final = await runLadderChain(sid, Promise.resolve(res('stopped', 'rung0')), d);
+    // rung 0 stalls → fresh retry (also stalls) → climb; every climbed rung fails → exhausts the ladder.
+    const d = scriptedDrivers({ rungs: ['stalled', ...Array(LADDER.length - 1).fill('failed')] });
+    const final = await runLadderChain(sid, Promise.resolve(res('stalled', 'rung0')), d);
     expect(final.status).toBe('exhausted');
-    expect(d.resumeCalls).toEqual(['rung0']);      // resumed rung 0 once
-    expect(d.runCalls).toEqual(LADDER.slice(1));   // then climbed through every remaining backend
-    // Total full-timeout-bearing operations after rung 0 = 1 resume + (LADDER.length-1) climbs.
-    // Nothing short-circuited on elapsed time — that is the gap.
-    expect(d.resumeCalls.length + d.runCalls.length).toBe(LADDER.length);
+    // retry of rung 0 (LADDER[0]) once, then climbed through every remaining backend.
+    expect(d.runCalls).toEqual([LADDER[0], ...LADDER.slice(1)]);
+    // Total full-timeout-bearing runRung calls = 1 retry + (LADDER.length-1) climbs = LADDER.length.
+    expect(d.runCalls.length).toBe(LADDER.length);
   });
 });
