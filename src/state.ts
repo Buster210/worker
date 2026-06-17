@@ -98,10 +98,24 @@ function jobJsonPath(handle: string, repo?: string): string {
 function ladderPath(sid: string)  { return join(workersDir(), 'ladder', `${sid}.jsonl`); }
 
 export function chainLockPath(sid: string) { return join(workersDir(), 'ladder', `${sid}.chain.lock`); }
+export function chainMetaPath(sid: string) { return join(workersDir(), 'ladder', `${sid}.chain.meta`); }
+
+export type ChainMeta = {
+  deadlineAt: number;
+};
+
 export function createChainLock(sid: string, ownerPid?: number, ownerStarted?: string) {
   try { writeFileSync(chainLockPath(sid), ownerPid != null ? `${ownerPid}\n${ownerStarted ?? ''}` : ''); } catch {}
 }
 export function removeChainLock(sid: string) { try { unlinkSync(chainLockPath(sid)); } catch {} }
+
+export function saveChainMeta(sid: string, meta: ChainMeta): void {
+  try { writeFileSync(chainMetaPath(sid), JSON.stringify(meta)); } catch {}
+}
+
+export function loadChainMeta(sid: string): ChainMeta | null {
+  try { return JSON.parse(readFileSync(chainMetaPath(sid), 'utf8')) as ChainMeta; } catch { return null; }
+}
 
 export type Job = {
   handle: string; backend: string; sid: string;
@@ -232,6 +246,14 @@ function retainMs(): number {
 }
 const TERMINAL_RE = /^(done|failed|timeout|killed|stalled)/;
 
+// A worktree is owned by the handle that CREATED it — its path is that handle's own tree dir. Ladder
+// reuse points retry/climb handles at the FIRST handle's worktree, so they share the path but must
+// never remove it (that would delete a sibling's tree + branch out from under it). Prune/reap remove
+// a worktree only through its owner; non-owner handles just drop their own (empty) handle dir + row.
+export function ownsWorktree(job: { handle: string; repo: string; worktree_path?: string }): boolean {
+  return !!job.worktree_path && job.worktree_path === join(handleDir(job.handle, job.repo), 'tree');
+}
+
 export function pruneOldJobs(now: number = Date.now()): number {
   ensureBootstrapped();
   const cutoff = now - retainMs();
@@ -240,7 +262,7 @@ export function pruneOldJobs(now: number = Date.now()): number {
     if (!TERMINAL_RE.test(job.status)) continue;
     const finishedAt = Date.parse(job.finished ?? '');
     if (!Number.isFinite(finishedAt) || finishedAt > cutoff) continue;
-    if (job.worktree_path) { try { removeWorktree(job.repo, job.worktree_path); } catch {} }
+    if (ownsWorktree(job)) { try { removeWorktree(job.repo, job.worktree_path!); } catch {} }
     try { rmSync(handleDir(job.handle, job.repo), { recursive: true, force: true }); } catch {}
     _jobs.delete(job.handle);
     _handleDirCache.delete(job.handle);

@@ -1,5 +1,6 @@
 import { describe, it, expect, test, beforeEach, afterEach } from 'bun:test';
-import { buildSpec, buildRunArgv, buildResumeArgv, getResumeToken, emitsJsonLog, computeLadder, ALL_BACKENDS, type Backend } from '../src/backends.ts';
+import { buildSpec, buildRunArgv, buildResumeArgv, getResumeToken, emitsJsonLog, computeLadder, ALL_BACKENDS, QUIET_BACKENDS, type Backend } from '../src/backends.ts';
+import { stallTimeoutMs, quietStallMs } from '../src/env.ts';
 import { handleDir } from '../src/state.ts';
 import { join } from 'path';
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
@@ -69,7 +70,7 @@ describe('buildRunArgv', () => {
 
   it('builds cmd argv without model if not provided', () => {
     const argv = buildRunArgv('cmd', 'spec', '/repo', 'sid123');
-    expect(argv).toEqual(['cmd', '-p', 'spec', '--yolo', '-t', '--skip-onboarding', '--add-dir', '/repo']);
+    expect(argv).toEqual(['cmd', '-p', 'spec', '--yolo', '-t', '--skip-onboarding', '--max-turns', '10000', '--add-dir', '/repo']);
   });
 
   it('builds opencode argv with optional model', () => {
@@ -258,4 +259,54 @@ describe('computeLadder', () => {
     }
   });
 
+  it('drops cmd and codex when isAuthed returns false for them', () => {
+    const result = computeLadder(() => false);
+    // codex and cmd removed; rest stay in ALL_BACKENDS order
+    expect(result).toEqual(['pool', 'omp', 'opencode', 'claude', 'claude_tmux']);
+    expect(result).not.toContain('cmd');
+    expect(result).not.toContain('codex');
+  });
+
+  it('drops only the backend whose auth check fails', () => {
+    const result = computeLadder(be => be !== 'codex');
+    expect(result).not.toContain('codex');
+    expect(result).toContain('cmd');
+    expect(result).toEqual(['cmd', 'pool', 'omp', 'opencode', 'claude', 'claude_tmux']);
+  });
+
+  it('default isAuthed keeps all backends when WORKER_SKIP_AUTH_GATE=1', () => {
+    const orig = process.env.WORKER_SKIP_AUTH_GATE;
+    process.env.WORKER_SKIP_AUTH_GATE = '1';
+    try {
+      expect(computeLadder()).toEqual([...ALL_BACKENDS]);
+    } finally {
+      if (orig === undefined) delete process.env.WORKER_SKIP_AUTH_GATE;
+      else process.env.WORKER_SKIP_AUTH_GATE = orig;
+    }
+  });
+});
+
+describe('QUIET_BACKENDS', () => {
+  it('includes codex', () => { expect(QUIET_BACKENDS.has('codex')).toBe(true); });
+  it('excludes claude', () => { expect(QUIET_BACKENDS.has('claude')).toBe(false); });
+  it('excludes cmd', () => { expect(QUIET_BACKENDS.has('cmd')).toBe(false); });
+  it('excludes pool', () => { expect(QUIET_BACKENDS.has('pool')).toBe(false); });
+});
+
+describe('stall thresholds', () => {
+  const savedEnv: Record<string, string | undefined> = {};
+  const keys = ['WORKER_STALL_MS', 'WORKER_STALL_MS_QUIET'] as const;
+  beforeEach(() => { for (const k of keys) savedEnv[k] = process.env[k]; });
+  afterEach(() => { for (const k of keys) savedEnv[k] === undefined ? delete process.env[k] : process.env[k] = savedEnv[k]; });
+
+  it('stallTimeoutMs defaults to 60_000', () => { expect(stallTimeoutMs()).toBe(60_000); });
+  it('quietStallMs defaults to 240_000', () => { expect(quietStallMs()).toBe(240_000); });
+  it('WORKER_STALL_MS overrides stallTimeoutMs', () => {
+    process.env.WORKER_STALL_MS = '9999';
+    expect(stallTimeoutMs()).toBe(9999);
+  });
+  it('WORKER_STALL_MS_QUIET overrides quietStallMs', () => {
+    process.env.WORKER_STALL_MS_QUIET = '42000';
+    expect(quietStallMs()).toBe(42000);
+  });
 });

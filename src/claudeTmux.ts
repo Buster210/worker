@@ -56,7 +56,8 @@ export async function runClaudeTmux(
   repo: string,
   handle: string,
   sid: string,
-  timeoutMs: number = defaultTimeoutMs(),
+  timeoutMs?: number,
+  deadlineAt?: number,
 ): Promise<RunResult> {
   try { execSync('which tmux', { stdio: 'ignore' }); }
   catch { throw new Error('claude_tmux backend requires tmux'); }
@@ -92,7 +93,7 @@ export async function runClaudeTmux(
 
   updateJob(handle, { worker_pid: 0 });
 
-  const deadline = Date.now() + timeoutMs;
+  const deadline = deadlineAt ?? (Date.now() + (timeoutMs ?? defaultTimeoutMs()));
   let stopped = false;
 
   while (Date.now() < deadline) {

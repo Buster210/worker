@@ -5,7 +5,7 @@ import { randomUUID } from 'crypto';
 import { spawnSync } from 'child_process';
 
 import {
-  getJob, updateJob, finalizeJob, getAllJobs, pruneOldJobs, readSpec,
+  getJob, updateJob, finalizeJob, getAllJobs, pruneOldJobs, readSpec, loadChainMeta, saveChainMeta,
 } from './state.ts';
 import { LADDER, ALL_BACKENDS, type Backend } from './backends.ts';
 import { backendShellArgv } from './runner.ts';
@@ -49,23 +49,21 @@ export function handleKill(args: { handle: string }): string {
     return `already ${job.status}`;
   }
   updateJob(handle, { kill_requested: true });
+  const finalizeKilled = () => finalizeJob(handle, resolveStatus(job.backend, 0, job.log_path, false));
   if (job.backend === 'claude_tmux') {
     forceKillJob(job);
-    const final = finalizeJob(handle, resolveStatus(job.backend, 0, job.log_path, false));
-    return `killed: ${handle} (${final})`;
+    return `killed: ${handle} (${finalizeKilled()})`;
   }
   if (job.status === 'stopped' && job.worker_pid) {
     forceKillJob(job);
-    const final = finalizeJob(handle, resolveStatus(job.backend, 0, job.log_path, false));
-    return `killed: ${handle} (${final})`;
+    return `killed: ${handle} (${finalizeKilled()})`;
   }
   if (job.worker_pid) {
     try { process.kill(-job.worker_pid, 'SIGTERM'); } catch {}
     setTimeout(() => { try { process.kill(-job.worker_pid, 'SIGKILL'); } catch {} }, 3_000).unref?.();
   }
   if (!isProcessAlive(job.worker_pid, job.started)) {
-    const final = finalizeJob(handle, resolveStatus(job.backend, 0, job.log_path, false));
-    return `killed: ${handle} (${final})`;
+    return `killed: ${handle} (${finalizeKilled()})`;
   }
   return `killed: ${handle}`;
 }
@@ -107,8 +105,31 @@ export function handleExtend(args: { handle: string; seconds: number }): { handl
   }
   const job = getJob(handle);
   if (!job) throw new Error(`No job found: ${handle}`);
-  if (job.status !== 'running') throw new Error(`Job ${handle} is not running (status: ${job.status})`);
+
   const now = Date.now();
+
+  // A chain handle carries the chain completion_lock (`...ladder/<sid>.chain.lock`). For these the
+  // extend is chain-WIDE: bump the .chain.meta deadline that runLadderChain + future rung launches
+  // read. The handle itself may already be a finished rung (it climbed on), so DON'T require it to
+  // be running — the running-only guard is only for plain per-job extends.
+  const completionLock = job.completion_lock ?? '';
+  const isChainHandle = completionLock.endsWith('.chain.lock');
+
+  if (isChainHandle) {
+    const filename = completionLock.split('/').pop() ?? '';
+    const sid = filename.replace('.chain.lock', '');
+    const chainMeta = sid ? loadChainMeta(sid) : null;
+    if (!chainMeta) throw new Error(`Chain ${handle} has no active deadline to extend`);
+    const newChainDeadline = Math.max(chainMeta.deadlineAt, now) + seconds * 1000;
+    saveChainMeta(sid, { deadlineAt: newChainDeadline });
+    // If the handle's own rung is still running, keep its per-job deadline in sync so the watchdog
+    // doesn't kill it before the chain budget says so.
+    if (job.status === 'running') updateJob(handle, { deadline_at: newChainDeadline });
+    return { handle, deadline_at: newChainDeadline };
+  }
+
+  // Plain per-job extend (non-ladder worker_run): only meaningful while the job is running.
+  if (job.status !== 'running') throw new Error(`Job ${handle} is not running (status: ${job.status})`);
   const newDeadline = Math.max(job.deadline_at ?? 0, now) + seconds * 1000;
   updateJob(handle, { deadline_at: newDeadline });
   return { handle, deadline_at: newDeadline };
@@ -119,35 +140,37 @@ const WORKER_INSTRUCTIONS = `# worker — delegate a coding task to a background
 Hand a coding task to a background agent that edits a repo, then check, resume, and report on it. One call = one background worker, isolated in its own git worktree.
 
 ## Rules
-- \`worker_ladder(sid, specFile, dir)\` is the DEFAULT — use it for every task. \`worker_run\` only when the user names a specific worker.
+- \`worker_ladder(sid, specFile, dir, timeout?)\` is the DEFAULT — use it for every task. \`worker_run\` only when the user names a specific worker.
 - \`dir\` is REQUIRED on every call — the absolute repo path.
 - \`specFile\` is a BARE filename (no slashes); spec files live in \`~/.claude/plans/\`. The server reads the file and uses its content as the task spec.
 - \`sid\` = your session id (e.g. \$CLAUDE_CODE_SESSION_ID).
+- \`timeout\` = optional hard timeout in seconds (1..3600, default 600). The chain deadline; if exceeded, the job ends with \`timeout\` status.
 - N workers can run in PARALLEL on the same repo — each is isolated in its own git worktree on branch \`worker/<handle>\`. A new call does NOT kill an existing one.
 - On a completed (green) run the worker makes ONE atomic commit on its own \`worker/<handle>\` branch (never pushes, never merges). The authoritative result is the \`worker-report <handle>\` bundle (full diff vs the pre-work base already included). To read git directly, use \`git -C <worktree_path> show\` or \`git -C <worktree_path> diff <base_sha>\` — a plain \`git diff\` will be empty after the commit.
 
 ## Run a task
-1. Call \`worker_ladder(sid, specFile, dir)\`. It returns at once: \`{ handle, status:"running" }\`, then works in the background — it keeps trying until the task is done or no worker can do it. You don't drive it.
+1. Call \`worker_ladder(sid, specFile, dir, timeout?)\`. It returns at once: \`{ handle, status:"running" }\`, then works in the background — it keeps trying until the task is done or no worker can do it. You don't drive it.
 2. Wait for completion in the BACKGROUND — run (just the handle):
        worker-report <handle>
-  When the job ends it prints one bundle to stdout:
-       line 1 = outcome — one of: completed · failed[:reason] · timeout · stopped · exhausted · killed
-       completed / failed / timeout / exhausted → blank line, then the full \`git diff\`
-       stopped / killed → just the one line
-  If the job is still running and near its deadline, you'll get a NEAR_TIMEOUT status line instead — use \`worker_extend\` to push the deadline out.
+  This command BLOCKS until the job finishes. It polls the job's lock file, so it won't return until the chain completes. When done it prints one bundle to stdout:
+       line 1 = status — one of: completed · failed[:reason] · timeout · stopped · exhausted · killed · stalled
+       completed / failed / timeout / exhausted / stalled → worktree path, branch, then the full \`git diff\`
+       stopped / killed → just the status line
+  If the job is still running and near its deadline, it prints a NEAR_TIMEOUT line instead of blocking. Two choices: \`worker_extend(handle, secs)\` then re-run \`worker-report <handle>\` to keep waiting; OR \`worker-report <handle> --wait\` to ignore the signal and block straight through to the terminal report (the worker is hard-killed at the grace edge and you get its \`timeout\` bundle). Don't poll with a fixed \`sleep\` — the near-timeout window is ~30s wide on each side of the deadline, so a short sleep can just re-trip the same signal.
   This bundle is your completion signal AND the result — don't also run \`git diff\` / \`worker_status\`.
 3. Act on the outcome:
   - \`completed\` → review the diff against the spec.
   - \`failed\` / \`timeout\` → inspect the diff; \`worker_resume\` to retry, or report.
   - \`stopped\` → the worker paused with its work preserved; \`worker_resume(handle, specFile, dir)\` to finish it.
-  - \`exhausted\` → no worker could do it; report and stop.
+  - \`exhausted\` → all backends tried with no success; report and stop.
+  - \`stalled\` → worker hung (no activity). The chain auto-retries once on the same backend, then climbs to the next. If you see this in the report, the chain already handled it.
   - \`killed\` → stop.
 
 ## Other tools
-- \`worker_extend(handle, seconds)\` — push a running worker's deadline out by \`seconds\` (1..86400). Repeatable. The deadline is soft within a grace window: ~30s before it the report emits \`NEAR_TIMEOUT\` so you can extend; if nobody extends, the worker is hard-killed (status \`timeout\`) ~60s past the deadline. Stall-freeze applies independently as a backstop.
+- \`worker_extend(handle, seconds)\` — push a running worker's deadline out by \`seconds\` (1..86400). Repeatable. The deadline is soft within a grace window: ~30s before it the report emits \`NEAR_TIMEOUT\` so you can extend; if nobody extends, the worker is hard-killed (status \`timeout\`) ~60s past the deadline.
 - \`worker_resume(handle, specFile, dir)\` — continue a \`stopped\` worker, or retry a \`failed\`/\`timeout\` one. \`specFile\` is a bare filename in \`~/.claude/plans/\`.
 - \`worker_kill(handle)\` — stop a running worker.
-- \`worker_status(handle)\` — mid-run check only; never your completion signal (use the report command above).
+- \`worker_status(handle)\` — mid-run check; returns the current job state. Not your completion signal — use \`worker-report\` which blocks until done.
 - \`worker_list(status?, limit?)\` — recent jobs. Optionally filter by status.
 - \`worker_doctor(backend?)\` — health check; names only the workers that aren't working.`;
 
@@ -159,7 +182,7 @@ const server = new McpServer(
 const bareFilename = (s: string) => !s.includes('/') && !s.includes('\\') && s !== '.' && s !== '..' && !s.includes('..');
 
 server.tool('worker_ladder',
-  `DEFAULT way to run a coding task: hands it to a background agent that edits the repo and runs it to completion on its own, until the task is done or no worker can do it. Pass \`specFile\` (bare filename in ~/.claude/plans/) + \`dir\` (absolute repo path). Returns at once { handle, status:"running" }; get the result via the report command \`bun report.ts <handle>\` (see instructions).`,
+  `DEFAULT way to run a coding task: hands it to a background agent that edits the repo and runs it to completion on its own, until the task is done or no worker can do it. Pass \`specFile\` (bare filename in ~/.claude/plans/) + \`dir\` (absolute repo path) + optional \`timeout\` (seconds, default 600). Returns at once { handle, status:"running" }; get the result via the report command \`bun report.ts <handle>\` (see instructions).`,
   {
     sid: z.string().describe('Session ID ($CLAUDE_CODE_SESSION_ID)'),
     specFile: z.string().min(1).refine(bareFilename, 'bare filename only (no path separators or ..)').describe('Spec filename (bare, no slashes) from ~/.claude/plans/'),
@@ -207,7 +230,7 @@ server.tool('worker_kill',
 );
 
 server.tool('worker_status',
-  'Check a running worker mid-task. Not a completion signal — use the report command.',
+  'Check a worker\'s current state. Returns status, pid, timing, etc. Not a completion signal — use `worker-report <handle>` which blocks until done.',
   { handle: z.string() },
   async (args) => reply(handleStatus(args))
 );

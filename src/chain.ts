@@ -1,32 +1,46 @@
-import { spawnSync } from 'child_process';
-import { appendLadder, chainLockPath, createChainLock, removeChainLock, getJob } from './state.ts';
+import { appendLadder, chainLockPath, createChainLock, removeChainLock, getJob, saveChainMeta, loadChainMeta } from './state.ts';
 import { LADDER, type Backend } from './backends.ts';
 import { type RunResult } from './runner.ts';
 import { launch, SERVER_STARTED } from './lifecycle.ts';
+import { defaultTimeoutMs } from './env.ts';
+import { type SeedContext } from './seed.ts';
 
 type LadderResult = { handle: string; status: string } | { status: 'exhausted'; note: string };
 
 export type LadderDrivers = {
-  runRung: (backend: Backend) => Promise<RunResult>;
+  // seed carries only the PRIOR rung's context for the continuation preamble — the prior work itself
+  // already lives in the shared worktree (reuse), so there is no copy.
+  runRung: (backend: Backend, seed?: SeedContext) => Promise<RunResult>;
 };
 
 export function handleLadder(args: { sid: string; prompt: string; dir: string; timeout?: number }): LadderResult {
   const { sid, prompt, dir } = args;
-  const timeoutMs = args.timeout ? args.timeout * 1000 : undefined;
+  const chainDeadlineAt = Date.now() + (args.timeout ? args.timeout * 1000 : defaultTimeoutMs());
 
   if (LADDER.length === 0) return { status: 'exhausted', note: 'no workers available' };
 
   createChainLock(sid, process.pid, SERVER_STARTED);
-  const first = launch(LADDER[0], prompt, dir, { sid, timeoutMs, completionLock: chainLockPath(sid) });
+  saveChainMeta(sid, { deadlineAt: chainDeadlineAt });
+  const first = launch(LADDER[0], prompt, dir, { sid, deadlineAt: chainDeadlineAt, completionLock: chainLockPath(sid) });
   const drivers: LadderDrivers = {
-    runRung: (backend) => launch(backend, prompt, dir, { sid, timeoutMs }).promise,
+    // Every rung after the first reuses the first rung's worktree + base_sha: the prior rung's work
+    // already lives in that tree, so the report (anchored to the first handle) surfaces whatever the
+    // winning rung leaves — no seed copy, no reparent. The chain completion_lock rides on each rung
+    // so worker_extend can detect it; the deadline is re-read fresh so those bumps reach later rungs.
+    runRung: (backend, seed) => {
+      const firstJob = getJob(first.handle);
+      return launch(backend, prompt, dir, {
+        sid,
+        deadlineAt: effectiveChainDeadline(sid, chainDeadlineAt),
+        completionLock: chainLockPath(sid),
+        reuseWorktree: firstJob?.worktree_path,
+        reuseBaseSha: firstJob?.base_sha,
+        seed,
+      }).promise;
+    },
   };
 
-  const chainPromise = runLadderChain(sid, first.promise, drivers)
-    .then(result => {
-      reparentWinningCommit(dir, first.handle, result);
-      return result;
-    })
+  const chainPromise = runLadderChain(sid, first.promise, drivers, chainDeadlineAt)
     .catch((): RunResult => ({
       status: 'failed', exit_code: 1, backend: LADDER[0], handle: first.handle,
       resume_token: first.handle, repo: dir, log: '',
@@ -37,41 +51,11 @@ export function handleLadder(args: { sid: string; prompt: string; dir: string; t
   return { handle: first.handle, status: 'running' };
 }
 
-export function reparentWinningCommit(dir: string, firstHandle: string, result: RunResult): void {
-  try {
-    if (result.status !== 'done' || result.handle === firstHandle) return;
-    const winnerWt = getJob(result.handle)?.worktree_path;
-    const firstWt = getJob(firstHandle)?.worktree_path;
-    if (!winnerWt || !firstWt) {
-      console.error(`[chain] reparent skipped for ${firstHandle} in ${dir}: missing worktree path(s)`);
-      return;
-    }
-
-    const winnerSha = spawnSync('git', ['-C', winnerWt, 'rev-parse', 'HEAD'], { encoding: 'utf8', timeout: 30_000 });
-    if (winnerSha.error || winnerSha.status !== 0) {
-      console.error(`[chain] failed to read winner SHA for ${result.handle} in ${dir}: ${winnerSha.error?.message ?? winnerSha.stderr?.trim() ?? ''}`);
-      return;
-    }
-
-    const sha = winnerSha.stdout.trim();
-    if (!sha) {
-      console.error(`[chain] empty winner SHA for ${result.handle} in ${dir}`);
-      return;
-    }
-
-    const reset = spawnSync('git', ['-C', firstWt, 'reset', '--hard', sha], { encoding: 'utf8', timeout: 30_000 });
-    if (reset.error || reset.status !== 0) {
-      console.error(`[chain] failed to reparent ${firstHandle} to ${sha} in ${dir}: ${reset.error?.message ?? reset.stderr?.trim() ?? ''}`);
-    }
-  } catch (err) {
-    console.error(`[chain] reparentWinningCommit failed for ${firstHandle} in ${dir}: ${(err as Error).message}`);
-  }
-}
-
 export async function runLadderChain(
   sid: string,
   firstPromise: Promise<RunResult>,
   drivers: LadderDrivers,
+  chainDeadlineAt: number,
 ): Promise<RunResult> {
   let i = 0;
   let turn = 1;
@@ -83,15 +67,26 @@ export async function runLadderChain(
     if (result.status === 'done' || result.status === 'killed' || result.status === 'timeout') return result;
 
     if (result.status === 'stalled') {
-      // one fresh re-run of the SAME backend (new worktree, no resume)
-      result = await drivers.runRung(LADDER[i]);
+      // one fresh re-run of the SAME backend, reusing the chain's shared worktree (prior work is
+      // already in it — handleLadder threads reuseWorktree/reuseBaseSha into each rung)
+      if (Date.now() >= effectiveChainDeadline(sid, chainDeadlineAt)) return { ...result, status: 'timeout' };
+
+      result = await drivers.runRung(LADDER[i], { priorBackend: LADDER[i], priorStatus: result.status });
       appendLadder(sid, turn++, LADDER[i], result.status);
       if (result.status === 'done' || result.status === 'killed' || result.status === 'timeout') return result;
     }
 
     i++;
     if (i >= LADDER.length) return { ...result, status: 'exhausted' };
-    result = await drivers.runRung(LADDER[i]);
+    if (Date.now() >= effectiveChainDeadline(sid, chainDeadlineAt)) return { ...result, status: 'timeout' };
+
+    result = await drivers.runRung(LADDER[i], { priorBackend: LADDER[i - 1], priorStatus: result.status });
     appendLadder(sid, turn++, LADDER[i], result.status);
   }
+}
+
+// The effective chain deadline reflects worker_extend bumps, which handleExtend writes to the
+// .chain.meta sidecar. Fall back to the launch-time value if the sidecar is missing/unreadable.
+export function effectiveChainDeadline(sid: string, fallback: number): number {
+  return loadChainMeta(sid)?.deadlineAt ?? fallback;
 }

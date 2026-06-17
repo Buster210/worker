@@ -1,5 +1,5 @@
 import { reapAgeMs } from './env.ts';
-import { getAllRunningJobs, getAllRunningJobsFresh, getAllStoppedJobs, finalizeJob, workersDir } from './state.ts';
+import { getAllRunningJobs, getAllRunningJobsFresh, getAllStoppedJobs, finalizeJob, workersDir, ownsWorktree } from './state.ts';
 import { isProcessAlive, killProcessTree } from './process.ts'
 import { resolveStatus } from './status.ts'
 import { removeWorktree } from './worktree.ts';
@@ -10,9 +10,11 @@ import { join } from 'path';
 const SELF_PID = process.pid;
 const SELF_STARTED = SERVER_STARTED;
 
-function reapWorktree(job: { repo: string; worktree_path?: string }): void {
-  if (job.worktree_path) {
-    try { removeWorktree(job.repo, job.worktree_path); } catch {}
+function reapWorktree(job: { handle: string; repo: string; worktree_path?: string }): void {
+  // Owner-only: a ladder's retry/climb handles share the first rung's worktree — only its creator
+  // may remove it (see ownsWorktree).
+  if (ownsWorktree(job)) {
+    try { removeWorktree(job.repo, job.worktree_path!); } catch {}
   }
 }
 

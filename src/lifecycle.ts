@@ -2,16 +2,17 @@ import { randomUUID } from 'crypto';
 import { spawn, spawnSync } from 'child_process';
 import { readFileSync, unlinkSync, writeFileSync } from 'fs';
 import { join } from 'path';
-import { killProcessTree } from './process.ts';
+import { killProcessTree, killProcessTrees } from './process.ts';
 import {
   handleDir, insertJob, getJob, updateJob, logPath as workerLogPath, finalizeJob, reaperPidPath,
 } from './state.ts';
-import { addWorktreeAsync } from './worktree.ts';
+import { addWorktreeAsync, clearStaleIndexLock } from './worktree.ts';
 import { buildSpec, buildRunArgv, buildResumeArgv, getResumeToken, type Backend } from './backends.ts';
 import { runWorker, type RunResult } from './runner.ts';
 import { runClaudeTmux } from './claudeTmux.ts';
 import { loginShellEnvAsync } from './env.ts';
 import { isProcessAlive } from './process.ts';
+import { buildContinuationPreamble, type SeedContext } from './seed.ts';
 
 // --- Server lifecycle state ---
 export const SERVER_STARTED = new Date().toISOString();
@@ -70,13 +71,19 @@ export function assertRepo(dir: string) {
   _repoChecked.add(dir);
 }
 
-export function forceKillJob(job: { handle: string; backend: string; worker_pid: number; log_path: string }): void {
-  updateJob(job.handle, { kill_requested: true });
+// Single source for backend-aware process kill. markRequested sets kill_requested
+// (forceKillJob path); shutdown passes false so jobs stay resumable.
+function killByBackend(job: { handle: string; backend: string; worker_pid: number }, markRequested: boolean): void {
+  if (markRequested) updateJob(job.handle, { kill_requested: true });
   if (job.backend === 'claude_tmux') {
     try { spawnSync('tmux', ['kill-session', '-t', job.handle], { stdio: 'ignore' }); } catch {}
   } else if (job.worker_pid > 0) {
     killProcessTree(job.worker_pid, 'SIGKILL');
   }
+}
+
+export function forceKillJob(job: { handle: string; backend: string; worker_pid: number; log_path: string }): void {
+  killByBackend(job, true);
 }
 
 function newHandle(backend: Backend): string {
@@ -86,55 +93,75 @@ function newHandle(backend: Backend): string {
 
 type LaunchResult = { handle: string; promise: Promise<RunResult> };
 
+// Finalize a job as failed when its run promise rejects, then rethrow.
+function failOnError(handle: string, p: Promise<RunResult>): Promise<RunResult> {
+  return p.catch((err: unknown) => {
+    finalizeJob(handle, 'failed');
+    throw err;
+  });
+}
+
 export function launch(
   backend: Backend,
   prompt: string,
   dir: string,
-  opts: { sid: string; model?: string; extraArgs?: string[]; timeoutMs?: number; completionLock?: string },
+  opts: { sid: string; model?: string; extraArgs?: string[]; timeoutMs?: number; deadlineAt?: number; completionLock?: string; seed?: SeedContext; reuseWorktree?: string; reuseBaseSha?: string },
 ): LaunchResult {
   const handle = newHandle(backend);
   trackLaunched(handle);
-  const promise: Promise<RunResult> = (async () => {
-    const wt = join(handleDir(handle, dir), 'tree');
+  const promise: Promise<RunResult> = failOnError(handle, (async () => {
+    // Ladder reuse: a climbing/retrying rung runs IN the prior rung's worktree (its uncommitted +
+    // committed work is already there — no seed copy), sharing its base_sha so the report diff
+    // stays anchored to the chain's original HEAD.
+    const reuse = opts.reuseWorktree;
+    const wt = reuse ?? join(handleDir(handle, dir), 'tree');
     const lp = workerLogPath(handle, dir);
-    const spec = buildSpec(backend, prompt);
+    let spec = buildSpec(backend, prompt);
+
+    // Prepend continuation preamble if seed is present
+    if (opts.seed) {
+      spec = buildContinuationPreamble(opts.seed) + spec;
+    }
+
     const modelToUse = (backend === 'claude' || backend === 'omp' || backend === 'claude_tmux') ? undefined : opts.model;
-    insertJob({ handle, backend, sid: opts.sid, repo: dir, worktree_path: wt, model: modelToUse, task: prompt, log_path: lp, completion_lock: opts.completionLock, server_pid: process.pid, server_started: SERVER_STARTED, server_sid: SERVER_SID });
+    insertJob({ handle, backend, sid: opts.sid, repo: dir, worktree_path: wt, base_sha: opts.reuseBaseSha, model: modelToUse, task: prompt, log_path: lp, completion_lock: opts.completionLock, server_pid: process.pid, server_started: SERVER_STARTED, server_sid: SERVER_SID, deadline_at: opts.deadlineAt });
 
     try {
-      const [createdWt, , base_sha] = await Promise.all([
-        addWorktreeAsync(dir, handle),
-        loginShellEnvAsync(),
-        new Promise<string | undefined>(resolve => {
-          const chunks: Buffer[] = [];
-          const p = spawn('git', ['-C', dir, 'rev-parse', 'HEAD'], { stdio: ['ignore', 'pipe', 'ignore'] });
-          p.stdout?.on('data', (d: Buffer) => chunks.push(d));
-          p.on('close', () => resolve(Buffer.concat(chunks).toString().trim() || undefined));
-          p.on('error', () => resolve(undefined));
-        }),
-      ]);
-      if (createdWt !== wt) throw new Error(`worktree path mismatch for ${handle}`);
-      if (base_sha) updateJob(handle, { base_sha });
+      if (reuse) {
+        clearStaleIndexLock(reuse);
+        await loginShellEnvAsync();
+      } else {
+        const [createdWt, , base_sha] = await Promise.all([
+          addWorktreeAsync(dir, handle),
+          loginShellEnvAsync(),
+          new Promise<string | undefined>(resolve => {
+            const chunks: Buffer[] = [];
+            const p = spawn('git', ['-C', dir, 'rev-parse', 'HEAD'], { stdio: ['ignore', 'pipe', 'ignore'] });
+            p.stdout?.on('data', (d: Buffer) => chunks.push(d));
+            p.on('close', () => resolve(Buffer.concat(chunks).toString().trim() || undefined));
+            p.on('error', () => resolve(undefined));
+          }),
+        ]);
+        if (createdWt !== wt) throw new Error(`worktree path mismatch for ${handle}`);
+        if (base_sha) updateJob(handle, { base_sha });
+      }
     } catch (err) {
       untrackLaunched(handle);
       throw err;
     }
 
     if (backend === 'claude_tmux') {
-      return runClaudeTmux(spec, wt, handle, handle, opts.timeoutMs);
+      return runClaudeTmux(spec, wt, handle, handle, opts.timeoutMs, opts.deadlineAt);
     }
     const argv = buildRunArgv(backend, spec, wt, handle, modelToUse, opts.extraArgs);
     const initToken = backend === 'opencode' ? '' : getResumeToken(backend, handle, lp);
-    const result = await runWorker(argv, wt, handle, backend, lp, initToken, opts.timeoutMs);
+    const result = await runWorker(argv, wt, handle, backend, lp, initToken, opts.timeoutMs, opts.deadlineAt);
     if (backend === 'opencode') {
       const tok = getResumeToken('opencode', handle, lp);
       if (tok) { result.resume_token = tok; updateJob(handle, { resume_token: tok }); }
     }
     return result;
-  })().catch((err: unknown) => {
-    finalizeJob(handle, 'failed');
-    throw err;
-  }).finally(() => untrackLaunched(handle));
+  })()).finally(() => untrackLaunched(handle));
 
   return { handle, promise };
 }
@@ -142,29 +169,30 @@ export function launch(
 export async function shutdown(): Promise<void> {
   if (_shuttingDown) return;
   _shuttingDown = true;
-  const toKill: string[] = [];
+
+  // Reaper kill is independent of worker teardown — fire it first (instant), don't gate
+  // it behind the kills.
+  if (_reaperOwned && _reaperPid) {
+    try { process.kill(_reaperPid, 'SIGTERM'); } catch {}
+  }
+
+  const jobs: NonNullable<ReturnType<typeof getJob>>[] = [];
   for (const handle of launchedHandles) {
     const job = getJob(handle);
     if (!job || (job.status !== 'running' && job.status !== 'stopped')) continue;
-    toKill.push(handle);
+    jobs.push(job);
   }
   launchedHandles.clear();
-  for (const handle of toKill) {
-    const job = getJob(handle);
-    if (!job) continue;
-    // Dispatch kill by backend type (same logic as forceKillJob) without setting
-    // kill_requested — shutdown finalizes as 'failed' so jobs remain resumable.
+
+  // Batch-kill every pid-backed worker tree from ONE process-table snapshot (2 `ps`
+  // enumerations total) instead of one doubled enumeration per job; tmux jobs killed
+  // by session. Jobs stay resumable (finalized 'failed', not kill_requested).
+  killProcessTrees(jobs.filter(j => j.backend !== 'claude_tmux' && j.worker_pid > 0).map(j => j.worker_pid), 'SIGKILL');
+  for (const job of jobs) {
     if (job.backend === 'claude_tmux') {
-      try { spawnSync('tmux', ['kill-session', '-t', handle], { stdio: 'ignore' }); } catch {}
-    } else if (job.worker_pid > 0) {
-      killProcessTree(job.worker_pid, 'SIGKILL');
+      try { spawnSync('tmux', ['kill-session', '-t', job.handle], { stdio: 'ignore' }); } catch {}
     }
-    finalizeJob(handle, 'failed', { resume_token: job.resume_token });
-    launchedHandles.delete(handle);
-  }
-  // Kill the external reaper so it doesn't outlive us
-  if (_reaperOwned && _reaperPid) {
-    try { process.kill(_reaperPid, 'SIGTERM'); } catch {}
+    finalizeJob(job.handle, 'failed', { resume_token: job.resume_token });
   }
   process.exit(0);
 }
@@ -177,11 +205,6 @@ export function resumeLaunch(args: { handle: string; prompt: string; dir: string
   if (!job) throw new Error(`No job found for handle: ${handle}`);
   updateJob(handle, { kill_requested: false });
 
-  const trackError = (p: Promise<RunResult>): Promise<RunResult> => p.catch((err: unknown) => {
-    finalizeJob(handle, 'failed');
-    throw err;
-  });
-
   const wtDir = job.worktree_path ?? dir;
 
   const be = job.backend as Backend;
@@ -193,5 +216,5 @@ export function resumeLaunch(args: { handle: string; prompt: string; dir: string
   const argv = buildResumeArgv(be, spec, wtDir, job.resume_token, undefined, extraArgs);
   const p = runWorker(argv, wtDir, handle, be, lp,
     job.resume_token, timeout ? timeout * 1000 : undefined);
-  return { handle, promise: trackError(p) };
+  return { handle, promise: failOnError(handle, p) };
 }

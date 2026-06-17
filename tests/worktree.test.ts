@@ -11,7 +11,8 @@ mkdirSync(STATE_DIR_RAW, { recursive: true });
 const STATE_DIR = realpathSync(STATE_DIR_RAW);
 process.env.WORKER_STATE_DIR = STATE_DIR;
 
-import { addWorktree, addWorktreeAsync, removeWorktree, listWorktrees } from '../src/worktree.ts';
+import { existsSync } from 'fs';
+import { addWorktree, addWorktreeAsync, removeWorktree, listWorktrees, clearStaleIndexLock } from '../src/worktree.ts';
 
 // Set up a temp repo WITH an initial commit so HEAD exists (worktree add requires HEAD).
 // realpathSync resolves /var → /private/var on macOS so paths match git worktree list output.
@@ -106,5 +107,31 @@ describe('removeWorktree', () => {
     removeWorktree(REPO, wtPath);
     // Second call should not throw
     expect(() => removeWorktree(REPO, wtPath)).not.toThrow();
+  });
+});
+
+describe('clearStaleIndexLock', () => {
+  it('removes a leftover index.lock from a worktree so the next rung can reuse it', () => {
+    const handle = 'test-handle-lock';
+    const wtPath = addWorktree(REPO, handle);
+    // Resolve the worktree's real index.lock path the way git itself reports it.
+    const r = spawnSync('git', ['-C', wtPath, 'rev-parse', '--git-path', 'index.lock'], { encoding: 'utf8' });
+    const rel = r.stdout.trim();
+    const lock = rel.startsWith('/') ? rel : join(wtPath, rel);
+    writeFileSync(lock, '');                    // simulate a SIGKILL'd git mid-write
+    expect(existsSync(lock)).toBe(true);
+
+    clearStaleIndexLock(wtPath);
+    expect(existsSync(lock)).toBe(false);
+  });
+
+  it('is a no-op when there is no lock', () => {
+    const handle = 'test-handle-nolock';
+    const wtPath = addWorktree(REPO, handle);
+    expect(() => clearStaleIndexLock(wtPath)).not.toThrow();
+  });
+
+  it('is a no-op when the path is not a git worktree', () => {
+    expect(() => clearStaleIndexLock(join(tmpdir(), `not-a-repo-${process.pid}`))).not.toThrow();
   });
 });

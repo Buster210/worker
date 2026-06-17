@@ -56,7 +56,7 @@ function spawnDetached(body: string, lp: string): number {
 }
 
 afterEach(() => {
-  for (const k of ['WORKER_POLL_MS', 'WORKER_WATCHDOG_MS', 'WORKER_RESUME_POLL_MS', 'WORKER_STALL_MS', 'WORKER_TIMEOUT_MS', 'WORKER_REAP_MS', 'WORKER_GRACE_MS', 'WORKER_REAPER_MS']) {
+  for (const k of ['WORKER_POLL_MS', 'WORKER_WATCHDOG_MS', 'WORKER_RESUME_POLL_MS', 'WORKER_STALL_MS', 'WORKER_STALL_MS_QUIET', 'WORKER_TIMEOUT_MS', 'WORKER_REAP_MS', 'WORKER_GRACE_MS', 'WORKER_REAPER_MS']) {
     delete process.env[k];
   }
 });
@@ -92,6 +92,19 @@ describe('runWorker lifecycle (real subprocess)', () => {
     const lp = seedJob(handle);
     const r = await runWorker(fakeScript('echo; echo "FAILED: boom"\nexit 1'), REPO, handle, 'cmd', lp, '');
     expect(r.status).toBe('failed:boom');
+  });
+
+  it('does NOT stall a codex worker within the normal stall window (uses quiet threshold)', async () => {
+    const handle = `codex-no-stall-${seq}`;
+    const lp = seedJob(handle);
+    process.env.WORKER_WATCHDOG_MS = '50';
+    process.env.WORKER_STALL_MS = '200';
+    process.env.WORKER_STALL_MS_QUIET = '5000';
+    // Write a change first (so the commit gate passes), then go silent for 400ms — past the
+    // 200ms normal stall but within the 5000ms quiet stall. Codex must NOT be killed in that gap.
+    const r = await runWorker(fakeScript(`echo work > ${handle}.out; sleep 0.4; echo; echo DONE`), REPO, handle, 'codex', lp, '', 60_000);
+    expect(r.status).toBe('done');
+    expect(r.exit_code).toBe(0);
   });
 
   it('kills a quiet idle worker to "stalled" when it stalls (SIGKILL, not frozen)', async () => {

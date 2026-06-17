@@ -1,7 +1,7 @@
 import { describe, it, expect, afterAll, spyOn } from 'bun:test';
 import { spawnSync, spawn } from 'child_process';
 import * as childProcess from 'child_process';
-import { listDescendants, killProcessTree } from '../src/process.ts'
+import { listDescendants, killProcessTree, killProcessTrees } from '../src/process.ts'
 
 // Spawn a detached process tree: top pid forks a child, which forks a grandchild,
 // which forks a great-grandchild — all `sleep 30`.
@@ -127,6 +127,53 @@ describe('killProcessTree', () => {
     killProcessTree(0, 'SIGKILL');
     killProcessTree(-1, 'SIGKILL');
     // No throw = pass.
+  });
+});
+
+describe('killProcessTrees (batch)', () => {
+  it('kills multiple trees from a single snapshot', () => {
+    const a = spawnTree();
+    const b = spawnTree();
+    allSpawned.push(...a.allPids, ...b.allPids);
+
+    killProcessTrees([a.topPid, b.topPid], 'SIGKILL');
+
+    const all = [...a.allPids, ...b.allPids];
+    const deadline = Date.now() + 1000;
+    while (Date.now() < deadline) {
+      if (all.filter(isAlive).length === 0) break;
+      spawnSync('sleep', ['0.02']);
+    }
+    for (const p of all) expect(isAlive(p)).toBe(false);
+  });
+
+  it('no-ops for empty or non-positive pids', () => {
+    killProcessTrees([], 'SIGKILL');
+    killProcessTrees([0, -1], 'SIGKILL');
+    // No throw = pass.
+  });
+
+  // The whole point of the batch form: ONE `ps` enumeration per pass regardless of
+  // tree count — not one (doubled) enumeration per pid like calling killProcessTree N times.
+  it('enumerates once per pass for N trees (not per pid)', () => {
+    const P1 = 999991, C1 = 888881, P2 = 999992, C2 = 888882;
+    const order: string[] = [];
+    const psSpy = spyOn(childProcess, 'spawnSync').mockImplementation((cmd: any) => {
+      if (cmd === 'ps') {
+        order.push('enumerate');
+        return { stdout: `${C1} ${P1}\n${C2} ${P2}\n`, status: 0, signal: null, pid: 0, output: [], stderr: '' } as any;
+      }
+      return { stdout: '', status: 0, signal: null, pid: 0, output: [], stderr: '' } as any;
+    });
+    const killSpy = spyOn(process, 'kill').mockImplementation((() => true) as any);
+    try {
+      killProcessTrees([P1, P2], 'SIGKILL');
+      // 2 passes (kill + survivor), ONE enumerate each — 2 total, not 2 per pid.
+      expect(order).toEqual(['enumerate', 'enumerate']);
+    } finally {
+      psSpy.mockRestore();
+      killSpy.mockRestore();
+    }
   });
 
   // Regression guard: descendants MUST be snapshotted while the tree is still

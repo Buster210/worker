@@ -1,36 +1,21 @@
 import { describe, it, expect, afterAll } from 'bun:test';
-import { spawnSync } from 'child_process';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'fs';
+import { rmSync } from 'fs';
 
 // Throwaway state store, set BEFORE importing server/state (resolution is lazy). The chain writes
 // its ladder audit trail under <STATE_DIR>/ladder; we read it back to assert turn-by-turn behavior.
 const STATE_DIR = join(tmpdir(), `wladder-state-${process.pid}`);
 process.env.WORKER_STATE_DIR = STATE_DIR;
 
-import { runLadderChain, reparentWinningCommit, type LadderDrivers } from '../src/chain.ts';
+import { runLadderChain, type LadderDrivers } from '../src/chain.ts';
 import { LADDER, type Backend } from '../src/backends.ts';
-import { getLadderHistory, insertJob } from '../src/state.ts';
+import { getLadderHistory } from '../src/state.ts';
 import type { RunResult } from '../src/runner.ts';
 
 let sidSeq = 0;
 const nextSid = () => `chain-test-${process.pid}-${sidSeq++}`;
 const tmpDirs: string[] = [];
-
-function makeRepo(prefix: string): string {
-  const raw = mkdtempSync(join(tmpdir(), prefix));
-  const dir = realpathSync(raw);
-  tmpDirs.push(dir);
-  const git = (...args: string[]) => spawnSync('git', ['-C', dir, ...args], { encoding: 'utf8' });
-  git('init', '-q');
-  git('config', 'user.email', 'test@test.com');
-  git('config', 'user.name', 'Test');
-  writeFileSync(join(dir, 'README.md'), 'init\n');
-  git('add', '.');
-  git('commit', '-m', 'init', '--no-gpg-sign');
-  return dir;
-}
 
 afterAll(() => {
   for (const dir of tmpDirs) {
@@ -61,7 +46,8 @@ describe('runLadderChain (auto-climb controller)', () => {
   it('stops on a first-rung done — no climb, single audit turn', async () => {
     const sid = nextSid();
     const d = scriptedDrivers({ rungs: [] });
-    const final = await runLadderChain(sid, Promise.resolve(res('done', 'first')), d);
+    const deadline = Date.now() + 600_000;
+    const final = await runLadderChain(sid, Promise.resolve(res('done', 'first')), d, deadline);
     expect(final.status).toBe('done');
     expect(final.handle).toBe('first');
     expect(d.runCalls).toEqual([]);       // never climbed
@@ -72,7 +58,8 @@ describe('runLadderChain (auto-climb controller)', () => {
     const sid = nextSid();
     // rung 0 = failed; first runRung (rung 1 = LADDER[1]) succeeds.
     const d = scriptedDrivers({ rungs: ['done'] });
-    const final = await runLadderChain(sid, Promise.resolve(res('failed')), d);
+    const deadline = Date.now() + 600_000;
+    const final = await runLadderChain(sid, Promise.resolve(res('failed')), d, deadline);
     expect(final.status).toBe('done');
     expect(d.runCalls).toEqual([LADDER[1]]);       // climbed exactly once, to rung 1 (no same-backend retry)
     expect(getLadderHistory(sid).map(h => h.result)).toEqual(['failed', 'done']);
@@ -81,7 +68,8 @@ describe('runLadderChain (auto-climb controller)', () => {
   it('on timeout: terminal — no retry, no climb (deadline+grace kill is final)', async () => {
     const sid = nextSid();
     const d = scriptedDrivers({ rungs: ['done'] });
-    const final = await runLadderChain(sid, Promise.resolve(res('timeout', 'rung0')), d);
+    const deadline = Date.now() + 600_000;
+    const final = await runLadderChain(sid, Promise.resolve(res('timeout', 'rung0')), d, deadline);
     expect(final.status).toBe('timeout');
     expect(d.runCalls).toEqual([]);                // never climbed
     expect(getLadderHistory(sid).map(h => h.result)).toEqual(['timeout']);
@@ -91,7 +79,8 @@ describe('runLadderChain (auto-climb controller)', () => {
     const sid = nextSid();
     // rung 0 stalls; the fresh retry of the SAME backend (LADDER[0]) succeeds.
     const d = scriptedDrivers({ rungs: ['done'] });
-    const final = await runLadderChain(sid, Promise.resolve(res('stalled', 'rung0')), d);
+    const deadline = Date.now() + 600_000;
+    const final = await runLadderChain(sid, Promise.resolve(res('stalled', 'rung0')), d, deadline);
     expect(final.status).toBe('done');
     expect(d.runCalls).toEqual([LADDER[0]]);       // retried the SAME backend, not a climb
     expect(getLadderHistory(sid).map(h => h.result)).toEqual(['stalled', 'done']);
@@ -101,7 +90,8 @@ describe('runLadderChain (auto-climb controller)', () => {
     const sid = nextSid();
     // rung 0 stalls → fresh retry of LADDER[0] stalls again → climb to LADDER[1] (done).
     const d = scriptedDrivers({ rungs: ['stalled', 'done'] });
-    const final = await runLadderChain(sid, Promise.resolve(res('stalled', 'rung0')), d);
+    const deadline = Date.now() + 600_000;
+    const final = await runLadderChain(sid, Promise.resolve(res('stalled', 'rung0')), d, deadline);
     expect(final.status).toBe('done');
     expect(d.runCalls).toEqual([LADDER[0], LADDER[1]]); // retry same backend, then climb to next
     expect(getLadderHistory(sid).map(h => h.result)).toEqual(['stalled', 'stalled', 'done']);
@@ -111,7 +101,8 @@ describe('runLadderChain (auto-climb controller)', () => {
     const sid = nextSid();
     // rung 0 fails (passed in) + every runRung fails → climbs LADDER.length-1 times then exhausts.
     const d = scriptedDrivers({ rungs: Array(LADDER.length).fill('failed') });
-    const final = await runLadderChain(sid, Promise.resolve(res('failed')), d);
+    const deadline = Date.now() + 600_000;
+    const final = await runLadderChain(sid, Promise.resolve(res('failed')), d, deadline);
     expect(final.status).toBe('exhausted');
     expect(d.runCalls).toEqual(LADDER.slice(1));   // climbed through rungs 1..N-1, no further
     expect(getLadderHistory(sid).length).toBe(LADDER.length);
@@ -123,7 +114,8 @@ describe('runLadderChain (auto-climb controller)', () => {
     // backend also stalls → ladder exhausted. The exhausted result must carry the retry attempt.
     const rungs = [...Array(LADDER.length - 2).fill('failed'), 'stalled', 'stalled'];
     const d = scriptedDrivers({ rungs });
-    const final = await runLadderChain(sid, Promise.resolve(res('failed')), d);
+    const deadline = Date.now() + 600_000;
+    const final = await runLadderChain(sid, Promise.resolve(res('failed')), d, deadline);
     expect(final.status).toBe('exhausted');
     expect(final.handle).toBe(`run-${LADDER[LADDER.length - 1]}`); // carried the retry result forward
   });
@@ -131,32 +123,10 @@ describe('runLadderChain (auto-climb controller)', () => {
   it('stops without climbing when a rung is killed (operator intent honored)', async () => {
     const sid = nextSid();
     const d = scriptedDrivers({ rungs: ['done'] });
-    const final = await runLadderChain(sid, Promise.resolve(res('killed', 'rung0')), d);
+    const deadline = Date.now() + 600_000;
+    const final = await runLadderChain(sid, Promise.resolve(res('killed', 'rung0')), d, deadline);
     expect(final.status).toBe('killed');
     expect(d.runCalls).toEqual([]);                // killed → chain stops, no climb
-  });
-
-  it('reparents the first worktree to the winning commit when the winner handle differs', () => {
-    const repo = makeRepo('wladder-reparent-');
-    const firstHandle = `first-${process.pid}-${sidSeq++}`;
-    const winnerHandle = `winner-${process.pid}-${sidSeq++}`;
-    const firstWt = join(repo, 'first-tree');
-    const winnerWt = join(repo, 'winner-tree');
-    spawnSync('git', ['-C', repo, 'worktree', 'add', '-b', `worker/${firstHandle}`, firstWt, 'HEAD'], { encoding: 'utf8' });
-    spawnSync('git', ['-C', repo, 'worktree', 'add', '-b', `worker/${winnerHandle}`, winnerWt, 'HEAD'], { encoding: 'utf8' });
-
-    insertJob({ handle: firstHandle, backend: 'cmd', sid: 'sid-a', repo, log_path: '/tmp/first.log', worktree_path: firstWt });
-    insertJob({ handle: winnerHandle, backend: 'cmd', sid: 'sid-b', repo, log_path: '/tmp/winner.log', worktree_path: winnerWt });
-
-    writeFileSync(join(winnerWt, 'feature.txt'), 'winner work\n');
-    spawnSync('git', ['-C', winnerWt, 'add', '.'], { encoding: 'utf8' });
-    spawnSync('git', ['-C', winnerWt, 'commit', '-m', 'winner'], { encoding: 'utf8' });
-
-    const winnerSha = spawnSync('git', ['-C', winnerWt, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
-    reparentWinningCommit(repo, firstHandle, { ...res('done', winnerHandle), handle: winnerHandle });
-
-    expect(spawnSync('git', ['-C', firstWt, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim()).toBe(winnerSha);
-    expect(spawnSync('git', ['-C', repo, 'rev-parse', `worker/${firstHandle}`], { encoding: 'utf8' }).stdout.trim()).toBe(winnerSha);
   });
 
   it('KNOWN GAP: no total wall-clock cap — retries + climbs every rung, each with the FULL per-rung timeout', async () => {
@@ -169,7 +139,8 @@ describe('runLadderChain (auto-climb controller)', () => {
     const sid = nextSid();
     // rung 0 stalls → fresh retry (also stalls) → climb; every climbed rung fails → exhausts the ladder.
     const d = scriptedDrivers({ rungs: ['stalled', ...Array(LADDER.length - 1).fill('failed')] });
-    const final = await runLadderChain(sid, Promise.resolve(res('stalled', 'rung0')), d);
+    const deadline = Date.now() + 600_000;
+    const final = await runLadderChain(sid, Promise.resolve(res('stalled', 'rung0')), d, deadline);
     expect(final.status).toBe('exhausted');
     // retry of rung 0 (LADDER[0]) once, then climbed through every remaining backend.
     expect(d.runCalls).toEqual([LADDER[0], ...LADDER.slice(1)]);

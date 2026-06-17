@@ -19,10 +19,11 @@ process.env.CLAUDE_CODE_SESSION_ID = THIS_SID;
 
 import { sweepStaleJobs, sweepChainLocks } from '../src/maintenance.ts';
 import { isProcessAlive } from '../src/process.ts';
-import { insertJob, getJob, getJobFresh, updateJob, finalizeJob, pruneOldJobs, logPath as stateLogPath, chainLockPath, workersDir, handleDir, __resetStateForTest, getAllRunningJobs, getAllRunningJobsFresh } from '../src/state.ts';
+import { insertJob, getJob, getJobFresh, updateJob, finalizeJob, pruneOldJobs, ownsWorktree, logPath as stateLogPath, chainLockPath, workersDir, handleDir, __resetStateForTest, getAllRunningJobs, getAllRunningJobsFresh } from '../src/state.ts';
 import { SERVER_STARTED, forceKillJob, spawnReaper, resetShutdownState } from '../src/lifecycle.ts';
 import { addWorktree } from '../src/worktree.ts';
 import { reaperPidPath } from '../src/state.ts';
+import { serverAliveInPs } from '../src/reaper.ts';
 
 const REPO = join(tmpdir(), `worphan-repo-${process.pid}`);
 const livePids: number[] = [];
@@ -194,6 +195,25 @@ describe('sweepStaleJobs — orphan branch', () => {
   });
 });
 
+describe('reaper serverAliveInPs — self-exit detection', () => {
+  const SRV = '/x/worker/src/server.ts';
+
+  it('true when a non-self line contains the server path', () => {
+    const ps = `100 /bin/bun run ${SRV}\n200 sleep 5`;
+    expect(serverAliveInPs(ps, SRV, 999)).toBe(true);
+  });
+
+  it('false when the only matching line is self (the reaper)', () => {
+    const ps = `999 /bin/bun run ${SRV}`;
+    expect(serverAliveInPs(ps, SRV, 999)).toBe(false);
+  });
+
+  it('false when no line contains the server path → reaper would self-exit', () => {
+    const ps = `100 sleep 5\n200 node app.js`;
+    expect(serverAliveInPs(ps, SRV, 999)).toBe(false);
+  });
+});
+
 describe('sweepChainLocks', () => {
   let savedStateDir: string | undefined;
 
@@ -361,6 +381,47 @@ describe('worktree reap — pruneOldJobs and normal finalize', () => {
     expect(existsSync(wt)).toBe(true);
 
     // Cleanup
+    try { rmSync(repo, { recursive: true, force: true }); } catch {}
+  });
+
+  it('ownsWorktree: true for the creator, false for a ladder reuse-sibling sharing the path', () => {
+    const repo = join(tmpdir(), `wreap-owns-${process.pid}-${seq++}`);
+    initGitRepo(repo);
+    const owner = `wreap-owner-${process.pid}-${seq++}`;
+    const sibling = `wreap-sibling-${process.pid}-${seq++}`;
+    insertJob({ handle: owner, backend: 'cmd', sid: 'test', repo, log_path: stateLogPath(owner, repo) });
+    const wt = addWorktree(repo, owner);
+    updateJob(owner, { worktree_path: wt });
+    // The sibling reuses the owner's worktree path (what a retry/climb rung does).
+    insertJob({ handle: sibling, backend: 'cmd', sid: 'test', repo, log_path: stateLogPath(sibling, repo), worktree_path: wt });
+
+    expect(ownsWorktree(getJob(owner)!)).toBe(true);
+    expect(ownsWorktree(getJob(sibling)!)).toBe(false);
+    try { rmSync(repo, { recursive: true, force: true }); } catch {}
+  });
+
+  it('pruneOldJobs on a reuse-sibling does NOT remove the shared worktree (owner gate)', () => {
+    const repo = join(tmpdir(), `wreap-share-${process.pid}-${seq++}`);
+    initGitRepo(repo);
+    const owner = `wreap-shareowner-${process.pid}-${seq++}`;
+    const sibling = `wreap-sharesib-${process.pid}-${seq++}`;
+
+    // Owner created the worktree but is still FRESH → not eligible for pruning this pass.
+    insertJob({ handle: owner, backend: 'cmd', sid: 'test', repo, log_path: stateLogPath(owner, repo) });
+    const wt = addWorktree(repo, owner);
+    updateJob(owner, { worktree_path: wt, status: 'done', finished: new Date().toISOString() });
+
+    // Sibling reuses the same worktree and is OLD → gets pruned. It must NOT take the worktree down.
+    insertJob({ handle: sibling, backend: 'cmd', sid: 'test', repo, log_path: stateLogPath(sibling, repo), worktree_path: wt });
+    updateJob(sibling, { status: 'failed', finished: new Date(Date.now() - 8 * 86_400_000).toISOString() });
+
+    expect(existsSync(wt)).toBe(true);
+    pruneOldJobs(Date.now());
+
+    expect(getJob(sibling)).toBeNull();          // sibling row pruned
+    expect(getJob(owner)).not.toBeNull();        // owner kept (still fresh)
+    expect(existsSync(wt)).toBe(true);           // shared worktree survives the sibling prune
+
     try { rmSync(repo, { recursive: true, force: true }); } catch {}
   });
 

@@ -8,8 +8,9 @@ import { mkdirSync, writeFileSync, existsSync, unlinkSync } from 'fs';
 const STATE_DIR = join(tmpdir(), `wreport-state-${process.pid}`);
 process.env.WORKER_STATE_DIR = STATE_DIR;
 process.env.WORKER_REPORT_POLL_MS = '20';
+process.env.WORKER_NEAR_EXPIRY_MS = '30000'; // pin the band so isNearTimeout boundary asserts are deterministic
 
-import { terminalStatus, statusLine, wantsDiff, renderReport, waitForUnlock } from '../src/report.ts';
+import { terminalStatus, statusLine, wantsDiff, renderReport, waitForUnlock, isNearTimeout } from '../src/report.ts';
 import { insertJob, updateJob, appendLadder, chainLockPath } from '../src/state.ts';
 
 let seq = 0;
@@ -151,5 +152,39 @@ describe('waitForUnlock — anti-hang', () => {
     unlinkSync(lock);
     await p;
     expect(resolved).toBe(true);
+  });
+
+  it('breaks out with near_timeout when a watched running job crosses into the deadline band mid-wait', async () => {
+    const lock = join(STATE_DIR, `${uniq('lk')}.lock`);
+    writeFileSync(lock, ''); // lock never clears — only the deadline watch can end this wait
+    const handle = uniq('h');
+    insertJob({ handle, backend: 'cmd', sid: uniq('s'), repo: '/repo/z', log_path: '/tmp/z.log' });
+    updateJob(handle, { status: 'running', deadline_at: Date.now() + 60 }); // ~60ms out, well inside NEAR
+    const why = await waitForUnlock(lock, 0, handle);
+    expect(why).toBe('near_timeout');
+    expect(existsSync(lock)).toBe(true); // we bailed on the deadline, never cleared the lock
+    unlinkSync(lock);
+  });
+});
+
+describe('isNearTimeout — band predicate', () => {
+  const near = 30_000; // WORKER_NEAR_EXPIRY_MS default
+  const run = (deadline_at?: number, status = 'running') => ({ status, deadline_at });
+  it('fires inside [deadline-NEAR, deadline+NEAR] for a running job', () => {
+    const now = 1_000_000;
+    expect(isNearTimeout(run(now + near - 1), now)).toBe(true);
+    expect(isNearTimeout(run(now - near + 1), now)).toBe(true);
+  });
+  it('stays quiet outside the band', () => {
+    const now = 1_000_000;
+    expect(isNearTimeout(run(now + near + 1), now)).toBe(false); // too early
+    expect(isNearTimeout(run(now - near - 1), now)).toBe(false); // long past — grace/kill territory
+  });
+  it('ignores non-running jobs and missing/zero deadlines', () => {
+    const now = 1_000_000;
+    expect(isNearTimeout(run(now, 'done'), now)).toBe(false);
+    expect(isNearTimeout(run(undefined), now)).toBe(false);
+    expect(isNearTimeout(run(0), now)).toBe(false);
+    expect(isNearTimeout(null, now)).toBe(false);
   });
 });

@@ -1,14 +1,14 @@
 import { spawn } from 'child_process';
 import { openSync, closeSync, writeSync } from 'fs';
 import { updateJob, getJob, finalizeJob } from './state.ts';
-import { emitsJsonLog, type Backend } from './backends.ts';
+import { emitsJsonLog, QUIET_BACKENDS, type Backend } from './backends.ts';
 import { readSentinel } from './logParse.ts';
 import { resolveStatus } from './status.ts';
 import { killProcessTree } from './process.ts';
 import { startActivityMonitor } from './monitor.ts';
 import { maybeVerifyAndCommit } from './commit.ts';
 
-import { defaultTimeoutMs, workerEnv, watchdogMs, stallTimeoutMs, graceMs } from './env.ts';
+import { defaultTimeoutMs, workerEnv, watchdogMs, stallTimeoutMs, quietStallMs, graceMs } from './env.ts';
 
 export type RunResult = {
   status: string;
@@ -40,7 +40,8 @@ function launchAndWait(
   handle: string,
   backend: Backend,
   logPath: string,
-  timeoutMs: number = defaultTimeoutMs(),
+  timeoutMs?: number,
+  deadlineAt?: number,
 ): Promise<{ rc: number; timedOut: boolean; stalled: boolean }> {
   return new Promise((resolve) => {
     const logFd = openSync(logPath, 'a');
@@ -52,9 +53,10 @@ function launchAndWait(
       detached: true,
     });
     const startMs = Date.now();
+    const deadline = deadlineAt ?? (startMs + (timeoutMs ?? defaultTimeoutMs()));
 
     if (proc.pid) {
-      try { updateJob(handle, { worker_pid: proc.pid, deadline_at: startMs + timeoutMs }); } catch {}
+      try { updateJob(handle, { worker_pid: proc.pid, deadline_at: deadline }); } catch {}
     }
 
     let rc = 0;
@@ -98,7 +100,7 @@ function launchAndWait(
       if (deadline && now >= deadline + graceMs()) { killAtGrace(); return; }
 
       if (mon.sig !== lastSig) { lastSig = mon.sig; lastActivityAt = mon.at; }
-      else if (now - lastActivityAt >= stallTimeoutMs()) {
+      else if (now - lastActivityAt >= (QUIET_BACKENDS.has(backend) ? quietStallMs() : stallTimeoutMs())) {
         killOnStallAndFinish();
         return;
       }
@@ -126,8 +128,9 @@ export async function runWorker(
   logPath: string,
   resumeToken: string,
   timeoutMs?: number,
+  deadlineAt?: number,
 ): Promise<RunResult> {
-  const { rc, timedOut, stalled } = await launchAndWait(argv, repo, handle, backend, logPath, timeoutMs);
+  const { rc, timedOut, stalled } = await launchAndWait(argv, repo, handle, backend, logPath, timeoutMs, deadlineAt);
   let status: string;
   if (stalled) {
     status = 'stalled';

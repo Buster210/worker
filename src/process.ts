@@ -1,14 +1,14 @@
 import { spawnSync } from 'child_process';
 
-export function listDescendants(pid: number): number[] {
+// Single `ps` snapshot of the whole process table → parent→children map.
+// Returns null when ps yields nothing (caller falls back to the pgrep walk).
+function buildChildMap(): Map<number, number[]> | null {
   const psResult = spawnSync('ps', ['-axo', 'pid=,ppid='], {
     stdio: ['ignore', 'pipe', 'ignore'],
     encoding: 'utf8',
   });
   const stdout = psResult.stdout ?? '';
-  if (!stdout) {
-    return listDescendantsLegacy(pid);
-  }
+  if (!stdout) return null;
   const childrenByPid = new Map<number, number[]>();
   for (const line of stdout.split('\n')) {
     const trimmed = line.trim();
@@ -22,6 +22,11 @@ export function listDescendants(pid: number): number[] {
     if (!arr) { arr = []; childrenByPid.set(parent, arr); }
     arr.push(child);
   }
+  return childrenByPid;
+}
+
+// Walk a prebuilt child map from `pid` down, returning all descendant pids.
+function walkTree(childrenByPid: Map<number, number[]>, pid: number): number[] {
   const result: number[] = [];
   const stack = [pid];
   while (stack.length > 0) {
@@ -31,6 +36,12 @@ export function listDescendants(pid: number): number[] {
     for (const k of kids) { result.push(k); stack.push(k); }
   }
   return result;
+}
+
+export function listDescendants(pid: number): number[] {
+  const map = buildChildMap();
+  if (!map) return listDescendantsLegacy(pid);
+  return walkTree(map, pid);
 }
 
 function listDescendantsLegacy(pid: number): number[] {
@@ -67,6 +78,30 @@ export function killProcessTree(pid: number, sig: NodeJS.Signals | number = 'SIG
   // No loop, no sleep — a single extra pass is enough.
   for (const survivor of listDescendants(pid)) {
     try { process.kill(survivor, sig); } catch {}
+  }
+}
+
+// Batch form of killProcessTree: kill many trees from ONE `ps` snapshot instead of
+// a doubled enumeration per pid (2 ps calls total, not 2×N). Same per-tree semantics
+// — snapshot → group-kill → kill captured descendants → one survivor re-pass. Used at
+// server shutdown when every worker dies at once.
+export function killProcessTrees(pids: number[], sig: NodeJS.Signals | number = 'SIGKILL'): void {
+  const live = pids.filter(p => p > 0);
+  if (live.length === 0) return;
+  const map = buildChildMap();
+  if (!map) { for (const pid of live) killProcessTree(pid, sig); return; }
+  for (const pid of live) {
+    const descendants = walkTree(map, pid);
+    try { process.kill(-pid, sig); } catch {}
+    for (const child of descendants) { try { process.kill(child, sig); } catch {} }
+  }
+  // Single survivor pass across all trees (darwin reparenting between snapshot and kill).
+  // If the second snapshot is empty (transient ps failure), fall back per-pid to
+  // listDescendants — which carries the pgrep legacy path — matching killProcessTree.
+  const map2 = buildChildMap();
+  for (const pid of live) {
+    const survivors = map2 ? walkTree(map2, pid) : listDescendants(pid);
+    for (const survivor of survivors) { try { process.kill(survivor, sig); } catch {} }
   }
 }
 

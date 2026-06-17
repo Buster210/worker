@@ -63,12 +63,24 @@ function ownerDead(serverPid: number): boolean {
   catch (e) { return (e as NodeJS.ErrnoException).code === 'ESRCH'; }
 }
 
-export async function waitForUnlock(lockPath: string, serverPid = 0): Promise<void> {
-  if (!existsSync(lockPath)) return;
-  const { promise, resolve } = Promise.withResolvers<void>();
+// True when a still-running job sits inside the [deadline-NEAR, deadline+NEAR] window —
+// the band where we stop blocking and surface a NEAR_TIMEOUT bundle so the caller can extend.
+export function isNearTimeout(job: { status: string; deadline_at?: number } | null | undefined, now: number): boolean {
+  if (!job || job.status !== 'running') return false;
+  const deadline = job.deadline_at ?? 0;
+  const nearMs = nearExpiryMs();
+  return deadline > 0 && deadline - now <= nearMs && deadline - now > -nearMs;
+}
+
+// 'unlocked' = lock cleared or owner died (caller renders the terminal report);
+// 'near_timeout' = job entered the near-deadline band mid-wait (caller prints the NEAR_TIMEOUT line).
+export async function waitForUnlock(lockPath: string, serverPid = 0, handle?: string): Promise<'unlocked' | 'near_timeout'> {
+  if (!existsSync(lockPath)) return 'unlocked';
+  const { promise, resolve } = Promise.withResolvers<'unlocked' | 'near_timeout'>();
   const interval = setInterval(() => {
-    if (!existsSync(lockPath)) { clearInterval(interval); resolve(); return; }
-    if (ownerDead(serverPid)) { clearInterval(interval); resolve(); }
+    if (!existsSync(lockPath)) { clearInterval(interval); resolve('unlocked'); return; }
+    if (handle && isNearTimeout(getJobFresh(handle), Date.now())) { clearInterval(interval); resolve('near_timeout'); return; }
+    if (ownerDead(serverPid)) { clearInterval(interval); resolve('unlocked'); }
   }, reportPollMs());
   interval.unref?.();
   return promise;
@@ -84,10 +96,26 @@ function logMtimeMs(logPath: string): number {
   try { return statSync(logPath).mtimeMs; } catch { return 0; }
 }
 
+// One dense line: is the worker still moving, how stale, what it has touched, and how to extend
+// before the grace window hard-kills it. Emitted instead of blocking when isNearTimeout() is true.
+export function nearTimeoutLine(handle: string, job: { log_path: string; worktree_path?: string; repo: string }): string {
+  const now = Date.now();
+  const lastMtime = logMtimeMs(job.log_path);
+  const secsSinceActivity = lastMtime > 0 ? Math.round((now - lastMtime) / 1000) : -1;
+  const working = lastMtime > 0 && (now - lastMtime) < 5_000; // no log activity near the deadline = stalled, not working
+  const stat = gitDiffStat(job.worktree_path ?? job.repo);
+  const statLine = stat ? ` · ${stat.split('\n').pop() ?? ''}` : '';
+  const activityPart = secsSinceActivity >= 0 ? `last-activity ${secsSinceActivity}s ago` : 'no activity';
+  const graceSec = Math.round(graceMs() / 1000);
+  return `NEAR_TIMEOUT ${handle} · ${working ? 'working' : 'stalled'} · ${activityPart}${statLine} · keep going: worker_extend(${handle},<secs>) · let it end: worker-report ${handle} --wait (blocks to final) — else hard-killed ${graceSec}s past deadline`;
+}
+
 if (import.meta.main) {
-  const handle = process.argv[2];
+  const argv = process.argv.slice(2);
+  const wait = argv.includes('--wait'); // --wait = block straight through to the terminal report, ignoring the near-timeout signal
+  const handle = argv.find(a => !a.startsWith('-'));
   if (!handle) {
-    console.error('usage: worker-report <handle>');
+    console.error('usage: worker-report <handle> [--wait]');
     process.exit(1);
   }
   const job = getJobFresh(handle);
@@ -96,23 +124,19 @@ if (import.meta.main) {
     process.exit(1);
   }
 
-  // Pre-expiry early return: if the job is still running and we're within
-  // NEAR_MS of deadline_at, emit a single dense status bundle instead of blocking.
-  const now = Date.now();
-  const deadline = job.deadline_at ?? 0;
-  const nearMs = nearExpiryMs();
-  if (job.status === 'running' && deadline > 0 && deadline - now <= nearMs && deadline - now > -nearMs) {
-    const lastMtime = logMtimeMs(job.log_path);
-    const secsSinceActivity = lastMtime > 0 ? Math.round((now - lastMtime) / 1000) : -1;
-    const working = lastMtime <= 0 || (now - lastMtime) < 5_000;
-    const stat = gitDiffStat(job.worktree_path ?? job.repo);
-    const statLine = stat ? ` · ${stat.split('\n').pop() ?? ''}` : '';
-    const activityPart = secsSinceActivity >= 0 ? `last-activity ${secsSinceActivity}s ago` : 'no activity';
-    const graceSec = Math.round(graceMs() / 1000);
-    console.log(`NEAR_TIMEOUT ${handle} · ${working ? 'working' : 'stalled'} · ${activityPart}${statLine} · extend: worker_extend(${handle},<secs>) — else hard-killed ${graceSec}s past deadline`);
+  // Pre-expiry early return: if the job is already inside the near-deadline band, emit a single
+  // dense status bundle instead of blocking. Otherwise block on the completion lock, but keep
+  // watching the deadline — a job that crosses into the band mid-wait breaks out with NEAR_TIMEOUT
+  // so the caller can extend before the grace window hard-kills it.
+  if (!wait && isNearTimeout(job, Date.now())) {
+    console.log(nearTimeoutLine(handle, job));
   } else {
     const lock = job.completion_lock || lockPath(handle, job.repo);
-    await waitForUnlock(lock, job.server_pid);
-    console.log(renderReport(handle, lock));
+    const why = await waitForUnlock(lock, job.server_pid, wait ? undefined : handle);
+    if (why === 'near_timeout') {
+      console.log(nearTimeoutLine(handle, getJobFresh(handle) ?? job));
+    } else {
+      console.log(renderReport(handle, lock));
+    }
   }
 }

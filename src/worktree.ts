@@ -1,5 +1,6 @@
 import { spawn, spawnSync } from 'child_process';
-import { join } from 'path';
+import { rmSync } from 'fs';
+import { isAbsolute, join } from 'path';
 import { handleDir } from './state.ts';
 
 export function addWorktree(repo: string, handle: string): string {
@@ -33,6 +34,20 @@ export function removeWorktree(repo: string, path: string): void {
     const handle = parts[parts.length - 2]; // path = .../workers/<project>/<handle>/tree
     spawnSync('git', ['-C', repo, 'branch', '-D', `worker/${handle}`], { encoding: 'utf8' });
   } catch {}
+}
+
+// A SIGKILL'd rung can leave .git/index.lock in the worktree it was using, which blocks every git
+// op of the next rung that reuses it. Safe to clear: the ladder reuses a worktree only after its
+// prior occupant has terminated (stall→SIGKILL or fail→exit), so there is no live writer.
+// ponytail: no live-process check — reuse-after-termination is the only caller; if that ever stops
+// holding, gate on `git rev-parse` of the lock's pid instead.
+export function clearStaleIndexLock(worktree: string): void {
+  const r = spawnSync('git', ['-C', worktree, 'rev-parse', '--git-path', 'index.lock'], { encoding: 'utf8' });
+  if (r.status !== 0 || typeof r.stdout !== 'string') return;
+  const rel = r.stdout.trim();
+  if (!rel) return;
+  const abs = isAbsolute(rel) ? rel : join(worktree, rel);
+  try { rmSync(abs, { force: true }); } catch {}
 }
 
 export function listWorktrees(repo: string): string[] {
