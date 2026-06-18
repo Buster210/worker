@@ -4,6 +4,7 @@ import { join } from 'path';
 import { existsSync } from 'fs';
 import { tailCapped } from './logParse.ts';
 import { FILE_CONFIG, type FileConfig } from './config.ts';
+import { authProbeMs, maxTurns } from './env.ts';
 
 export type Backend = 'pool' | 'omp' | 'opencode' | 'cmd' | 'claude' | 'claude_tmux' | 'codex';
 
@@ -30,7 +31,7 @@ function checkLegacyLadder(): void {
 function probeAuth(be: 'cmd' | 'codex'): boolean {
   const argv = be === 'cmd' ? ['cmd', 'status'] : ['codex', 'login', 'status'];
   const r = spawnSync(argv[0], argv.slice(1), {
-    timeout: 10_000,
+    timeout: authProbeMs(),
     stdio: ['ignore', 'ignore', 'ignore'],
   });
   if (r.error) return (r.error as NodeJS.ErrnoException).code !== 'ENOENT'; // missing -> drop; transient -> keep
@@ -63,7 +64,7 @@ export function computeLadder(
     if (typeof be === 'string' && validSet.has(be)) skipSet.add(be);
   }
 
-  const keep = (be: Backend) => !skipSet.has(be) && (be !== 'cmd' && be !== 'codex' || isAuthed(be));
+  const keep = (be: Backend) => !skipSet.has(be) && ((be !== 'cmd' && be !== 'codex') || isAuthed(be));
   const defaultOrder: Backend[] = ALL_BACKENDS.filter(keep);
 
   const raw = cfg.ladder;
@@ -106,7 +107,7 @@ export function buildRunArgv(backend: Backend, spec: string, repo: string, sid: 
     case 'omp':
       return ['omp', '-p', spec, '--session-dir', handleDir(sid, repo), '--approval-mode=yolo', '--mode=json', ...(extraArgs ?? [])];
     case 'cmd':
-      return ['cmd', '-p', spec, '--yolo', '-t', '--skip-onboarding', '--max-turns', '10000', '--add-dir', repo, ...(model ? ['--model', model] : []), ...(extraArgs ?? [])];
+      return ['cmd', '-p', spec, '--yolo', '-t', '--skip-onboarding', '--max-turns', String(maxTurns()), '--add-dir', repo, ...(model ? ['--model', model] : []), ...(extraArgs ?? [])];
     case 'opencode':
       return ['opencode', 'run', spec, '--dir', repo, '--dangerously-skip-permissions', '--format', 'json', ...(model ? ['-m', model] : []), ...(extraArgs ?? [])];
     case 'pool':
@@ -129,7 +130,7 @@ export function buildResumeArgv(backend: Backend, spec: string, repo: string, to
     case 'pool':
       return ['pool', 'exec', '-p', spec, '-d', repo, '--unsafe-auto-allow', '--continue', token, ...(extraArgs ?? [])];
     case 'cmd':
-      return ['cmd', '-p', spec, '--yolo', '-t', '--skip-onboarding', '--max-turns', '10000', '--add-dir', repo, ...(model ? ['--model', model] : []), ...(extraArgs ?? [])];
+      return ['cmd', '-p', spec, '--yolo', '-t', '--skip-onboarding', '--max-turns', String(maxTurns()), '--add-dir', repo, ...(model ? ['--model', model] : []), ...(extraArgs ?? [])];
     case 'codex':
       return ['codex', 'exec', 'resume', '--last', '--json', '--skip-git-repo-check', '--dangerously-bypass-approvals-and-sandbox', ...(model ? ['-m', model] : []), spec];
     default:

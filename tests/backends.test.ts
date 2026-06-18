@@ -132,6 +132,13 @@ describe('buildResumeArgv', () => {
     ]);
   });
 
+  it('builds cmd resume argv with --max-turns at default 10000', () => {
+    const argv = buildResumeArgv('cmd', 'spec', '/repo', 'tok');
+    const idx = argv.indexOf('--max-turns');
+    expect(idx).not.toBe(-1);
+    expect(argv[idx + 1]).toBe('10000');
+  });
+
   it('throws for unknown backend and lists valid backends', () => {
     expect(() => buildResumeArgv('bogus' as Backend, 'spec', '/repo', 'token'))
       .toThrow(`Unknown backend: bogus. Valid: ${ALL_BACKENDS.join(', ')}`);

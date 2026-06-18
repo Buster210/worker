@@ -15,6 +15,8 @@ export function quietStallMs(): number { return envMs('WORKER_STALL_MS_QUIET', 2
 export function reapAgeMs(): number { return envMs('WORKER_REAP_MS', 900_000); }
 export function nearExpiryMs(): number { return envMs('WORKER_NEAR_EXPIRY_MS', 30_000); }
 export function graceMs(): number { return envMs('WORKER_GRACE_MS', 60_000); }
+export function authProbeMs(): number { return envMs('WORKER_AUTH_PROBE_MS', 2_000); }
+export function maxTurns(): number { return envMs('WORKER_MAX_TURNS', 10_000); }
 
 const HOME = process.env.HOME ?? '';
 
