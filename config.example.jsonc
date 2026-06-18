@@ -1,0 +1,30 @@
+{
+  // Backend try-order, highest priority first. Subset/reorder of:
+  // "codex" | "cmd" | "pool" | "omp" | "opencode" | "claude" | "claude_tmux"
+  "ladder": ["codex", "cmd", "pool", "omp", "opencode", "claude", "claude_tmux"],
+
+  // Backend names to remove from the ladder. Same names as above. [] = skip none.
+  "skip": [],
+
+  // Verify-gate shell command run before commit; non-zero exit aborts commit.
+  // "" = no gate. e.g. "bun run typecheck" or "bun test"
+  "verifyCmd": "",
+
+  // Worker state dir. Absolute path. "" = default ~/.claude/workers
+  "stateDir": "",
+
+  // Spec-file dir read by worker_ladder. Absolute path. "" = default ~/.claude/plans
+  "plansDir": "",
+
+  // Finished-job retention before cleanup, milliseconds. Must be > 0 to apply; 0 = default.
+  "retainMs": 0,
+
+  // worker-report poll interval, milliseconds. Must be > 0 to apply; 0 = default.
+  "reportPollMs": 0,
+
+  // Shell rc file sourced for spawn env. Absolute path. "" = none.
+  "rc": "",
+
+  // Source login shell to capture env for spawns. true | false
+  "loginShell": true
+}
