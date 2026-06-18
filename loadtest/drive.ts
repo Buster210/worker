@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync, rmSync } from 'fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, chmodSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { spawnSync } from 'child_process';
@@ -6,9 +6,17 @@ import { spawnSync } from 'child_process';
 const STATE = mkdtempSync(join(tmpdir(), 'load-state-'));
 const REPO = mkdtempSync(join(tmpdir(), 'load-repo-'));
 
+// workerEnv() hard-prepends ${HOME}/.bun/bin to the worker PATH, so a real ~/.bun/bin/omp would
+// shadow the loadtest stub and silently drive real agents (burning API). Run under a fake HOME whose
+// .bun/bin/omp IS the stub. HOME is captured at env.ts load time -> set before the dynamic import.
+const FAKEHOME = mkdtempSync(join(tmpdir(), 'load-home-'));
+mkdirSync(join(FAKEHOME, '.bun', 'bin'), { recursive: true });
+chmodSync(join(process.cwd(), 'loadtest', 'stub-omp.sh'), 0o755);
+symlinkSync(join(process.cwd(), 'loadtest', 'stub-omp.sh'), join(FAKEHOME, '.bun', 'bin', 'omp'));
+
+process.env.HOME = FAKEHOME;
 process.env.WORKER_STATE_DIR = STATE;
 process.env.WORKER_LOGIN_SHELL = '0';
-process.env.SKIP_omp = '1';
 process.env.SKIP_codex = '1';
 process.env.SKIP_pool = '1';
 process.env.SKIP_cmd = '1';
@@ -17,7 +25,6 @@ process.env.SKIP_claude = '1';
 process.env.SKIP_claude_tmux = '1';
 process.env.WORKER_POLL_MS = String(parseInt(process.env.LOAD_POLL_MS ?? '500', 10));
 process.env.WORKER_RESUME_POLL_MS = String(parseInt(process.env.LOAD_RESUME_POLL_MS ?? '500', 10));
-process.env.PATH = `${process.env.HOME}/.bun/bin:/usr/local/bin:/usr/bin:/bin:${process.cwd()}/loadtest`;
 
 spawnSync('git', ['init', '-q'], { cwd: REPO });
 spawnSync('git', ['-C', REPO, 'config', 'user.email', 'load@test']);
@@ -71,6 +78,9 @@ const failed = results.filter(r => r.status === 'rejected' || (r.status === 'ful
 console.log(`\nelapsed: ${elapsed}ms`);
 console.log(`statuses: ${statuses.join(' ')}`);
 console.log(`failed: ${failed.length}/${N}`);
+for (const [i, r] of results.entries()) {
+  if (r.status === 'rejected') console.log(`REJECT ${handles[i].handle.slice(0, 12)}: ${r.reason?.message ?? r.reason}`);
+}
 
 if (rssSamples.length > 0) {
   const avgRss = rssSamples.reduce((a, b) => a + b, 0) / rssSamples.length;

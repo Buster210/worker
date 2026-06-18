@@ -12,16 +12,51 @@ export function addWorktree(repo: string, handle: string): string {
   return path;
 }
 
+// Concurrent `git worktree add` on one repo races two ways: the .git/config.lock / worktrees lock,
+// and — because every worktree leaf is named `tree`, so git auto-numbers the admin ids tree/tree1/…
+// non-atomically — a read of a sibling's half-written .git/worktrees/treeN/commondir. Both are
+// transient: a staggered retry lets the winning sibling finish, then the loser gets a fresh id.
+// ponytail: bounded jittered retry on the transient git-races only; real errors (branch exists, bad
+// HEAD) don't match and fail fast. If contention ever outlasts the budget, raise the retry cap.
+const WORKTREE_ADD_RETRIES = 6;
+const WORKTREE_ADD_TRANSIENT = /lock|commondir|failed to read|Undefined error|No such file/i;
+
+// All worktree leaves are named `tree`, so concurrent `git worktree add` auto-number their admin ids
+// (tree/tree1/…) non-atomically and read each other's half-written .git/worktrees/treeN/commondir.
+// Every launch in this server shares one process, so a single in-process queue makes the adds run one
+// at a time — the race is gone at the source. The worker RUN stays parallel; only the ~50ms add
+// serializes. The jittered retry below is the cross-process backstop (a second server on the repo).
+let _addQueue: Promise<unknown> = Promise.resolve();
+
+function gitWorktreeAdd(repo: string, handle: string, path: string, branch: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const run = async () => {
+      for (let attempt = 1; ; attempt++) {
+        const err = await new Promise<string | null>(res => {
+          const stderr: Buffer[] = [];
+          const p = spawn('git', ['-C', repo, 'worktree', 'add', '-b', branch, path, 'HEAD'], { stdio: ['ignore', 'ignore', 'pipe'] });
+          p.stderr?.on('data', (d: Buffer) => stderr.push(d));
+          p.on('close', code => res(code === 0 ? null : Buffer.concat(stderr).toString().trim()));
+          p.on('error', e => res(e.message));
+        });
+        if (err === null) return;
+        if (attempt >= WORKTREE_ADD_RETRIES || !WORKTREE_ADD_TRANSIENT.test(err)) {
+          throw new Error(`worktree add failed for ${handle}: ${err}`);
+        }
+        await new Promise(r => setTimeout(r, attempt * 40 + Math.floor(Math.random() * 60)));
+      }
+    };
+    // chain onto the queue so only one add runs at a time; a failed add must not break the chain
+    const done = _addQueue.then(run, run);
+    _addQueue = done.catch(() => {});
+    done.then(resolve, reject);
+  });
+}
+
 export async function addWorktreeAsync(repo: string, handle: string): Promise<string> {
   const path = join(handleDir(handle, repo), 'tree');
   const branch = `worker/${handle}`;
-  await new Promise<void>((resolve, reject) => {
-    const stderr: Buffer[] = [];
-    const p = spawn('git', ['-C', repo, 'worktree', 'add', '-b', branch, path, 'HEAD'], { stdio: ['ignore', 'ignore', 'pipe'] });
-    p.stderr?.on('data', (d: Buffer) => stderr.push(d));
-    p.on('close', code => code === 0 ? resolve() : reject(new Error(`worktree add failed for ${handle}: ${Buffer.concat(stderr).toString().trim()}`)));
-    p.on('error', err => reject(new Error(`worktree add failed for ${handle}: ${err.message}`)));
-  });
+  await gitWorktreeAdd(repo, handle, path, branch);
   return path;
 }
 
