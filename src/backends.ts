@@ -1,4 +1,4 @@
-import { handleDir, workersDir } from './state.ts';
+import { handleDirUncached, workersDir } from './state.ts';
 import { spawnSync } from 'child_process';
 import { join } from 'path';
 import { existsSync } from 'fs';
@@ -105,7 +105,7 @@ export function buildRunArgv(backend: Backend, spec: string, repo: string, sid: 
     case 'claude':
       return ['claude', '-p', spec, '--session-id', sid, '--model', 'sonnet', '--dangerously-skip-permissions', '--add-dir', repo, ...(extraArgs ?? [])];
     case 'omp':
-      return ['omp', '-p', spec, '--session-dir', handleDir(sid, repo), '--approval-mode=yolo', '--mode=json', ...(extraArgs ?? [])];
+      return ['omp', '-p', spec, '--session-dir', handleDirUncached(sid, repo), '--approval-mode=yolo', '--mode=json', ...(extraArgs ?? [])];
     case 'cmd':
       return ['cmd', '-p', spec, '--yolo', '-t', '--skip-onboarding', '--max-turns', String(maxTurns()), '--add-dir', repo, ...(model ? ['--model', model] : []), ...(extraArgs ?? [])];
     case 'opencode':
@@ -124,7 +124,7 @@ export function buildResumeArgv(backend: Backend, spec: string, repo: string, to
     case 'claude':
       return ['claude', '-p', spec, '--resume', token, '--model', 'sonnet', '--dangerously-skip-permissions', '--add-dir', repo, ...(extraArgs ?? [])];
     case 'omp':
-      return ['omp', '-p', spec, '--session-dir', handleDir(token, repo), '--continue', '--approval-mode=yolo', '--mode=json', ...(extraArgs ?? [])];
+      return ['omp', '-p', spec, '--session-dir', handleDirUncached(token, repo), '--continue', '--approval-mode=yolo', '--mode=json', ...(extraArgs ?? [])];
     case 'opencode':
       return ['opencode', 'run', spec, '-s', token, '--dir', repo, '--dangerously-skip-permissions', '--format', 'json', ...(extraArgs ?? [])];
     case 'pool':

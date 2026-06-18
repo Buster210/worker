@@ -1,4 +1,4 @@
-import { appendLadder, chainLockPath, createChainLock, removeChainLock, getJob, saveChainMeta, loadChainMeta } from './state.ts';
+import { appendLadder, chainLockPath, createChainLock, removeChainLock, removeChainMeta, getJob, saveChainMeta, loadChainMeta } from './state.ts';
 import { LADDER, type Backend } from './backends.ts';
 import { type RunResult } from './runner.ts';
 import { launch, SERVER_STARTED } from './lifecycle.ts';
@@ -29,6 +29,11 @@ export function handleLadder(args: { sid: string; prompt: string; dir: string; t
     // so worker_extend can detect it; the deadline is re-read fresh so those bumps reach later rungs.
     runRung: (backend, seed) => {
       const firstJob = getJob(first.handle);
+      if (!firstJob || !firstJob.worktree_path) {
+        console.error(`[ladder] reuse worktree missing for chain ${sid} (first handle ${first.handle}); rung ${backend} runs in a fresh tree, prior work not carried`);
+      } else if (!firstJob.base_sha) {
+        console.error(`[ladder] reuse base_sha missing for chain ${sid}; report diff for rung ${backend} anchored to current HEAD, may omit committed work`);
+      }
       return launch(backend, prompt, dir, {
         sid,
         deadlineAt: effectiveChainDeadline(sid, chainDeadlineAt),
@@ -45,7 +50,7 @@ export function handleLadder(args: { sid: string; prompt: string; dir: string; t
       status: 'failed', exit_code: 1, backend: LADDER[0], handle: first.handle,
       resume_token: first.handle, repo: dir, log: '',
     }))
-    .finally(() => removeChainLock(sid));
+    .finally(() => { removeChainLock(sid); removeChainMeta(sid); });
 
   void chainPromise;
   return { handle: first.handle, status: 'running' };

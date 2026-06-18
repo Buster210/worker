@@ -72,9 +72,16 @@ export function resolveHandleDir(handle: string): string | null {
 
 const _handleDirCache = new Map<string, string>();
 
+// Pure path derivation, NO cache write. Use this where a caller needs a handle-scoped path from an
+// arbitrary base (e.g. omp's --session-dir is derived from the worktree path) WITHOUT redirecting the
+// handle's job record + lock — `handleDir` caches, so calling it with a non-repo base poisons every
+// later no-repo lookup (updateJob/finalizeJob/removeLock).
+export function handleDirUncached(handle: string, repo: string): string {
+  return join(workersDir(), projectName(repo), handle);
+}
 export function handleDir(handle: string, repo?: string): string {
   if (repo) {
-    const dir = join(workersDir(), projectName(repo), handle);
+    const dir = handleDirUncached(handle, repo);
     _handleDirCache.set(handle, dir);
     return dir;
   }
@@ -108,6 +115,7 @@ export function createChainLock(sid: string, ownerPid?: number, ownerStarted?: s
   try { writeFileSync(chainLockPath(sid), ownerPid != null ? `${ownerPid}\n${ownerStarted ?? ''}` : ''); } catch {}
 }
 export function removeChainLock(sid: string) { try { unlinkSync(chainLockPath(sid)); } catch {} }
+export function removeChainMeta(sid: string) { try { unlinkSync(chainMetaPath(sid)); } catch {} }
 
 export function saveChainMeta(sid: string, meta: ChainMeta): void {
   try { writeFileSync(chainMetaPath(sid), JSON.stringify(meta)); } catch {}

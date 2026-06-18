@@ -11,7 +11,7 @@ const PLANS_DIR = join(tmpdir(), `wstate-plans-${process.pid}`);
 process.env.WORKER_PLANS_DIR = PLANS_DIR;
 mkdirSync(PLANS_DIR, { recursive: true });
 
-import { finalizeJob, insertJob, getJob, getJobFresh, updateJob, workersDir, handleDir, resolveHandleDir, pruneOldJobs, readSpec, plansDir } from '../src/state.ts';
+import { finalizeJob, insertJob, getJob, getJobFresh, updateJob, workersDir, handleDir, handleDirUncached, lockPath, resolveHandleDir, pruneOldJobs, readSpec, plansDir, saveChainMeta, removeChainMeta, chainMetaPath } from '../src/state.ts';
 
 afterAll(() => {
   try { rmSync(STATE_DIR, { recursive: true, force: true }); } catch {}
@@ -229,5 +229,31 @@ describe('plansDir + readSpec', () => {
   it('rejects a bare filename containing ".." (no separator)', () => {
     expect(() => readSpec('foo..bar')).toThrow(/path traversal/);
     expect(() => readSpec('..foo')).toThrow(/path traversal/);
+  });
+});
+
+describe('removeChainMeta', () => {
+  it('deletes the .chain.meta file written by saveChainMeta', () => {
+    const sid = `test-chain-meta-${process.pid}-${Date.now()}`;
+    saveChainMeta(sid, { deadlineAt: Date.now() + 60_000 });
+    expect(existsSync(chainMetaPath(sid))).toBe(true);
+    removeChainMeta(sid);
+    expect(existsSync(chainMetaPath(sid))).toBe(false);
+  });
+});
+describe('handleDirUncached does not poison the handle-dir cache', () => {
+  it('finalizeJob writes to canonical dir even after handleDirUncached with foreign repo', () => {
+    const handle = `uncached-${process.pid}-${Date.now()}`;
+    const repo = `/tmp/wstate-cache-${process.pid}-${Date.now()}`;
+    insertJob({ handle, backend: 'omp', sid: 's', repo, log_path: join(STATE_DIR, 'logs', handle, 'run.log') });
+
+    // Simulate what omp argv builder does: derive a session-dir from the worktree path.
+    // This must NOT poison the cache so that finalizeJob writes to the canonical dir.
+    const wt = join(handleDir(handle, repo), 'tree');
+    handleDirUncached(handle, wt);
+
+    finalizeJob(handle, 'done');
+    expect(getJobFresh(handle)?.status).toBe('done');
+    expect(existsSync(lockPath(handle, repo))).toBe(false);
   });
 });

@@ -89,6 +89,7 @@ export function sweepChainLocks(): void {
           // Owner pid present — unlink only if owner is dead
           if (!isProcessAlive(pid, started || undefined)) {
             unlinkSync(lockFile);
+            try { unlinkSync(lockFile.replace(/\.chain\.lock$/, '.chain.meta')); } catch {}
           }
           continue;
         }
@@ -97,6 +98,7 @@ export function sweepChainLocks(): void {
       const mtime = statSync(lockFile).mtimeMs;
       if (Date.now() - mtime > reapAgeMs()) {
         unlinkSync(lockFile);
+        try { unlinkSync(lockFile.replace(/\.chain\.lock$/, '.chain.meta')); } catch {}
       }
     } catch {
       // Swallow per-file errors

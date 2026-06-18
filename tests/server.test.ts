@@ -12,7 +12,7 @@ process.env.WORKER_PLANS_DIR = PLANS_DIR;
 // server.ts only boots the stdio transport under `import.meta.main`, so importing it
 // here registers the tools as a side effect but does NOT connect/hang the test runner.
 import { reply, handleStatus, handleKill, handleResume, handleList, handleDoctor } from '../src/server.ts';
-import { insertJob, updateJob, finalizeJob, getJob, logPath as stateLogPath } from '../src/state.ts';
+import { insertJob, updateJob, finalizeJob, getJob, logPath as stateLogPath, appendLadder, chainLockPath } from '../src/state.ts';
 import { workerEnv } from '../src/env.ts';
 
 mkdirSync(PLANS_DIR, { recursive: true });
@@ -167,5 +167,37 @@ describe('handleDoctor — success path', () => {
       workerEnv().PATH = savedPath;
       try { rmSync(stubDir, { recursive: true, force: true }); } catch {}
     }
+  });
+});
+describe('handleStatus — chain handle', () => {
+  const chainHandles: string[] = [];
+  function seedChain(sid: string): string {
+    const handle = `srv-${process.pid}-${seq++}`;
+    chainHandles.push(handle);
+    insertJob({ handle, backend: 'codex', sid: 'test', repo: REPO, log_path: stateLogPath(handle, REPO), completion_lock: chainLockPath(sid) });
+    updateJob(handle, { status: 'failed' }); // first rung failed
+    return handle;
+  }
+
+  it('reports chain-terminal status when chain lock is absent (climbed chain)', () => {
+    const sid = `chain-${process.pid}-${seq++}`;
+    const handle = seedChain(sid);
+    appendLadder(sid, 1, 'codex', 'failed');
+    appendLadder(sid, 2, 'cmd', 'done');
+    try { rmSync(chainLockPath(sid), { force: true }); } catch {} // ensure chain lock absent (chain finished)
+    const s = handleStatus({ handle });
+    expect(s.status).toBe('done');   // NOT 'failed'
+    expect(s.alive).toBe(false);
+  });
+
+  it('reports "running" when chain lock is present (chain still running)', () => {
+    const sid2 = `chain-${process.pid}-${seq++}`;
+    const handle2 = seedChain(sid2);
+    appendLadder(sid2, 1, 'codex', 'failed');
+    writeFileSync(chainLockPath(sid2), ''); // chain lock present → running
+    const s2 = handleStatus({ handle: handle2 });
+    expect(s2.status).toBe('running');
+    expect(s2.alive).toBe(true);
+    try { rmSync(chainLockPath(sid2), { force: true }); } catch {}
   });
 });

@@ -3,7 +3,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import { randomUUID } from 'crypto';
 import { spawnSync } from 'child_process';
-
+import { existsSync } from 'fs';
 import {
   getJob, updateJob, finalizeJob, getAllJobs, pruneOldJobs, readSpec, loadChainMeta, saveChainMeta,
 } from './state.ts';
@@ -15,6 +15,7 @@ import { isProcessAlive } from './process.ts';
 import { sweepStaleJobs, reapStoppedJobs, sweepChainLocks } from './maintenance.ts';
 import { launch, forceKillJob, assertRepo, resumeLaunch as lifecycleResumeLaunch, shutdown, spawnReaper } from './lifecycle.ts';
 import { handleLadder } from './chain.ts';
+import { terminalStatus } from './report.ts';
 
 // --- MCP tool handlers (keep in server.ts) ---
 
@@ -72,6 +73,14 @@ export function handleStatus(args: { handle: string }): Record<string, unknown> 
   const { handle } = args;
   const job = getJob(handle);
   if (!job) throw new Error(`No job found: ${handle}`);
+  // A chain handle is just the FIRST rung — its own status goes stale once the chain climbs on.
+  // Mirror worker-report: while the chain lock exists the chain is running; once it is gone, report the
+  // chain's terminal status from ladder history so worker_status and worker-report agree.
+  const cl = job.completion_lock ?? '';
+  if (cl.endsWith('.chain.lock')) {
+    const running = existsSync(cl);
+    return { status: running ? 'running' : terminalStatus(handle, cl), alive: running, started: job.started };
+  }
   let alive = false;
   if (job.worker_pid && (job.status === 'running' || job.status === 'stopped')) {
     alive = isProcessAlive(job.worker_pid, job.started);
