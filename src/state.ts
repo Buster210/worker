@@ -112,12 +112,14 @@ export type ChainMeta = {
 };
 
 export function createChainLock(sid: string, ownerPid?: number, ownerStarted?: string) {
+  ensureLadderDir();
   try { writeFileSync(chainLockPath(sid), ownerPid != null ? `${ownerPid}\n${ownerStarted ?? ''}` : ''); } catch {}
 }
 export function removeChainLock(sid: string) { try { unlinkSync(chainLockPath(sid)); } catch {} }
 export function removeChainMeta(sid: string) { try { unlinkSync(chainMetaPath(sid)); } catch {} }
 
 export function saveChainMeta(sid: string, meta: ChainMeta): void {
+  ensureLadderDir();
   try { writeFileSync(chainMetaPath(sid), JSON.stringify(meta)); } catch {}
 }
 
@@ -289,7 +291,16 @@ export function __resetStateForTest(): void {
 }
 
 export function appendLadder(sid: string, turn: number, worker: string, result: string) {
-  appendFileSync(ladderPath(sid), JSON.stringify({ turn, worker, result, ts: new Date().toISOString() }) + '\n');
+  ensureLadderDir();
+  try {
+    appendFileSync(ladderPath(sid), JSON.stringify({ turn, worker, result, ts: new Date().toISOString() }) + '\n');
+  } catch (err) {
+    console.error(`appendLadder: write failed (sid=${sid} turn=${turn} worker=${worker}): ${err}`);
+  }
+}
+
+function ensureLadderDir(): void {
+  try { mkdirSync(join(workersDir(), 'ladder'), { recursive: true }); } catch {}
 }
 
 export function getLadderHistory(sid: string): { turn: number; worker: string; result: string }[] {

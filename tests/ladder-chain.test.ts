@@ -129,6 +129,16 @@ describe('runLadderChain (auto-climb controller)', () => {
     expect(d.runCalls).toEqual([]);                // killed → chain stops, no climb
   });
 
+  it('climbs despite a missing ladder/ dir (ensureLadderDir resilience)', async () => {
+    const sid = nextSid();
+    const d = scriptedDrivers({ rungs: ['done'] });
+    const deadline = Date.now() + 600_000;
+    rmSync(join(STATE_DIR, 'ladder'), { recursive: true, force: true });
+    const final = await runLadderChain(sid, Promise.resolve(res('failed')), d, deadline);
+    expect(final.status).toBe('done');
+    expect(d.runCalls).toEqual([LADDER[1]]);
+  });
+
   it('KNOWN GAP: no total wall-clock cap — retries + climbs every rung, each with the FULL per-rung timeout', async () => {
     // The caller's `timeout` is applied PER RUNG, not across the chain: handleLadder computes
     // timeoutMs once and hands the SAME value to every launch (chain.ts). runLadderChain has no
