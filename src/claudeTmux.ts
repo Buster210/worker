@@ -97,13 +97,20 @@ export async function runClaudeTmux(
   const deadline = deadlineAt ?? (Date.now() + (timeoutMs ?? defaultTimeoutMs()));
   let stopped = false;
 
+  // ponytail: doneFile read is a cheap syscall (keep at 1s); `tmux has-session`
+  // spawns a subprocess — throttle to 5s. cuts ~600 spawns/10min to ~120.
+  let lastLiveCheck = 0;
   while (Date.now() < deadline) {
     try {
       const content = readFileSync(doneFile, 'utf8');
       if (content.trim().length > 0) { stopped = true; break; }
     } catch {}
-    try { execSync(`tmux has-session -t ${sid} 2>/dev/null`, { stdio: 'ignore' }); }
-    catch { stopped = true; break; }
+    const now = Date.now();
+    if (now - lastLiveCheck >= 5000) {
+      lastLiveCheck = now;
+      try { execSync(`tmux has-session -t ${sid} 2>/dev/null`, { stdio: 'ignore' }); }
+      catch { stopped = true; break; }
+    }
     await Bun.sleep(1000);
   }
 
