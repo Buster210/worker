@@ -17,7 +17,7 @@ import { reaperPidPath } from './state.ts';
 import { spawnSync } from 'child_process';
 import { unlinkSync, writeFileSync } from 'fs';
 
-const SWEEP_INTERVAL_MS = envMs('WORKER_REAPER_MS', 2_000);
+const SWEEP_INTERVAL_MS = envMs('WORKER_REAPER_MS', 10_000);
 // The server entry's path tail (e.g. "src/server.ts"), derived from this file's sibling.
 // Matching the tail — not the absolute path — catches the server whether Claude Code
 // launched it absolute (the mcp config form) or relative (dev/manual). Safe direction:

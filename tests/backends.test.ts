@@ -8,7 +8,7 @@ import { tmpdir } from 'os';
 
 describe('buildSpec', () => {
   it('wraps prompt with PREAMBLE and CONTRACT for non-claude backend (cmd)', () => {
-    const spec = buildSpec('cmd', 'test prompt');
+    const spec = buildSpec('test prompt');
     expect(spec).toContain('test prompt');
     expect(spec).toContain('senior coding worker');
     expect(spec).toContain('DONE');
@@ -17,7 +17,7 @@ describe('buildSpec', () => {
   });
 
   it('wraps prompt with PREAMBLE and CONTRACT for claude backend', () => {
-    const spec = buildSpec('claude', 'test prompt');
+    const spec = buildSpec('test prompt');
     expect(spec).toContain('test prompt');
     expect(spec).toContain('senior coding worker');
     expect(spec).toContain('DONE');
@@ -26,7 +26,7 @@ describe('buildSpec', () => {
   });
 
   it('wraps prompt with PREAMBLE and CONTRACT for codex backend', () => {
-    const spec = buildSpec('codex', 'test prompt');
+    const spec = buildSpec('test prompt');
     expect(spec).toContain('test prompt');
     expect(spec).toContain('senior coding worker');
     expect(spec).toContain('DONE');
@@ -36,15 +36,15 @@ describe('buildSpec', () => {
 
   it('all backends produce identical structure (preamble + task + contract)', () => {
     const backends: Backend[] = ['codex', 'cmd', 'pool', 'omp', 'opencode', 'claude', 'claude_tmux'];
-    const specs = backends.map(be => buildSpec(be, 'my task'));
-    // All specs are identical — backend param is unused
+    const specs = backends.map(() => buildSpec('my task'));
+    // All specs are identical — spec is backend-independent
     for (const spec of specs) {
       expect(spec).toBe(specs[0]);
     }
   });
 
   it('PREAMBLE step-5 tells the agent NOT to commit (harness owns the commit)', () => {
-    const spec = buildSpec('claude', 'my task');
+    const spec = buildSpec('my task');
     expect(spec).toContain('Do NOT commit');
     expect(spec).toContain('harness makes the atomic commit on green');
     // The old instruction must be gone

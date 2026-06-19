@@ -105,10 +105,6 @@ export function killProcessTrees(pids: number[], sig: NodeJS.Signals | number = 
   }
 }
 
-export function killGroup(pid: number, sig: 'SIGTERM' | 'SIGKILL' | 'SIGSTOP' = 'SIGTERM') {
-  try { process.kill(-pid, sig); } catch {}
-}
-
 const ETIME_RE = /^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/;
 export function parseEtimeSeconds(etime: string): number | null {
   const m = etime.trim().match(ETIME_RE);

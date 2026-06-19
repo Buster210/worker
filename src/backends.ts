@@ -95,8 +95,7 @@ export const LADDER: Backend[] = computeLadder();
 const PREAMBLE = `You are a senior coding worker. Deliver mature, pragmatic, production-grade code. Work in order: (1) understand the task; touch only what it requires. (2) Plan in place only; do NOT enter plan mode. Take the laziest solution that works — does it need to exist (YAGNI)? → stdlib → native feature → already-installed dep → one line → minimal code; stop at the first rung that holds. No speculative abstraction, no boilerplate-for-later; deletion over addition; shortest working diff. (3) Implement. (4) Test, run, and verify. (5) Review the result against every requirement in the spec and confirm the deliverables exist as saved files. Only then signal DONE; otherwise FAILED:<reason>. Do NOT commit — the harness makes the atomic commit on green. Priorities: correctness > security > clarity > performance > brevity. Full standards: ~/.claude/skills/coding-standards/SKILL.md.`;
 const CONTRACT = `\nMake only the changes the task requires. Stop when done. Final reply = ONE line: "DONE" or "FAILED:<reason>". Nothing else.`;
 
-export function buildSpec(backend: Backend, userPrompt: string): string {
-  void backend;
+export function buildSpec(userPrompt: string): string {
   return `${PREAMBLE}\n\n${userPrompt}${CONTRACT}`;
 }
 

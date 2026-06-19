@@ -116,7 +116,7 @@ export function launch(
     // stays anchored to the chain's original HEAD.
     const reuse = opts.reuseWorktree;
     const lp = workerLogPath(handle, dir);
-    let spec = buildSpec(backend, prompt);
+    let spec = buildSpec(prompt);
 
     // Prepend continuation preamble if seed is present
     if (opts.seed) {
@@ -250,7 +250,7 @@ export function resumeLaunch(args: { handle: string; prompt: string; dir: string
 
   const be = job.backend as Backend;
   const lp = workerLogPath(handle);
-  let spec = buildSpec(be, prompt);
+  let spec = buildSpec(prompt);
   if (be === 'cmd') {
     spec = `A prior attempt already ran in this repo — inspect the working tree, determine what is already done, and complete only the remainder.\n\n` + spec;
   }
