@@ -1,16 +1,11 @@
 #!/usr/bin/env bun
-import { existsSync, statSync } from 'fs';
+import { existsSync, statSync, watch } from 'fs';
 import { basename } from 'path';
 import { spawnSync } from 'child_process';
 import { getJobFresh, getLadderHistory, lockPath } from './state.ts';
 import { nearExpiryMs, graceMs } from './env.ts';
 import { FILE_CONFIG } from './config.ts';
 
-function reportPollMs(): number {
-  const v = Number(process.env.WORKER_REPORT_POLL_MS);
-  if (Number.isFinite(v) && v > 0) return v;
-  return FILE_CONFIG.reportPollMs ?? 150;
-}
 
 export function terminalStatus(handle: string, lockPath: string): string {
   if (lockPath.endsWith('.chain.lock')) {
@@ -54,7 +49,7 @@ export function renderReport(handle: string, lockPath: string, diff: (repo: stri
   const warn = status === 'done' && body === '(no tracked changes)'
     ? '\n\nWARNING: completed but worktree has no changes vs base — work may be missing.'
     : '';
-  return `${line}\nworktree: ${diffDir}\nbranch: worker/${handle}\n\n${body}${warn}`;
+  return `${line}\nworktree: ${diffDir}\nbranch: ${job.branch ?? `worker/${handle}`}\n\n${body}${warn}`;
 }
 
 function ownerDead(serverPid: number): boolean {
@@ -77,12 +72,35 @@ export function isNearTimeout(job: { status: string; deadline_at?: number } | nu
 export async function waitForUnlock(lockPath: string, serverPid = 0, handle?: string): Promise<'unlocked' | 'near_timeout'> {
   if (!existsSync(lockPath)) return 'unlocked';
   const { promise, resolve } = Promise.withResolvers<'unlocked' | 'near_timeout'>();
-  const interval = setInterval(() => {
-    if (!existsSync(lockPath)) { clearInterval(interval); resolve('unlocked'); return; }
-    if (handle && isNearTimeout(getJobFresh(handle), Date.now())) { clearInterval(interval); resolve('near_timeout'); return; }
-    if (ownerDead(serverPid)) { clearInterval(interval); resolve('unlocked'); }
-  }, reportPollMs());
-  interval.unref?.();
+
+  let settled = false;
+  const settle = (result: 'unlocked' | 'near_timeout') => {
+    if (settled) return;
+    settled = true;
+    watcher?.close();
+    clearInterval(slowPoll);
+    resolve(result);
+  };
+
+  // FSEvents (macOS) / inotify (Linux): fires instantly on lock file deletion, ~0 CPU
+  let watcher: ReturnType<typeof watch> | undefined;
+  try {
+    watcher = watch(lockPath, () => { if (!existsSync(lockPath)) settle('unlocked'); });
+    watcher.unref?.();
+  } catch {
+    // lock already gone between existsSync and watch, or unsupported FS
+    if (!existsSync(lockPath)) { resolve('unlocked'); return promise; }
+    // fall through to slow poll only
+  }
+
+  // ponytail: slow poll only for timeout/owner-dead — can't be event-driven; 5s is plenty
+  const slowPoll = setInterval(() => {
+    if (!existsSync(lockPath)) { settle('unlocked'); return; }
+    if (handle && isNearTimeout(getJobFresh(handle), Date.now())) { settle('near_timeout'); return; }
+    if (ownerDead(serverPid)) settle('unlocked');
+  }, 5000);
+  slowPoll.unref?.();
+
   return promise;
 }
 

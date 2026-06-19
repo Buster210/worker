@@ -56,6 +56,7 @@ export async function runClaudeTmux(
   repo: string,
   handle: string,
   sid: string,
+  model: string,
   timeoutMs?: number,
   deadlineAt?: number,
 ): Promise<RunResult> {
@@ -78,7 +79,7 @@ export async function runClaudeTmux(
   }));
   writeFileSync(specFile, spec);
   writeFileSync(doneFile, '');
-  writeFileSync(launchScript, `#!/usr/bin/env bash\nexec claude --settings "${settingsFile}" --dangerously-skip-permissions --model sonnet "$(cat "${specFile}")"`, { mode: 0o755 });
+  writeFileSync(launchScript, `#!/usr/bin/env bash\nexec claude --settings "${settingsFile}" --dangerously-skip-permissions --model ${model} "$(cat "${specFile}")"`, { mode: 0o755 });
 
   try { execSync(`tmux kill-session -t ${sid} 2>/dev/null`, { stdio: 'ignore' }); } catch {}
 

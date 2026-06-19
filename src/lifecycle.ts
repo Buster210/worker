@@ -5,6 +5,7 @@ import { join } from 'path';
 import { killProcessTree, killProcessTrees } from './process.ts';
 import {
   handleDir, insertJob, getJob, updateJob, logPath as workerLogPath, finalizeJob, reaperPidPath,
+  isInPlaceOwner,
 } from './state.ts';
 import { addWorktreeAsync, clearStaleIndexLock } from './worktree.ts';
 import { buildSpec, buildRunArgv, buildResumeArgv, getResumeToken, type Backend } from './backends.ts';
@@ -105,16 +106,15 @@ export function launch(
   backend: Backend,
   prompt: string,
   dir: string,
-  opts: { sid: string; model?: string; extraArgs?: string[]; timeoutMs?: number; deadlineAt?: number; completionLock?: string; seed?: SeedContext; reuseWorktree?: string; reuseBaseSha?: string },
+  opts: { sid: string; model?: string; complex?: boolean; extraArgs?: string[]; timeoutMs?: number; deadlineAt?: number; completionLock?: string; seed?: SeedContext; reuseWorktree?: string; reuseBaseSha?: string },
 ): LaunchResult {
   const handle = newHandle(backend);
   trackLaunched(handle);
   const promise: Promise<RunResult> = failOnError(handle, (async () => {
-    // Ladder reuse: a climbing/retrying rung runs IN the prior rung's worktree (its uncommitted +
+    // Ladder reuse: a climbing/retrying rung runs IN the prior rung's workspace (its uncommitted +
     // committed work is already there — no seed copy), sharing its base_sha so the report diff
     // stays anchored to the chain's original HEAD.
     const reuse = opts.reuseWorktree;
-    const wt = reuse ?? join(handleDir(handle, dir), 'tree');
     const lp = workerLogPath(handle, dir);
     let spec = buildSpec(backend, prompt);
 
@@ -123,14 +123,54 @@ export function launch(
       spec = buildContinuationPreamble(opts.seed) + spec;
     }
 
-    const modelToUse = (backend === 'claude' || backend === 'omp' || backend === 'claude_tmux') ? undefined : opts.model;
-    insertJob({ handle, backend, sid: opts.sid, repo: dir, worktree_path: wt, base_sha: opts.reuseBaseSha, model: modelToUse, task: prompt, log_path: lp, completion_lock: opts.completionLock, server_pid: process.pid, server_started: SERVER_STARTED, server_sid: SERVER_SID, deadline_at: opts.deadlineAt });
+    // ponytail: write-first + earliest-alive election. Provably <=1 worker in the
+    // project dir (insert precedes read in program order -> two racers can't both
+    // see only themselves). Project dir may idle if the in-place worker exits while
+    // younger worktree workers persist -- safe, not optimal; re-elect oldest-alive
+    // to dir on drain if reuse matters.
+    const treePath = join(handleDir(handle, dir), 'tree');
+    // claude/claude_tmux pick model by task hardness: complex → sonnet, else haiku. omp self-selects.
+    const claudeModel = opts.complex ? 'sonnet' : 'haiku';
+    const modelToUse = (backend === 'claude' || backend === 'claude_tmux') ? (opts.model ?? claudeModel) : backend === 'omp' ? undefined : opts.model;
+    insertJob({ handle, backend, sid: opts.sid, repo: dir, worktree_path: reuse ?? treePath, base_sha: opts.reuseBaseSha, model: modelToUse, task: prompt, log_path: lp, completion_lock: opts.completionLock, server_pid: process.pid, server_started: SERVER_STARTED, server_sid: SERVER_SID, deadline_at: opts.deadlineAt });
+
+    let inPlace = false;
+    let wt: string;
+    if (reuse) { wt = reuse; }
+    else {
+      inPlace = isInPlaceOwner(handle, dir);
+      wt = inPlace ? dir : treePath;
+      if (inPlace) updateJob(handle, { worktree_path: dir });
+    }
 
     try {
       if (reuse) {
+        // Ladder reuse: reusing prior rung's workspace (could be project dir or a worktree).
         clearStaleIndexLock(reuse);
         await loginShellEnvAsync();
+      } else if (inPlace) {
+        // In-place: run directly in the project directory, no worktree.
+        const [, base_sha, branch] = await Promise.all([
+          loginShellEnvAsync(),
+          new Promise<string | undefined>(resolve => {
+            const chunks: Buffer[] = [];
+            const p = spawn('git', ['-C', dir, 'rev-parse', 'HEAD'], { stdio: ['ignore', 'pipe', 'ignore'] });
+            p.stdout?.on('data', (d: Buffer) => chunks.push(d));
+            p.on('close', () => resolve(Buffer.concat(chunks).toString().trim() || undefined));
+            p.on('error', () => resolve(undefined));
+          }),
+          new Promise<string>(resolve => {
+            const chunks: Buffer[] = [];
+            const p = spawn('git', ['-C', dir, 'rev-parse', '--abbrev-ref', 'HEAD'], { stdio: ['ignore', 'pipe', 'ignore'] });
+            p.stdout?.on('data', (d: Buffer) => chunks.push(d));
+            p.on('close', () => resolve(Buffer.concat(chunks).toString().trim() || 'HEAD'));
+            p.on('error', () => resolve('HEAD'));
+          }),
+        ]);
+        if (base_sha) updateJob(handle, { base_sha });
+        updateJob(handle, { branch });
       } else {
+        // Concurrent worker — isolated worktree from HEAD.
         const [createdWt, , base_sha] = await Promise.all([
           addWorktreeAsync(dir, handle),
           loginShellEnvAsync(),
@@ -144,6 +184,7 @@ export function launch(
         ]);
         if (createdWt !== wt) throw new Error(`worktree path mismatch for ${handle}`);
         if (base_sha) updateJob(handle, { base_sha });
+        updateJob(handle, { branch: `worker/${handle}` });
       }
     } catch (err) {
       untrackLaunched(handle);
@@ -151,7 +192,7 @@ export function launch(
     }
 
     if (backend === 'claude_tmux') {
-      return runClaudeTmux(spec, wt, handle, handle, opts.timeoutMs, opts.deadlineAt);
+      return runClaudeTmux(spec, wt, handle, handle, opts.model ?? claudeModel, opts.timeoutMs, opts.deadlineAt);
     }
     const argv = buildRunArgv(backend, spec, wt, handle, modelToUse, opts.extraArgs);
     const initToken = backend === 'opencode' ? '' : getResumeToken(backend, handle, lp);
@@ -213,7 +254,7 @@ export function resumeLaunch(args: { handle: string; prompt: string; dir: string
   if (be === 'cmd') {
     spec = `A prior attempt already ran in this repo — inspect the working tree, determine what is already done, and complete only the remainder.\n\n` + spec;
   }
-  const argv = buildResumeArgv(be, spec, wtDir, job.resume_token, undefined, extraArgs);
+  const argv = buildResumeArgv(be, spec, wtDir, job.resume_token, job.model, extraArgs);
   const p = runWorker(argv, wtDir, handle, be, lp,
     job.resume_token, timeout ? timeout * 1000 : undefined);
   return { handle, promise: failOnError(handle, p) };

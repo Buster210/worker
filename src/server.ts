@@ -146,7 +146,7 @@ export function handleExtend(args: { handle: string; seconds: number }): { handl
 
 const WORKER_INSTRUCTIONS = `# worker — delegate a coding task to a background agent
 
-Hand a coding task to a background agent that edits a repo, then check, resume, and report on it. One call = one background worker, isolated in its own git worktree.
+Hand a coding task to a background agent that edits a repo, then check, resume, and report on it. One call = one background worker. A worker runs directly in the repo's working tree when no other worker is active on that repo (its commit lands on the repo's current branch); if another worker is already active, it gets its own fresh git worktree off HEAD on branch \`worker/<handle>\`. The \`worker-report\` bundle names the exact path + branch where the changes landed.
 
 ## Rules
 - \`worker_ladder(sid, specFile, dir, timeout?)\` is the DEFAULT — use it for every task. \`worker_run\` only when the user names a specific worker.
@@ -154,8 +154,9 @@ Hand a coding task to a background agent that edits a repo, then check, resume, 
 - \`specFile\` is a BARE filename (no slashes); spec files live in \`~/.claude/plans/\`. The server reads the file and uses its content as the task spec.
 - \`sid\` = your session id (e.g. \$CLAUDE_CODE_SESSION_ID).
 - \`timeout\` = optional hard timeout in seconds (1..3600, default 600). The chain deadline; if exceeded, the job ends with \`timeout\` status.
-- N workers can run in PARALLEL on the same repo — each is isolated in its own git worktree on branch \`worker/<handle>\`. A new call does NOT kill an existing one.
-- On a completed (green) run the worker makes ONE atomic commit on its own \`worker/<handle>\` branch (never pushes, never merges). The authoritative result is the \`worker-report <handle>\` bundle (full diff vs the pre-work base already included). To read git directly, use \`git -C <worktree_path> show\` or \`git -C <worktree_path> diff <base_sha>\` — a plain \`git diff\` will be empty after the commit.
+- \`complex\` = optional boolean, default false. Set it true ONLY when the task is genuinely hard/complex; leave it off for everything else. That is the whole decision you make — the server alone maps \`complex\` to the worker model (complex → stronger model, else cheaper/faster). Never pass a model yourself.
+- N workers can run in PARALLEL on the same repo — whichever launches while no other worker is active runs in the repo working tree (commit on the current branch); any that launch while another is active each get an isolated git worktree off HEAD on branch \`worker/<handle>\`. A new call does NOT kill an existing one. The election is cross-process safe across separate MCP servers sharing the repo.
+- On a completed (green) run the worker makes ONE atomic commit (never pushes, never merges) — on branch \`worker/<handle>\` if it ran in a worktree, or on the repo's current branch if it ran in the working tree; \`worker-report\` states which. The authoritative result is the \`worker-report <handle>\` bundle (full diff vs the pre-work base already included). To read git directly, use \`git -C <worktree_path> show\` or \`git -C <worktree_path> diff <base_sha>\` — a plain \`git diff\` will be empty after the commit.
 
 ## Run a task
 1. Call \`worker_ladder(sid, specFile, dir, timeout?)\`. It returns at once: \`{ handle, status:"running" }\`, then works in the background — it keeps trying until the task is done or no worker can do it. You don't drive it.
@@ -175,13 +176,7 @@ Hand a coding task to a background agent that edits a repo, then check, resume, 
   - \`stalled\` → worker hung (no activity). The chain auto-retries once on the same backend, then climbs to the next. If you see this in the report, the chain already handled it.
   - \`killed\` → stop.
 
-## Other tools
-- \`worker_extend(handle, seconds)\` — push a running worker's deadline out by \`seconds\` (1..86400). Repeatable. The deadline is soft within a grace window: ~30s before it the report emits \`NEAR_TIMEOUT\` so you can extend; if nobody extends, the worker is hard-killed (status \`timeout\`) ~60s past the deadline.
-- \`worker_resume(handle, specFile, dir)\` — continue a \`stopped\` worker, or retry a \`failed\`/\`timeout\` one. \`specFile\` is a bare filename in \`~/.claude/plans/\`.
-- \`worker_kill(handle)\` — stop a running worker.
-- \`worker_status(handle)\` — mid-run check; returns the current job state. Not your completion signal — use \`worker-report\` which blocks until done.
-- \`worker_list(status?, limit?)\` — recent jobs. Optionally filter by status.
-- \`worker_doctor(backend?)\` — health check; names only the workers that aren't working.`;
+The other tools (\`worker_extend\`, \`worker_resume\`, \`worker_kill\`, \`worker_status\`, \`worker_list\`, \`worker_doctor\`) self-describe — see each tool's own description.`;
 
 const server = new McpServer(
   { name: 'worker', version: '0.2.0' },
@@ -191,21 +186,22 @@ const server = new McpServer(
 const bareFilename = (s: string) => !s.includes('/') && !s.includes('\\') && s !== '.' && s !== '..' && !s.includes('..');
 
 server.tool('worker_ladder',
-  `DEFAULT way to run a coding task: hands it to a background agent that edits the repo and runs it to completion on its own, until the task is done or no worker can do it. Pass \`specFile\` (bare filename in ~/.claude/plans/) + \`dir\` (absolute repo path) + optional \`timeout\` (seconds, default 600). Returns at once { handle, status:"running" }; get the result via the report command \`bun report.ts <handle>\` (see instructions).`,
+  `DEFAULT way to run a coding task: hands it to a background agent that edits the repo and runs it to completion on its own, until the task is done or no worker can do it. Pass \`specFile\` (bare filename in ~/.claude/plans/) + \`dir\` (absolute repo path) + optional \`timeout\` (seconds, default 600) + optional \`complex\` (true ONLY for hard tasks; the server picks the model from it). Returns at once { handle, status:"running" }; changes land on the branch/worktree named in the \`worker-report\` bundle (the repo's current branch if it ran in-place, else \`worker/<handle>\` in its own worktree). Read the result per the report flow in the server instructions.`,
   {
     sid: z.string().describe('Session ID ($CLAUDE_CODE_SESSION_ID)'),
     specFile: z.string().min(1).refine(bareFilename, 'bare filename only (no path separators or ..)').describe('Spec filename (bare, no slashes) from ~/.claude/plans/'),
     dir: z.string().min(1).refine(s => s.startsWith('/'), 'absolute path required').describe('Repo directory (absolute path, required)'),
     timeout: z.number().int().min(1).max(3600).optional().describe('Hard timeout seconds (1..3600, default 600)'),
+    complex: z.boolean().optional().describe('Set true ONLY when the task is hard/complex; omit (defaults false) otherwise. The server alone maps this to the model — you never choose a model.'),
   },
-  async ({ sid, specFile, dir, timeout }) => {
+  async ({ sid, specFile, dir, timeout, complex }) => {
     const prompt = readSpec(specFile);
-    return reply(handleLadder({ sid, prompt, dir, timeout }));
+    return reply(handleLadder({ sid, prompt, dir, timeout, complex }));
   }
 );
 
 server.tool('worker_run',
-  `Run a coding task on a SPECIFIC worker — only when the user explicitly names one; otherwise use worker_ladder. Pass \`specFile\` (bare filename in ~/.claude/plans/) + \`dir\` (absolute repo path). Returns at once { handle, status:"running" }; get the result via the report command \`bun report.ts <handle>\` (see instructions).`,
+  `Run a coding task on a SPECIFIC worker — only when the user explicitly names one; otherwise use worker_ladder. Pass \`specFile\` (bare filename in ~/.claude/plans/) + \`dir\` (absolute repo path). Returns at once { handle, status:"running" }; changes land on the branch/worktree named in the \`worker-report\` bundle (the repo's current branch if it ran in-place, else \`worker/<handle>\` in its own worktree). Read the result per the report flow in the server instructions.`,
   {
     backend: z.string().describe('The specific worker to run (default to worker_ladder unless the user named one).'),
     specFile: z.string().min(1).refine(bareFilename, 'bare filename only (no path separators or ..)').describe('Spec filename (bare, no slashes) from ~/.claude/plans/'),
@@ -275,7 +271,7 @@ if (import.meta.main) {
   reapStoppedJobs();
   sweepChainLocks();
   pruneOldJobs();
-  setInterval(() => { reapStoppedJobs(); sweepStaleJobs(); sweepChainLocks(); }, 60_000).unref();
+  setInterval(() => { reapStoppedJobs(); sweepStaleJobs(); sweepChainLocks(); pruneOldJobs(); }, 60_000).unref();
   spawnReaper();
   const transport = new StdioServerTransport();
   await server.connect(transport);

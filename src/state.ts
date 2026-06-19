@@ -2,6 +2,7 @@ import { mkdirSync, readFileSync, writeFileSync, readdirSync, appendFileSync, un
 import { join, basename } from 'path';
 import { removeWorktree } from './worktree.ts';
 import { FILE_CONFIG } from './config.ts';
+import { isProcessAlive } from './process.ts';
 
 const _ensuredDirs = new Set<string>();
 export function workersDir(): string {
@@ -140,6 +141,8 @@ export type Job = {
   deadline_at?: number;
   worktree_path?: string;
   base_sha?: string;
+  created_at?: number;
+  branch?: string;
 };
 
 export function insertJob(j: {
@@ -147,7 +150,7 @@ export function insertJob(j: {
   worker_pid?: number; resume_token?: string; repo: string; model?: string;
   task?: string; log_path: string; completion_lock?: string;
   server_pid?: number; server_started?: string; server_sid?: string; deadline_at?: number;
-  worktree_path?: string; base_sha?: string;
+  worktree_path?: string; base_sha?: string; created_at?: number; branch?: string;
 }) {
   const job: Job = {
     handle: j.handle, backend: j.backend,
@@ -162,6 +165,8 @@ export function insertJob(j: {
     deadline_at: j.deadline_at,
     worktree_path: j.worktree_path,
     base_sha: j.base_sha,
+    created_at: j.created_at ?? Date.now(),
+    branch: j.branch,
   };
   mkdirSync(handleDir(j.handle, j.repo), { recursive: true });
   _jobs.set(job.handle, job);
@@ -248,6 +253,23 @@ export function getAllRunningJobs(): Job[] { return collectJobs(j => j.status ==
 export function getAllRunningJobsFresh(): Job[] { return scanAllJobs().filter(j => j.status === 'running'); }
 export function getAllStoppedJobs(): Job[] { return collectJobs(j => j.status === 'stopped'); }
 export function getAllJobs(): Job[] { ensureBootstrapped(); return Array.from(_jobs.values()); }
+/** True iff this handle is the earliest-created ALIVE running job for the repo. */
+export function isInPlaceOwner(handle: string, repo: string): boolean {
+  const mine = getJob(handle);
+  if (!mine || mine.status !== 'running' || mine.repo !== repo) return false;
+  // scanAllJobs (disk-fresh), NOT collectJobs (in-process _jobs cache) — a peer MCP
+  // server's job written after our bootstrap is invisible to the cache, which would
+  // let two processes each claim the project dir. Cross-process election MUST hit disk.
+  const others = scanAllJobs().filter(j =>
+    j.status === 'running' && j.repo === repo && j.handle !== handle &&
+    isProcessAlive(j.server_pid, j.server_started)
+  );
+  const mineAt = mine.created_at ?? 0;
+  return others.every(o => {
+    const oAt = o.created_at ?? 0;
+    return mineAt < oAt || (mineAt === oAt && handle < o.handle);
+  });
+}
 
 function retainMs(): number {
   const v = Number(process.env.WORKER_RETAIN_MS);

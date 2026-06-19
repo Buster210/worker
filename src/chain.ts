@@ -13,15 +13,15 @@ export type LadderDrivers = {
   runRung: (backend: Backend, seed?: SeedContext) => Promise<RunResult>;
 };
 
-export function handleLadder(args: { sid: string; prompt: string; dir: string; timeout?: number }): LadderResult {
-  const { sid, prompt, dir } = args;
+export function handleLadder(args: { sid: string; prompt: string; dir: string; timeout?: number; complex?: boolean }): LadderResult {
+  const { sid, prompt, dir, complex } = args;
   const chainDeadlineAt = Date.now() + (args.timeout ? args.timeout * 1000 : defaultTimeoutMs());
 
   if (LADDER.length === 0) return { status: 'exhausted', note: 'no workers available' };
 
   createChainLock(sid, process.pid, SERVER_STARTED);
   saveChainMeta(sid, { deadlineAt: chainDeadlineAt });
-  const first = launch(LADDER[0], prompt, dir, { sid, deadlineAt: chainDeadlineAt, completionLock: chainLockPath(sid) });
+  const first = launch(LADDER[0], prompt, dir, { sid, complex, deadlineAt: chainDeadlineAt, completionLock: chainLockPath(sid) });
   const drivers: LadderDrivers = {
     // Every rung after the first reuses the first rung's worktree + base_sha: the prior rung's work
     // already lives in that tree, so the report (anchored to the first handle) surfaces whatever the
@@ -36,6 +36,7 @@ export function handleLadder(args: { sid: string; prompt: string; dir: string; t
       }
       return launch(backend, prompt, dir, {
         sid,
+        complex,
         deadlineAt: effectiveChainDeadline(sid, chainDeadlineAt),
         completionLock: chainLockPath(sid),
         reuseWorktree: firstJob?.worktree_path,

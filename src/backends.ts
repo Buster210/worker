@@ -103,7 +103,7 @@ export function buildSpec(backend: Backend, userPrompt: string): string {
 export function buildRunArgv(backend: Backend, spec: string, repo: string, sid: string, model?: string, extraArgs?: string[]): string[] {
   switch (backend) {
     case 'claude':
-      return ['claude', '-p', spec, '--session-id', sid, '--model', 'sonnet', '--dangerously-skip-permissions', '--add-dir', repo, ...(extraArgs ?? [])];
+      return ['claude', '-p', spec, '--session-id', sid, '--model', model ?? 'sonnet', '--dangerously-skip-permissions', '--add-dir', repo, ...(extraArgs ?? [])];
     case 'omp':
       return ['omp', '-p', spec, '--session-dir', handleDirUncached(sid, repo), '--approval-mode=yolo', '--mode=json', ...(extraArgs ?? [])];
     case 'cmd':
@@ -122,7 +122,7 @@ export function buildRunArgv(backend: Backend, spec: string, repo: string, sid: 
 export function buildResumeArgv(backend: Backend, spec: string, repo: string, token: string, model?: string, extraArgs?: string[]): string[] {
   switch (backend) {
     case 'claude':
-      return ['claude', '-p', spec, '--resume', token, '--model', 'sonnet', '--dangerously-skip-permissions', '--add-dir', repo, ...(extraArgs ?? [])];
+      return ['claude', '-p', spec, '--resume', token, '--model', model ?? 'sonnet', '--dangerously-skip-permissions', '--add-dir', repo, ...(extraArgs ?? [])];
     case 'omp':
       return ['omp', '-p', spec, '--session-dir', handleDirUncached(token, repo), '--continue', '--approval-mode=yolo', '--mode=json', ...(extraArgs ?? [])];
     case 'opencode':

@@ -1,5 +1,6 @@
 import { spawnSync } from 'child_process';
 import { statSync } from 'fs';
+
 type ActivityMonitor = {
   readonly sig: string;
   readonly log: string;
@@ -14,9 +15,14 @@ const _activityMonitors = new Map<string, ActivityMonitor>();
 function readLogStat(logPath: string): string {
   try { const st = statSync(logPath); return `${st.mtimeMs}:${st.size}`; } catch { return ''; }
 }
+
+// ponytail: poll-on-read, no fs.watch. The watchdog reads sig/at every WORKER_WATCHDOG_MS (5s),
+// each read runs poll() -> one statSync. fs.watch on the actively-appended worker log fired a
+// callback per write (Bun/macOS kqueue event storm -> a pegged core for the whole run) while the
+// watchdog never observes the sub-5s updates anyway. If a backend ever needs finer stall timing,
+// shrink WORKER_WATCHDOG_MS rather than re-adding a watcher.
 export function startActivityMonitor(repo: string, logPath: string): ActivityMonitor {
   const key = `${repo}\0${logPath}`;
-  let watcher: FSWatcher | undefined;
   let cachedLog = readLogStat(logPath);
   let cachedAt = Date.now();
   let lastPollAt = 0;
@@ -33,19 +39,9 @@ export function startActivityMonitor(repo: string, logPath: string): ActivityMon
     repo,
     logPath,
     dispose() {
-      try { watcher?.close(); } catch {}
       _activityMonitors.delete(key);
     },
   };
-  try {
-    watcher = fsWatch(logPath, { persistent: false }, () => {
-      const fresh = readLogStat(logPath);
-      if (fresh && fresh !== cachedLog) {
-        cachedLog = fresh;
-        cachedAt = Date.now();
-      }
-    });
-  } catch {}
   _activityMonitors.set(key, mon);
   return mon;
 }
