@@ -139,7 +139,7 @@ describe('runWorker lifecycle (real subprocess)', () => {
     const r = await runWorker(fakeScript('echo; echo FAILED; sleep 20'), REPO, handle, 'cmd', lp, '', 60_000);
     expect(r.status).toBe('failed');
     expect(r.exit_code).toBe(124);
-  });
+  }, 30_000); // real subprocess SIGKILL+grace + first-spawn login-env build exceeds bun's 5s default
 
   it('kills a productive worker at deadline+grace when nobody extends → "timeout"', async () => {
     const handle = `grace-${seq}`;
@@ -152,7 +152,7 @@ describe('runWorker lifecycle (real subprocess)', () => {
     expect(r.status).toBe('timeout');
     expect(r.exit_code).toBe(124);
     expect(getJob(handle)?.status).toBe('timeout');
-  });
+  }, 30_000); // real subprocess SIGKILL+grace + first-spawn login-env build exceeds bun's 5s default
 
   it('does NOT kill when the deadline is pushed out (worker_extend) before grace expires', async () => {
     const handle = `extend-${seq}`;

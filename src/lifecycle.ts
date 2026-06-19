@@ -2,7 +2,7 @@ import { randomUUID } from 'crypto';
 import { spawn, spawnSync } from 'child_process';
 import { readFileSync, unlinkSync, writeFileSync } from 'fs';
 import { join } from 'path';
-import { killProcessTree, killProcessTrees } from './process.ts';
+import { killProcessTree, killProcessTrees, getProcessStartTime } from './process.ts';
 import {
   handleDir, insertJob, getJob, updateJob, logPath as workerLogPath, finalizeJob, reaperPidPath,
   isInPlaceOwner,
@@ -16,7 +16,11 @@ import { isProcessAlive } from './process.ts';
 import { buildContinuationPreamble, type SeedContext } from './seed.ts';
 
 // --- Server lifecycle state ---
-export const SERVER_STARTED = new Date().toISOString();
+// Use the OS-reported process start (ps etime), not module-import time. server_started is the
+// pid-reuse guard: isProcessAlive() matches it against `ps` start time with a 60s skew window.
+// new Date() at import lags real start whenever this module is imported late (e.g. a big test
+// run importing it ~minutes in), pushing skew past 60s so the server's own job reads as dead.
+export const SERVER_STARTED = getProcessStartTime(process.pid) ?? new Date().toISOString();
 const SERVER_SID = process.env.CLAUDE_CODE_SESSION_ID ?? '';
 const launchedHandles = new Set<string>();
 

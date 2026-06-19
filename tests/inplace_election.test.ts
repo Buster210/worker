@@ -28,7 +28,10 @@ function makeJob(handle: string, created_at: number, opts?: { server_pid?: numbe
     log_path: `/tmp/${handle}.log`,
     created_at,
     server_pid: opts?.server_pid ?? process.pid,
-    server_started: opts?.server_started ?? new Date().toISOString(),
+    // Omit (not now()): a live job means "this pid is alive". isProcessAlive short-circuits true
+    // for an alive pid when started is absent; stamping now() instead made the 60s skew check fail
+    // once the suite had run >60s (real process start drifts past the window) — flaky in full runs.
+    server_started: opts?.server_started,
   });
 }
 

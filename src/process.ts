@@ -115,7 +115,7 @@ export function parseEtimeSeconds(etime: string): number | null {
 
 const _pidVerified = new Map<number, { started: string; at: number }>();
 
-function getProcessStartTime(pid: number): string | null {
+export function getProcessStartTime(pid: number): string | null {
   try {
     const result = spawnSync('ps', ['-o', 'etime=', '-p', String(pid)], { encoding: 'utf8' });
     if (result.status !== 0) return null;
