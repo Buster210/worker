@@ -175,13 +175,7 @@ Hand a coding task to a background agent that edits a repo, then check, resume, 
   - \`stalled\` → worker hung (no activity). The chain auto-retries once on the same backend, then climbs to the next. If you see this in the report, the chain already handled it.
   - \`killed\` → stop.
 
-## Other tools
-- \`worker_extend(handle, seconds)\` — push a running worker's deadline out by \`seconds\` (1..86400). Repeatable. The deadline is soft within a grace window: ~30s before it the report emits \`NEAR_TIMEOUT\` so you can extend; if nobody extends, the worker is hard-killed (status \`timeout\`) ~60s past the deadline.
-- \`worker_resume(handle, specFile, dir)\` — continue a \`stopped\` worker, or retry a \`failed\`/\`timeout\` one. \`specFile\` is a bare filename in \`~/.claude/plans/\`.
-- \`worker_kill(handle)\` — stop a running worker.
-- \`worker_status(handle)\` — mid-run check; returns the current job state. Not your completion signal — use \`worker-report\` which blocks until done.
-- \`worker_list(status?, limit?)\` — recent jobs. Optionally filter by status.
-- \`worker_doctor(backend?)\` — health check; names only the workers that aren't working.`;
+The other tools (\`worker_extend\`, \`worker_resume\`, \`worker_kill\`, \`worker_status\`, \`worker_list\`, \`worker_doctor\`) self-describe — see each tool's own description.`;
 
 const server = new McpServer(
   { name: 'worker', version: '0.2.0' },
@@ -191,7 +185,7 @@ const server = new McpServer(
 const bareFilename = (s: string) => !s.includes('/') && !s.includes('\\') && s !== '.' && s !== '..' && !s.includes('..');
 
 server.tool('worker_ladder',
-  `DEFAULT way to run a coding task: hands it to a background agent that edits the repo and runs it to completion on its own, until the task is done or no worker can do it. Pass \`specFile\` (bare filename in ~/.claude/plans/) + \`dir\` (absolute repo path) + optional \`timeout\` (seconds, default 600). Returns at once { handle, status:"running" }; get the result via the report command \`bun report.ts <handle>\` (see instructions).`,
+  `DEFAULT way to run a coding task: hands it to a background agent that edits the repo and runs it to completion on its own, until the task is done or no worker can do it. Pass \`specFile\` (bare filename in ~/.claude/plans/) + \`dir\` (absolute repo path) + optional \`timeout\` (seconds, default 600). Returns at once { handle, status:"running" }; read the result per the report flow in the server instructions.`,
   {
     sid: z.string().describe('Session ID ($CLAUDE_CODE_SESSION_ID)'),
     specFile: z.string().min(1).refine(bareFilename, 'bare filename only (no path separators or ..)').describe('Spec filename (bare, no slashes) from ~/.claude/plans/'),
@@ -205,7 +199,7 @@ server.tool('worker_ladder',
 );
 
 server.tool('worker_run',
-  `Run a coding task on a SPECIFIC worker — only when the user explicitly names one; otherwise use worker_ladder. Pass \`specFile\` (bare filename in ~/.claude/plans/) + \`dir\` (absolute repo path). Returns at once { handle, status:"running" }; get the result via the report command \`bun report.ts <handle>\` (see instructions).`,
+  `Run a coding task on a SPECIFIC worker — only when the user explicitly names one; otherwise use worker_ladder. Pass \`specFile\` (bare filename in ~/.claude/plans/) + \`dir\` (absolute repo path). Returns at once { handle, status:"running" }; read the result per the report flow in the server instructions.`,
   {
     backend: z.string().describe('The specific worker to run (default to worker_ladder unless the user named one).'),
     specFile: z.string().min(1).refine(bareFilename, 'bare filename only (no path separators or ..)').describe('Spec filename (bare, no slashes) from ~/.claude/plans/'),
