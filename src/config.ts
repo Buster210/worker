@@ -15,7 +15,7 @@ export type FileConfig = {
 
 function loadFileConfig(pathOverride?: string): FileConfig {
   const home = process.env.HOME ?? '';
-  const configPath = pathOverride ?? join(home, '.claude', 'workers', 'config.json');
+  const configPath = pathOverride ?? process.env.WORKER_CONFIG_PATH ?? join(home, '.claude', 'workers', 'config.json');
 
   let raw: unknown;
   try {
