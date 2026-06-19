@@ -20,8 +20,11 @@ export function terminalStatus(handle: string, lockPath: string): string {
   return getJobFresh(handle)?.status ?? 'failed';
 }
 
-export function statusLine(status: string): string {
-  return status === 'done' ? 'completed' : status;
+export function statusLine(status: string, branch?: string, baseSha?: string): string {
+  if (status !== 'done') return status;
+  const ref = branch ?? 'current branch';
+  const base = baseSha ? ` (base ${baseSha})` : '';
+  return `completed — worker committed changes to branch ${ref}${base}. Review the diff below and merge; nothing else to run.`;
 }
 
 export function wantsDiff(status: string): boolean {
@@ -40,9 +43,9 @@ function gitDiff(repo: string, baseSha?: string): string {
 
 export function renderReport(handle: string, lockPath: string, diff: (repo: string, baseSha?: string) => string = gitDiff): string {
   const status = terminalStatus(handle, lockPath);
-  const line = statusLine(status);
-  if (!wantsDiff(status)) return line;
+  if (!wantsDiff(status)) return statusLine(status);
   const job = getJobFresh(handle);
+  const line = statusLine(status, job?.branch, job?.base_sha);
   if (!job?.repo) return `${line}\n\n(diff unavailable: unknown handle ${handle})`;
   const diffDir = job.worktree_path ?? job.repo;
   const body = diff(diffDir, job.base_sha);
@@ -94,12 +97,14 @@ export async function waitForUnlock(lockPath: string, serverPid = 0, handle?: st
   }
 
   // ponytail: slow poll only for timeout/owner-dead — can't be event-driven; 5s is plenty
-  const slowPoll = setInterval(() => {
+  const poll = () => {
     if (!existsSync(lockPath)) { settle('unlocked'); return; }
     if (handle && isNearTimeout(getJobFresh(handle), Date.now())) { settle('near_timeout'); return; }
     if (ownerDead(serverPid)) settle('unlocked');
-  }, 5000);
+  };
+  const slowPoll = setInterval(poll, 5000);
   slowPoll.unref?.();
+  poll(); // immediate: job may already be in the near band / owner already dead at call time
 
   return promise;
 }

@@ -68,7 +68,10 @@ describe('terminalStatus — ladder (chain lock → audit trail, not rung-0 job.
 });
 
 describe('statusLine', () => {
-  it('collapses done to "completed"', () => expect(statusLine('done')).toBe('completed'));
+  it('collapses done to pointer wording', () => {
+    expect(statusLine('done')).toBe('completed — worker committed changes to branch current branch. Review the diff below and merge; nothing else to run.');
+    expect(statusLine('done', 'worker/h1', 'abc123')).toBe('completed — worker committed changes to branch worker/h1 (base abc123). Review the diff below and merge; nothing else to run.');
+  });
   it('reports every other status verbatim (preserving the failed:reason family)', () => {
     expect(statusLine('failed:max-turns')).toBe('failed:max-turns');
     expect(statusLine('timeout')).toBe('timeout');
@@ -84,12 +87,10 @@ describe('wantsDiff', () => {
     expect(wantsDiff('killed')).toBe(false);
     for (const s of ['done', 'failed:max-turns', 'timeout', 'exhausted']) expect(wantsDiff(s)).toBe(true);
   });
-});
-
-describe('renderReport (diff injected — no real git)', () => {
-  it('done → "completed" + blank line + full diff', () => {
+  it('done → pointer wording + worktree + branch + full diff', () => {
     const { handle, lockPath } = seedRun('done');
-    expect(renderReport(handle, lockPath, () => 'DIFFBODY')).toBe(`completed\nworktree: /repo/x\nbranch: worker/${handle}\n\nDIFFBODY`);
+    const ptr = 'completed — worker committed changes to branch current branch. Review the diff below and merge; nothing else to run.';
+    expect(renderReport(handle, lockPath, () => 'DIFFBODY')).toBe(`${ptr}\nworktree: /repo/x\nbranch: worker/${handle}\n\nDIFFBODY`);
   });
   it('exhausted ladder → "exhausted" + diff', () => {
     const { handle, lockPath } = seedLadder('failed');
@@ -97,7 +98,8 @@ describe('renderReport (diff injected — no real git)', () => {
   });
   it('done with empty diff emits a warning', () => {
     const { handle, lockPath } = seedRun('done');
-    expect(renderReport(handle, lockPath, () => '(no tracked changes)')).toBe(`completed\nworktree: /repo/x\nbranch: worker/${handle}\n\n(no tracked changes)\n\nWARNING: completed but worktree has no changes vs base — work may be missing.`);
+    const ptr = 'completed — worker committed changes to branch current branch. Review the diff below and merge; nothing else to run.';
+    expect(renderReport(handle, lockPath, () => '(no tracked changes)')).toBe(`${ptr}\nworktree: /repo/x\nbranch: worker/${handle}\n\n(no tracked changes)\n\nWARNING: completed but worktree has no changes vs base — work may be missing.`);
   });
   it('stopped → single line, diff fn never invoked', () => {
     const { handle, lockPath } = seedRun('stopped');
