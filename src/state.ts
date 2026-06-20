@@ -332,3 +332,18 @@ export function getLadderHistory(sid: string): { turn: number; worker: string; r
       .map(l => JSON.parse(l));
   } catch { return []; }
 }
+
+/** Delete `run.log` for a `done` handle. Returns `'pruned'` or `'kept:…'` if no-op/failed. */
+export function pruneTranscript(handle: string): 'pruned' | 'kept:not-done' | 'kept:no-job' | 'kept:error' {
+  const job = getJob(handle);
+  if (!job) return 'kept:no-job';
+  if (job.status !== 'done') return 'kept:not-done';
+  try {
+    unlinkSync(logPath(handle, job.repo));
+    return 'pruned';
+  } catch (e) {
+    // already gone = success (idempotent re-cleanup); any other error = honest failure
+    if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') return 'pruned';
+    return 'kept:error';
+  }
+}

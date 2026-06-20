@@ -255,7 +255,7 @@ describe('handleResume — hermetic', () => {
 
 describe('handleRun — via PATH stub', () => {
   beforeAll(() => {
-    makeStub('cmd', 'echo DONE > worker-output.txt; echo DONE; exit 0');
+    makeStub('cmd', 'echo "DONE-$RANDOM-$$" > worker-output.txt; echo DONE; exit 0');
   });
 
   it('happy path: stub emits DONE, returns {handle, running}, poll → done', async () => {
@@ -328,7 +328,7 @@ describe('handleRun — via PATH stub', () => {
     expect(getJobFresh(a.handle)?.status).toBe('running');
 
     // B: completes quickly — launching B must NOT kill A
-    makeStub('cmd', 'echo DONE > worker-output.txt; echo DONE; exit 0');
+    makeStub('cmd', 'echo "DONE-$RANDOM-$$" > worker-output.txt; echo DONE; exit 0');
     const specB = writeSpec('parallel-b.md', 'parallel worker B spec');
     const b = handleRun({ backend: 'cmd', specFile: specB, dir: REPO });
     expect(b.status).toBe('running');
@@ -359,7 +359,7 @@ describe('handleRun — via PATH stub', () => {
   });
 
   it('parallel workers: two concurrent workers each get isolated worktrees on separate branches', async () => {
-    makeStub('cmd', 'echo DONE > worker-output.txt; echo DONE; exit 0');
+    makeStub('cmd', 'echo "DONE-$RANDOM-$$" > worker-output.txt; echo DONE; exit 0');
     process.env.WORKER_POLL_MS = '50';
     process.env.WORKER_RESUME_POLL_MS = '50';
 
@@ -394,13 +394,13 @@ describe('handleRun — via PATH stub', () => {
 
 describe('handleResume — via PATH stub (dead pid / failed retry)', () => {
   beforeAll(() => {
-    makeStub('cmd', 'echo DONE > worker-output.txt; echo DONE; exit 0');
+    makeStub('cmd', 'echo "DONE-$RANDOM-$$" > worker-output.txt; echo DONE; exit 0');
   });
 
   it('stopped job with dead pid → fresh re-run completes', async () => {
     process.env.WORKER_POLL_MS = '50';
     process.env.WORKER_RESUME_POLL_MS = '50';
-    makeStub('cmd', 'echo DONE > worker-output.txt; echo DONE; exit 0');
+    makeStub('cmd', 'echo "DONE-$RANDOM-$$" > worker-output.txt; echo DONE; exit 0');
 
     const handle = `hr-deadpid-${seq++}`;
     const lp = stateLogPath(handle, REPO);
@@ -428,7 +428,7 @@ describe('handleResume — via PATH stub (dead pid / failed retry)', () => {
   it('failed job retry re-runs the worker but status stays failed (known gap)', async () => {
     process.env.WORKER_POLL_MS = '50';
     process.env.WORKER_RESUME_POLL_MS = '50';
-    makeStub('cmd', 'echo DONE > worker-output.txt; echo DONE; exit 0');
+    makeStub('cmd', 'echo "DONE-$RANDOM-$$" > worker-output.txt; echo DONE; exit 0');
 
     const handle = `hr-failed-retry-${seq++}`;
     const lp = stateLogPath(handle, REPO);
@@ -466,7 +466,7 @@ describe('handleResume — via PATH stub (dead pid / failed retry)', () => {
     // Same bug as failed retry: a timeout job retried successfully stays timeout, not done.
     process.env.WORKER_POLL_MS = '50';
     process.env.WORKER_RESUME_POLL_MS = '50';
-    makeStub('cmd', 'echo DONE > worker-output.txt; echo DONE; exit 0');
+    makeStub('cmd', 'echo "DONE-$RANDOM-$$" > worker-output.txt; echo DONE; exit 0');
 
     const handle = `hr-timeout-retry-${seq++}`;
     const lp = stateLogPath(handle, REPO);

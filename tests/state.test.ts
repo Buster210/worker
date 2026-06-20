@@ -11,7 +11,7 @@ const PLANS_DIR = join(tmpdir(), `wstate-plans-${process.pid}`);
 process.env.WORKER_PLANS_DIR = PLANS_DIR;
 mkdirSync(PLANS_DIR, { recursive: true });
 
-import { finalizeJob, insertJob, getJob, getJobFresh, updateJob, workersDir, handleDir, handleDirUncached, lockPath, resolveHandleDir, pruneOldJobs, readSpec, plansDir, saveChainMeta, removeChainMeta, chainMetaPath } from '../src/state.ts';
+import { finalizeJob, insertJob, getJob, getJobFresh, updateJob, workersDir, handleDir, handleDirUncached, lockPath, resolveHandleDir, pruneOldJobs, readSpec, plansDir, saveChainMeta, removeChainMeta, chainMetaPath, pruneTranscript } from '../src/state.ts';
 
 afterAll(() => {
   try { rmSync(STATE_DIR, { recursive: true, force: true }); } catch {}
@@ -255,5 +255,46 @@ describe('handleDirUncached does not poison the handle-dir cache', () => {
     finalizeJob(handle, 'done');
     expect(getJobFresh(handle)?.status).toBe('done');
     expect(existsSync(lockPath(handle, repo))).toBe(false);
+  });
+});
+describe('pruneTranscript', () => {
+  it('prunes run.log when status is done; keeps job.json', () => {
+    const handle = `pt-done-${process.pid}-${Date.now()}`;
+    const repo = `/tmp/wstate-pt-${process.pid}`;
+    const dir = handleDir(handle, repo);
+    mkdirSync(dir, { recursive: true });
+    const log = join(dir, 'run.log');
+    writeFileSync(log, 'agent output');
+    insertJob({ handle, backend: 'cmd', sid: 's', repo, log_path: log });
+    updateJob(handle, { status: 'done' });
+    expect(pruneTranscript(handle)).toBe('pruned');
+    expect(existsSync(log)).toBe(false);
+    expect(existsSync(join(dir, 'job.json'))).toBe(true);
+  });
+  it('keeps run.log when status is not done', () => {
+    const handle = `pt-stall-${process.pid}-${Date.now()}`;
+    const repo = `/tmp/wstate-pt-${process.pid}`;
+    const dir = handleDir(handle, repo);
+    mkdirSync(dir, { recursive: true });
+    const log = join(dir, 'run.log');
+    writeFileSync(log, 'agent output');
+    insertJob({ handle, backend: 'cmd', sid: 's', repo, log_path: log });
+    updateJob(handle, { status: 'stalled' });
+    expect(pruneTranscript(handle)).toBe('kept:not-done');
+    expect(existsSync(log)).toBe(true);
+  });
+  it('returns kept:no-job for unknown handle', () => {
+    expect(pruneTranscript(`nonexistent-${process.pid}`)).toBe('kept:no-job');
+  });
+  it('is idempotent: re-prune of an already-gone log still returns pruned', () => {
+    const handle = `pt-twice-${process.pid}-${Date.now()}`;
+    const repo = `/tmp/wstate-pt-${process.pid}`;
+    const dir = handleDir(handle, repo);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'run.log'), 'agent output');
+    insertJob({ handle, backend: 'cmd', sid: 's', repo, log_path: join(dir, 'run.log') });
+    updateJob(handle, { status: 'done' });
+    expect(pruneTranscript(handle)).toBe('pruned');
+    expect(pruneTranscript(handle)).toBe('pruned'); // ENOENT → still pruned
   });
 });

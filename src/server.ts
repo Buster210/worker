@@ -6,6 +6,7 @@ import { spawnSync } from 'child_process';
 import { existsSync } from 'fs';
 import {
   getJob, updateJob, finalizeJob, getAllJobs, pruneOldJobs, readSpec, loadChainMeta, saveChainMeta,
+  pruneTranscript,
 } from './state.ts';
 import { LADDER, ALL_BACKENDS, type Backend } from './backends.ts';
 import { backendShellArgv } from './runner.ts';
@@ -144,38 +145,31 @@ export function handleExtend(args: { handle: string; seconds: number }): { handl
   return { handle, deadline_at: newDeadline };
 }
 
-const WORKER_INSTRUCTIONS = `# worker — delegate a coding task to a background agent
+export function handleCleanup(args: { handle: string }): string {
+  return pruneTranscript(args.handle);
+}
 
-Hand a coding task to a background agent that edits a repo, then check, resume, and report on it. One call = one background worker. The first worker for a repo runs directly in the project directory; concurrent workers each get their own isolated git worktree.
+const WORKER_INSTRUCTIONS = `# worker — delegate coding task to background agent
+
+One call = one worker. Active worker → repo working tree; concurrent → isolated worktree \`worker/<handle>\` off HEAD. \`worker-report\` names path + branch.
 
 ## Rules
-- \`worker_ladder(sid, specFile, dir, timeout?)\` is the DEFAULT — use it for every task. \`worker_run\` only when the user names a specific worker.
-- \`dir\` is REQUIRED on every call — the absolute repo path.
-- \`specFile\` is a BARE filename (no slashes); spec files live in \`~/.claude/plans/\`. The server reads the file and uses its content as the task spec.
-- \`sid\` = your session id (e.g. \$CLAUDE_CODE_SESSION_ID).
-- \`timeout\` = optional hard timeout in seconds (1..3600, default 600). The chain deadline; if exceeded, the job ends with \`timeout\` status.
-- N workers can run in PARALLEL on the same repo — the first runs in the project directory, concurrent ones each get an isolated git worktree on branch \`worker/<handle>\`. A new call does NOT kill an existing one.
-- On a completed (green) run the worker makes ONE atomic commit on its own \`worker/<handle>\` branch (never pushes, never merges). The authoritative result is the \`worker-report <handle>\` bundle (full diff vs the pre-work base already included). To read git directly, use \`git -C <worktree_path> show\` or \`git -C <worktree_path> diff <base_sha>\` — a plain \`git diff\` will be empty after the commit.
+- \`worker_ladder(sid, specFile, dir, timeout?)\` = DEFAULT. \`worker_run\` only when user names specific worker.
+- \`dir\` = REQUIRED, absolute path.
+- \`specFile\` = bare filename, no slashes; \`~/.claude/plans/\`. Server reads as task spec.
+- Spec = TARGET (goal, outcome, criteria) NOT files/lines. Worker explores + decides. Give constraints + verification; leave how-to.
+- \`sid\` = session id (\`$CLAUDE_CODE_SESSION_ID\`).
+- \`timeout\` = optional seconds (1..3600, default 600). Exceeded → \`timeout\`.
+- \`complex\` = bool, default false. True = genuinely hard only. Server maps to model; never pass model.
+- N parallel workers — idle → working tree; active → worktree. New call ≠ kill existing. Cross-process safe.
+- Done → ONE atomic commit (no push, no merge) — \`worker/<handle>\` branch or current branch. \`worker-report <handle>\` = authoritative result (diff vs pre-work base). \`git -C <path> show\` or \`diff <base_sha>\`; plain \`git diff\` empty post-commit.
 
-## Run a task
-1. Call \`worker_ladder(sid, specFile, dir, timeout?)\`. It returns at once: \`{ handle, status:"running" }\`, then works in the background — it keeps trying until the task is done or no worker can do it. You don't drive it.
-2. Wait for completion in the BACKGROUND — run (just the handle):
-       worker-report <handle>
-  This command BLOCKS until the job finishes. It polls the job's lock file, so it won't return until the chain completes. When done it prints one bundle to stdout:
-       line 1 = status — one of: completed · failed[:reason] · timeout · stopped · exhausted · killed · stalled
-       completed / failed / timeout / exhausted / stalled → worktree path, branch, then the full \`git diff\`
-       stopped / killed → just the status line
-  If the job is still running and near its deadline, it prints a NEAR_TIMEOUT line instead of blocking. Two choices: \`worker_extend(handle, secs)\` then re-run \`worker-report <handle>\` to keep waiting; OR \`worker-report <handle> --wait\` to ignore the signal and block straight through to the terminal report (the worker is hard-killed at the grace edge and you get its \`timeout\` bundle). Don't poll with a fixed \`sleep\` — the near-timeout window is ~30s wide on each side of the deadline, so a short sleep can just re-trip the same signal.
-  This bundle is your completion signal AND the result — don't also run \`git diff\` / \`worker_status\`.
-3. Act on the outcome:
-  - \`completed\` → review the diff against the spec.
-  - \`failed\` / \`timeout\` → inspect the diff; \`worker_resume\` to retry, or report.
-  - \`stopped\` → the worker paused with its work preserved; \`worker_resume(handle, specFile, dir)\` to finish it.
-  - \`exhausted\` → all backends tried with no success; report and stop.
-  - \`stalled\` → worker hung (no activity). The chain auto-retries once on the same backend, then climbs to the next. If you see this in the report, the chain already handled it.
-  - \`killed\` → stop.
+## Run
+1. \`worker_ladder(sid, specFile, dir, timeout?)\` → \`{ handle, status:"running" }\`. Background.
+2. \`worker-report <handle>\` blocks. Status: completed · failed[:reason] · timeout · stopped · exhausted · killed · stalled. completed/failed/timeout/exhausted/stalled → path + branch + diff. stopped/killed → status only. Near deadline → NEAR_TIMEOUT: \`worker_extend(handle, secs)\` + re-report, or \`--wait\` to block through. Don't sleep-poll (~30s window). Bundle = completion + result.
+3. Outcomes: completed → review, \`worker_cleanup\`. failed/timeout → inspect, \`worker_resume\`. stopped → \`worker_resume(handle, specFile, dir)\`. exhausted → all backends failed. stalled → chain auto-handled. killed → stop.
 
-The other tools (\`worker_extend\`, \`worker_resume\`, \`worker_kill\`, \`worker_status\`, \`worker_list\`, \`worker_doctor\`) self-describe — see each tool's own description.`;
+Other tools (\`worker_extend\`, \`worker_resume\`, \`worker_kill\`, \`worker_status\`, \`worker_list\`, \`worker_doctor\`, \`worker_cleanup\`) self-describe.`;
 
 const server = new McpServer(
   { name: 'worker', version: '0.2.0' },
@@ -185,28 +179,29 @@ const server = new McpServer(
 const bareFilename = (s: string) => !s.includes('/') && !s.includes('\\') && s !== '.' && s !== '..' && !s.includes('..');
 
 server.tool('worker_ladder',
-  `DEFAULT way to run a coding task: hands it to a background agent that edits the repo and runs it to completion on its own, until the task is done or no worker can do it. Pass \`specFile\` (bare filename in ~/.claude/plans/) + \`dir\` (absolute repo path) + optional \`timeout\` (seconds, default 600). Returns at once { handle, status:"running" }; read the result per the report flow in the server instructions.`,
+  `Run task via background agent. \`sid\` + \`specFile\` (bare, ~/.claude/plans/) + \`dir\` (absolute) + optional \`timeout\` (1..3600, def 600) + \`complex\` (true=hard, server picks model). → { handle, status:'running' }. Branch: current or worker/<handle>. Report flow in server instructions.`,
   {
     sid: z.string().describe('Session ID ($CLAUDE_CODE_SESSION_ID)'),
     specFile: z.string().min(1).refine(bareFilename, 'bare filename only (no path separators or ..)').describe('Spec filename (bare, no slashes) from ~/.claude/plans/'),
     dir: z.string().min(1).refine(s => s.startsWith('/'), 'absolute path required').describe('Repo directory (absolute path, required)'),
     timeout: z.number().int().min(1).max(3600).optional().describe('Hard timeout seconds (1..3600, default 600)'),
+    complex: z.boolean().optional().describe('true=hard; server picks model. Never pass model yourself.'),
   },
-  async ({ sid, specFile, dir, timeout }) => {
+  async ({ sid, specFile, dir, timeout, complex }) => {
     const prompt = readSpec(specFile);
-    return reply(handleLadder({ sid, prompt, dir, timeout }));
+    return reply(handleLadder({ sid, prompt, dir, timeout, complex }));
   }
 );
 
 server.tool('worker_run',
-  `Run a coding task on a SPECIFIC worker — only when the user explicitly names one; otherwise use worker_ladder. Pass \`specFile\` (bare filename in ~/.claude/plans/) + \`dir\` (absolute repo path). Returns at once { handle, status:"running" }; read the result per the report flow in the server instructions.`,
+  `Run task on named worker (user explicitly names one; else use worker_ladder). Same params as worker_ladder + \`backend\`. → { handle, status:'running' }. Report flow in server instructions.`,
   {
-    backend: z.string().describe('The specific worker to run (default to worker_ladder unless the user named one).'),
+    backend: z.string().describe('Named backend to run.'),
     specFile: z.string().min(1).refine(bareFilename, 'bare filename only (no path separators or ..)').describe('Spec filename (bare, no slashes) from ~/.claude/plans/'),
     model: z.string().regex(/^[A-Za-z0-9._:-]+$/).optional().describe('Model override. Ignored by workers that pin their own model.'),
     dir: z.string().min(1).refine(s => s.startsWith('/'), 'absolute path required').describe('Repo directory (absolute path, required)'),
     timeout: z.number().int().min(1).max(3600).optional().describe('Hard timeout seconds (1..3600, default 600)'),
-    extraArgs: z.array(z.string().max(4096)).optional().describe('Raw extra args forwarded verbatim to the worker. Omit unless you know the worker CLI.'),
+    extraArgs: z.array(z.string().max(4096)).optional().describe('Raw worker CLI args.'),
   },
   async ({ backend, ...rest }) => {
     if (!LADDER.includes(backend as Backend)) return reply(`Unknown worker: ${backend}`);
@@ -215,7 +210,7 @@ server.tool('worker_run',
 );
 
 server.tool('worker_resume',
-  'Continue a stopped worker, or retry a failed/timeout one. Pass the same specFile (bare filename in ~/.claude/plans/) used when the job was started.',
+  'Continue stopped worker, retry failed/timeout. Same specFile + dir as original. Optional timeout + extraArgs.',
   {
     handle: z.string(),
     specFile: z.string().min(1).refine(bareFilename, 'bare filename only (no path separators or ..)').describe('Spec filename (bare, no slashes) from ~/.claude/plans/'),
@@ -227,19 +222,19 @@ server.tool('worker_resume',
 );
 
 server.tool('worker_kill',
-  'Stop a running worker by handle.',
+  'Kill running worker by handle.',
   { handle: z.string() },
   async (args) => reply(handleKill(args))
 );
 
 server.tool('worker_status',
-  'Check a worker\'s current state. Returns status, pid, timing, etc. Not a completion signal — use `worker-report <handle>` which blocks until done.',
+  'Check worker state (status, pid, timing). Not completion signal — use worker-report.',
   { handle: z.string() },
   async (args) => reply(handleStatus(args))
 );
 
 server.tool('worker_extend',
-  'Push a running worker\'s deadline out by N seconds (1..86400). Repeatable. The deadline is soft within a grace window (~30s pre-deadline NEAR_TIMEOUT warning), but if nobody extends, the worker is hard-killed (status "timeout") ~60s past the deadline.',
+  'Extend running worker deadline by N seconds (1..86400). Repeatable. Hard-killed ~60s past deadline if unextended.',
   {
     handle: z.string().describe('Worker handle'),
     seconds: z.number().describe('Seconds to extend the deadline (1..86400)'),
@@ -248,19 +243,25 @@ server.tool('worker_extend',
 );
 
 server.tool('worker_doctor',
-  'Report worker health — names only the workers that are not operational; otherwise confirms all are fine.',
+  'Health check — names non-operational workers, or confirms all fine.',
   { backend: z.string().optional() },
   async (args) => reply(handleDoctor(args))
 );
 
 
 server.tool('worker_list',
-  'List recent worker jobs. Optionally filter by status.',
+  'List recent jobs. Optional status filter, limit (default 20).',
   {
     status: z.string().optional().describe('Filter by status: running|stopped|done|failed|timeout|killed'),
     limit: z.number().optional().describe('Max results (default 20)'),
   },
   async (args) => reply(handleList(args))
+);
+
+server.tool('worker_cleanup',
+  'Drop transcript (run.log) for done handle after diff review. Keeps job.json + worktree + branch. No-op unless done.',
+  { handle: z.string() },
+  async (args) => reply(handleCleanup(args))
 );
 
 if (import.meta.main) {
