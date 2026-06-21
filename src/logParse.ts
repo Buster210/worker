@@ -7,6 +7,10 @@ function envBytes(key: string, def: number): number {
 
 const STATUS_TAIL_BYTES = envBytes('WORKER_STATUS_TAIL_BYTES', 1_048_576);
 const SENTINEL_TAIL_BYTES = envBytes('WORKER_SENTINEL_TAIL_BYTES', 65_536);
+// Hard ceiling for the json-error full rescan. Without it a multi-MB streaming-json log gets
+// read whole into RAM on every cache-missing readSentinel (reaper sweep, per orphan, every 10s).
+// 8MB covers errors buried well before EOF; the 1MB tail above already catches terminal errors.
+const MAX_ERROR_SCAN_BYTES = envBytes('WORKER_MAX_ERROR_SCAN_BYTES', 8_388_608);
 
 export function tailCapped(logPath: string, cap: number = STATUS_TAIL_BYTES): string {
   try {
@@ -146,7 +150,7 @@ export function readSentinel(logPath: string, json: boolean): { status: Sentinel
   }
 
   if (!status && json && st.size > STATUS_TAIL_BYTES) {
-    const big = tailCapped(logPath, st.size);
+    const big = tailCapped(logPath, Math.min(st.size, MAX_ERROR_SCAN_BYTES));
     const bigLines = big.split('\n').filter(Boolean);
     status = detectJsonError(bigLines);
   }

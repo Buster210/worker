@@ -79,6 +79,28 @@ describe('statusLine', () => {
     expect(statusLine('stopped')).toBe('stopped');
     expect(statusLine('killed')).toBe('killed');
   });
+  it('exhausted with ladder runs → rich breakdown', () => {
+    const runs = [
+      { turn: 1, worker: 'omp', result: 'failed' },
+      { turn: 2, worker: 'cmd', result: 'stalled' },
+      { turn: 3, worker: 'codex', result: 'failed' },
+    ];
+    const line = statusLine('exhausted', undefined, undefined, runs);
+    expect(line).toContain('LADDER EXHAUSTED');
+    expect(line).toContain('omp → failed');
+    expect(line).toContain('cmd → stalled');
+    expect(line).toContain('codex → failed');
+  });
+  it('exhausted without ladder runs falls back to bare token', () => {
+    expect(statusLine('exhausted')).toBe('exhausted');
+  });
+  it('done/timeout/killed/stopped are unchanged', () => {
+    expect(statusLine('done')).toContain('completed');
+    expect(statusLine('timeout')).toBe('timeout');
+    expect(statusLine('killed')).toBe('killed');
+    expect(statusLine('stopped')).toBe('stopped');
+    expect(statusLine('failed:max-turns')).toBe('failed:max-turns');
+  });
 });
 
 describe('wantsDiff', () => {
@@ -92,9 +114,13 @@ describe('wantsDiff', () => {
     const ptr = 'completed — worker committed changes to branch current branch. Review the diff below and merge; nothing else to run.';
     expect(renderReport(handle, lockPath, () => 'DIFFBODY')).toBe(`${ptr}\nworktree: /repo/x\nbranch: worker/${handle}\n\nDIFFBODY`);
   });
-  it('exhausted ladder → "exhausted" + diff', () => {
+  it('exhausted ladder → headline + per-rung breakdown + diff', () => {
     const { handle, lockPath } = seedLadder('failed');
-    expect(renderReport(handle, lockPath, () => 'DIFFBODY')).toBe(`exhausted\nworktree: /repo/y\nbranch: worker/${handle}\n\nDIFFBODY`);
+    const expected = 'LADDER EXHAUSTED — no backend completed the task. Breakdown:\n' +
+      '  rung 1: omp → failed\n' +
+      '  rung 2: opencode → failed\n' +
+      `worktree: /repo/y\nbranch: worker/${handle}\n\nDIFFBODY`;
+    expect(renderReport(handle, lockPath, () => 'DIFFBODY')).toBe(expected);
   });
   it('done with empty diff emits a warning', () => {
     const { handle, lockPath } = seedRun('done');

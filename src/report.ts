@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { existsSync, statSync, watch } from 'fs';
+import { existsSync, statSync } from 'fs';
 import { basename } from 'path';
 import { spawnSync } from 'child_process';
 import { getJobFresh, getLadderHistory, lockPath } from './state.ts';
@@ -20,11 +20,19 @@ export function terminalStatus(handle: string, lockPath: string): string {
   return getJobFresh(handle)?.status ?? 'failed';
 }
 
-export function statusLine(status: string, branch?: string, baseSha?: string): string {
-  if (status !== 'done') return status;
-  const ref = branch ?? 'current branch';
-  const base = baseSha ? ` (base ${baseSha})` : '';
-  return `completed — worker committed changes to branch ${ref}${base}. Review the diff below and merge; nothing else to run.`;
+export type LadderRun = { turn: number; worker: string; result: string };
+
+export function statusLine(status: string, branch?: string, baseSha?: string, ladderRuns?: LadderRun[]): string {
+  if (status === 'done') {
+    const ref = branch ?? 'current branch';
+    const base = baseSha ? ` (base ${baseSha})` : '';
+    return `completed — worker committed changes to branch ${ref}${base}. Review the diff below and merge; nothing else to run.`;
+  }
+  if (status === 'exhausted' && ladderRuns?.length) {
+    const breakdown = ladderRuns.map(r => `  rung ${r.turn}: ${r.worker} → ${r.result}`).join('\n');
+    return `LADDER EXHAUSTED — no backend completed the task. Breakdown:\n${breakdown}`;
+  }
+  return status;
 }
 
 export function wantsDiff(status: string): boolean {
@@ -43,9 +51,14 @@ function gitDiff(repo: string, baseSha?: string): string {
 
 export function renderReport(handle: string, lockPath: string, diff: (repo: string, baseSha?: string) => string = gitDiff): string {
   const status = terminalStatus(handle, lockPath);
+  let ladderRuns: LadderRun[] | undefined;
+  if (status === 'exhausted' && lockPath.endsWith('.chain.lock')) {
+    const sid = basename(lockPath).replace(/\.chain\.lock$/, '');
+    ladderRuns = getLadderHistory(sid);
+  }
   if (!wantsDiff(status)) return statusLine(status);
   const job = getJobFresh(handle);
-  const line = statusLine(status, job?.branch, job?.base_sha);
+  const line = statusLine(status, job?.branch, job?.base_sha, ladderRuns);
   if (!job?.repo) return `${line}\n\n(diff unavailable: unknown handle ${handle})`;
   const diffDir = job.worktree_path ?? job.repo;
   const body = diff(diffDir, job.base_sha);
@@ -80,31 +93,22 @@ export async function waitForUnlock(lockPath: string, serverPid = 0, handle?: st
   const settle = (result: 'unlocked' | 'near_timeout') => {
     if (settled) return;
     settled = true;
-    watcher?.close();
-    clearInterval(slowPoll);
+    clearInterval(poller);
     resolve(result);
   };
 
-  // FSEvents (macOS) / inotify (Linux): fires instantly on lock file deletion, ~0 CPU
-  let watcher: ReturnType<typeof watch> | undefined;
-  try {
-    watcher = watch(lockPath, () => { if (!existsSync(lockPath)) settle('unlocked'); });
-    watcher.unref?.();
-  } catch {
-    // lock already gone between existsSync and watch, or unsupported FS
-    if (!existsSync(lockPath)) { resolve('unlocked'); return promise; }
-    // fall through to slow poll only
-  }
-
-  // ponytail: slow poll only for timeout/owner-dead — can't be event-driven; 5s is plenty
+  // ponytail: poll-only, NO fs.watch. On Bun/macOS, watch() on a lock that lives in a busy
+  // dir (the ladder/ chain dir gets sibling .chain.meta + history writes) storms the kqueue
+  // callback and pegs a core for the whole wait — the exact bug already removed from monitor.ts.
+  // A 1s existsSync poll is ~0 CPU and reactive enough for a completion blocker (workers run minutes).
   const poll = () => {
     if (!existsSync(lockPath)) { settle('unlocked'); return; }
     if (handle && isNearTimeout(getJobFresh(handle), Date.now())) { settle('near_timeout'); return; }
     if (ownerDead(serverPid)) settle('unlocked');
   };
-  const slowPoll = setInterval(poll, 5000);
-  slowPoll.unref?.();
-  poll(); // immediate: job may already be in the near band / owner already dead at call time
+  const poller = setInterval(poll, 1000);
+  poller.unref?.();
+  poll(); // immediate: lock may already be gone / job already in near band / owner already dead
 
   return promise;
 }

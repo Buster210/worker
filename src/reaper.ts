@@ -18,6 +18,12 @@ import { spawnSync } from 'child_process';
 import { unlinkSync, writeFileSync } from 'fs';
 
 const SWEEP_INTERVAL_MS = envMs('WORKER_REAPER_MS', 10_000);
+// The orphan sweep is cheap (in-memory + bounded disk); run it every tick. The liveness self-exit
+// check forks `ps` over the whole process table, so throttle it — lingering a few extra seconds with
+// no server alive is the safe failure mode (see header), so a 30s cadence costs nothing and cuts the
+// ps spawn rate 3x.
+const LIVE_CHECK_MS = envMs('WORKER_REAPER_LIVECHECK_MS', 30_000);
+let _lastLiveCheckAt = 0;
 // The server entry's path tail (e.g. "src/server.ts"), derived from this file's sibling.
 // Matching the tail — not the absolute path — catches the server whether Claude Code
 // launched it absolute (the mcp config form) or relative (dev/manual). Safe direction:
@@ -55,7 +61,11 @@ function exitCleanly(): void {
 
 function loop(): void {
   sweepStaleJobs({ fresh: true });            // also serves as the final sweep on the exit tick
-  if (!anyClaudeCodeAlive()) exitCleanly();   // no worker MCP server left -> don't linger as an orphan
+  const now = Date.now();
+  if (now - _lastLiveCheckAt >= LIVE_CHECK_MS) {  // throttle the ps-forking self-exit check to 30s
+    _lastLiveCheckAt = now;
+    if (!anyClaudeCodeAlive()) exitCleanly();   // no worker MCP server left -> don't linger as an orphan
+  }
   // NOT unref'd: a ref'd timer is what keeps this daemon alive between ticks. bun (unlike node)
   // does NOT hold the event loop open for a registered signal listener, so an unref'd timer here
   // would make the reaper run exactly one sweep and exit. exitCleanly/SIGTERM exit via process.exit.
