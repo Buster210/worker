@@ -1,10 +1,13 @@
 import { basename } from 'path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
 import { randomUUID } from 'crypto';
 import { spawnSync } from 'child_process';
 import { existsSync } from 'fs';
+import http from 'http';
+import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import {
   getJob, updateJob, finalizeJob, getAllJobs, pruneOldJobs, readSpec, loadChainMeta, saveChainMeta,
   pruneTranscript, getLadderHistory,
@@ -18,6 +21,10 @@ import { sweepStaleJobs, reapStoppedJobs, sweepChainLocks } from './maintenance.
 import { launch, forceKillJob, assertRepo, resumeLaunch as lifecycleResumeLaunch, shutdown, spawnReaper } from './lifecycle.ts';
 import { handleLadder } from './chain.ts';
 import { terminalStatus } from './report.ts';
+import {
+  acquireLock, readLock, removeLock, isDaemonAlive, SessionTracker,
+  killSessionWorkers, hardShutdown, startKeepalive,
+} from './daemon.ts';
 
 // --- MCP tool handlers (keep in server.ts) ---
 
@@ -175,100 +182,105 @@ const WORKER_INSTRUCTIONS = `# worker — delegate coding task to bg agent
 
 Other tools self-describe: \`worker_extend\` \`worker_resume\` \`worker_kill\` \`worker_status\` \`worker_list\` \`worker_doctor\` \`worker_cleanup\`.`;
 
-const server = new McpServer(
-  { name: 'worker', version: '0.3.0' },
-  { instructions: WORKER_INSTRUCTIONS },
-);
+/** Create a fresh McpServer with all worker tools registered. */
+export function createWorkerServer(tracker?: SessionTracker): McpServer {
+  const s = new McpServer(
+    { name: 'worker', version: '0.3.0' },
+    { instructions: WORKER_INSTRUCTIONS },
+  );
 
-const bareFilename = (s: string) => !s.includes('/') && !s.includes('\\') && s !== '.' && s !== '..' && !s.includes('..');
+  const bareFilename = (v: string) => !v.includes('/') && !v.includes('\\') && v !== '.' && v !== '..' && !v.includes('..');
 
-server.tool('worker_ladder',
-  `Default lane. Run task on bg agent, climbs backend ladder. → {handle, status:'running'} on worker/<handle> or current branch. Spec + report loop → server instructions.`,
-  {
-    sid: z.string().describe('Session ID ($CLAUDE_CODE_SESSION_ID)'),
-    specFile: z.string().min(1).refine(bareFilename, 'bare filename only (no path separators or ..)').describe('Spec filename (bare, no slashes) from ~/.claude/plans/'),
-    dir: z.string().min(1).refine(s => s.startsWith('/'), 'absolute path required').describe('Repo directory (absolute path, required)'),
-    timeout: z.number().int().min(1).max(3600).optional().describe('Hard timeout seconds (1..3600, default 600)'),
-    complex: z.boolean().optional().describe('true=hard; server picks model. Never pass model yourself.'),
-  },
-  async ({ sid, specFile, dir, timeout, complex }) => {
-    const prompt = readSpec(specFile);
-    return reply(handleLadder({ sid, prompt, dir, timeout, complex }));
-  }
-);
+  s.tool('worker_ladder',
+    `Default lane. Run task on bg agent, climbs backend ladder. → {handle, status:'running'} on worker/<handle> or current branch. Spec + report loop → server instructions.`,
+    {
+      sid: z.string().describe('Session ID ($CLAUDE_CODE_SESSION_ID)'),
+      specFile: z.string().min(1).refine(bareFilename, 'bare filename only (no path separators or ..)').describe('Spec filename (bare, no slashes) from ~/.claude/plans/'),
+      dir: z.string().min(1).refine(v => v.startsWith('/'), 'absolute path required').describe('Repo directory (absolute path, required)'),
+      timeout: z.number().int().min(1).max(3600).optional().describe('Hard timeout seconds (1..3600, default 600)'),
+      complex: z.boolean().optional().describe('true=hard; server picks model. Never pass model yourself.'),
+    },
+    async ({ sid, specFile, dir, timeout, complex }, extra) => {
+      if (tracker && extra.sessionId) tracker.setClaudeSid(extra.sessionId, sid);
+      const prompt = readSpec(specFile);
+      return reply(handleLadder({ sid, prompt, dir, timeout, complex }));
+    }
+  );
 
-server.tool('worker_run',
-  `Run task on a named backend — use only when user names one, else worker_ladder. → {handle, status:'running'}. Report loop → server instructions.`,
-  {
-    backend: z.string().describe('Named backend to run.'),
-    specFile: z.string().min(1).refine(bareFilename, 'bare filename only (no path separators or ..)').describe('Spec filename (bare, no slashes) from ~/.claude/plans/'),
-    model: z.string().regex(/^[A-Za-z0-9._:-]+$/).optional().describe('Model override. Ignored by workers that pin their own model.'),
-    dir: z.string().min(1).refine(s => s.startsWith('/'), 'absolute path required').describe('Repo directory (absolute path, required)'),
-    timeout: z.number().int().min(1).max(3600).optional().describe('Hard timeout seconds (1..3600, default 600)'),
-    extraArgs: z.array(z.string().max(4096)).optional().describe('Raw worker CLI args.'),
-  },
-  async ({ backend, ...rest }) => {
-    if (!LADDER.includes(backend as Backend)) return reply(`Unknown worker: ${backend}`);
-    return reply(handleRun({ backend: backend as Backend, ...rest }));
-  }
-);
+  s.tool('worker_run',
+    `Run task on a named backend — use only when user names one, else worker_ladder. → {handle, status:'running'}. Report loop → server instructions.`,
+    {
+      backend: z.string().describe('Named backend to run.'),
+      specFile: z.string().min(1).refine(bareFilename, 'bare filename only (no path separators or ..)').describe('Spec filename (bare, no slashes) from ~/.claude/plans/'),
+      model: z.string().regex(/^[A-Za-z9._:-]+$/).optional().describe('Model override. Ignored by workers that pin their own model.'),
+      dir: z.string().min(1).refine(v => v.startsWith('/'), 'absolute path required').describe('Repo directory (absolute path, required)'),
+      timeout: z.number().int().min(1).max(3600).optional().describe('Hard timeout seconds (1..3600, default 600)'),
+      extraArgs: z.array(z.string().max(4096)).optional().describe('Raw worker CLI args.'),
+    },
+    async ({ backend, ...rest }) => {
+      if (!LADDER.includes(backend as Backend)) return reply(`Unknown worker: ${backend}`);
+      return reply(handleRun({ backend: backend as Backend, ...rest }));
+    }
+  );
 
-server.tool('worker_resume',
-  'Resume stopped worker / retry failed|timeout. Pass original specFile + dir.',
-  {
-    handle: z.string(),
-    specFile: z.string().min(1).refine(bareFilename, 'bare filename only (no path separators or ..)').describe('Spec filename (bare, no slashes) from ~/.claude/plans/'),
-    dir: z.string().min(1).refine(s => s.startsWith('/'), 'absolute path required').describe('Repo directory (absolute path, required)'),
-    timeout: z.number().int().min(1).max(3600).optional(),
-    extraArgs: z.array(z.string().max(4096)).optional().describe('Raw worker CLI args.'),
-  },
-  async (args) => reply(handleResume(args))
-);
+  s.tool('worker_resume',
+    'Resume stopped worker / retry failed|timeout. Pass original specFile + dir.',
+    {
+      handle: z.string(),
+      specFile: z.string().min(1).refine(bareFilename, 'bare filename only (no path separators or ..)').describe('Spec filename (bare, no slashes) from ~/.claude/plans/'),
+      dir: z.string().min(1).refine(v => v.startsWith('/'), 'absolute path required').describe('Repo directory (absolute path, required)'),
+      timeout: z.number().int().min(1).max(3600).optional(),
+      extraArgs: z.array(z.string().max(4096)).optional().describe('Raw worker CLI args.'),
+    },
+    async (args) => reply(handleResume(args))
+  );
 
-server.tool('worker_kill',
-  'Kill a running worker.',
-  { handle: z.string() },
-  async (args) => reply(handleKill(args))
-);
+  s.tool('worker_kill',
+    'Kill a running worker.',
+    { handle: z.string() },
+    async (args) => reply(handleKill(args))
+  );
 
-server.tool('worker_status',
-  'Worker state: status, pid, timing. Not a done-signal — use worker-report to wait for completion.',
-  { handle: z.string() },
-  async (args) => reply(handleStatus(args))
-);
+  s.tool('worker_status',
+    'Worker state: status, pid, timing. Not a done-signal — use worker-report to wait for completion.',
+    { handle: z.string() },
+    async (args) => reply(handleStatus(args))
+  );
 
-server.tool('worker_extend',
-  'Push worker deadline +N sec (1..86400). Repeatable. Unextended → hard-killed ~60s past deadline.',
-  {
-    handle: z.string().describe('Worker handle'),
-    seconds: z.number().describe('Seconds to extend the deadline (1..86400)'),
-  },
-  async (args) => reply(handleExtend(args))
-);
+  s.tool('worker_extend',
+    'Push worker deadline +N sec (1..86400). Repeatable. Unextended → hard-killed ~60s past deadline.',
+    {
+      handle: z.string().describe('Worker handle'),
+      seconds: z.number().describe('Seconds to extend the deadline (1..86400)'),
+    },
+    async (args) => reply(handleExtend(args))
+  );
 
-server.tool('worker_doctor',
-  'Health check: names broken workers, else all-fine.',
-  { backend: z.string().optional() },
-  async (args) => reply(handleDoctor(args))
-);
+  s.tool('worker_doctor',
+    'Health check: names broken workers, else all-fine.',
+    { backend: z.string().optional() },
+    async (args) => reply(handleDoctor(args))
+  );
 
+  s.tool('worker_list',
+    'List recent jobs.',
+    {
+      status: z.string().optional().describe('Filter by status: running|stopped|done|failed|timeout|killed'),
+      limit: z.number().optional().describe('Max results (default 20)'),
+    },
+    async (args) => reply(handleList(args))
+  );
 
-server.tool('worker_list',
-  'List recent jobs.',
-  {
-    status: z.string().optional().describe('Filter by status: running|stopped|done|failed|timeout|killed'),
-    limit: z.number().optional().describe('Max results (default 20)'),
-  },
-  async (args) => reply(handleList(args))
-);
+  s.tool('worker_cleanup',
+    'Drop transcript (run.log) after diff reviewed. Keeps job.json + worktree + branch. No-op unless worker done.',
+    { handle: z.string() },
+    async (args) => reply(handleCleanup(args))
+  );
 
-server.tool('worker_cleanup',
-  'Drop transcript (run.log) after diff reviewed. Keeps job.json + worktree + branch. No-op unless worker done.',
-  { handle: z.string() },
-  async (args) => reply(handleCleanup(args))
-);
+  return s;
+}
 
-if (import.meta.main) {
+function initDaemon(): void {
   workerEnv();
   sweepStaleJobs();
   reapStoppedJobs();
@@ -276,9 +288,117 @@ if (import.meta.main) {
   pruneOldJobs();
   setInterval(() => { reapStoppedJobs(); sweepStaleJobs(); sweepChainLocks(); pruneOldJobs(); }, 60_000).unref();
   spawnReaper();
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  process.on('SIGTERM', shutdown);
-  process.on('SIGINT', shutdown);
-  process.stdin.on('end', shutdown);
+}
+
+if (import.meta.main) {
+  const httpMode = process.argv.includes('--http');
+
+  if (httpMode) {
+    initDaemon();
+    // --- HTTP daemon mode ---
+    const tracker = new SessionTracker();
+
+    const httpServer = http.createServer(async (req, res) => {
+      // Health endpoint
+      if (req.url === '/health' && req.method === 'GET') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, sessions: tracker.size, uptime: process.uptime() }));
+        return;
+      }
+
+      // MCP endpoint
+      if (req.url === '/mcp') {
+        let body = '';
+        for await (const chunk of req) body += chunk;
+
+        const sessionId = req.headers['mcp-session-id'] as string | undefined;
+
+        if (sessionId) {
+          const entry = tracker.get(sessionId);
+          if (entry) {
+            // Existing session — route to its transport (DELETE has no body)
+            const parsed = body ? JSON.parse(body) : undefined;
+            await entry.transport.handleRequest(req, res, parsed);
+            return;
+          }
+        }
+
+        if (!sessionId && req.method === 'POST') {
+          const parsed: unknown = JSON.parse(body);
+          if (isInitializeRequest(parsed)) {
+            // New session — create transport + server
+            const transport = new StreamableHTTPServerTransport({
+              sessionIdGenerator: () => randomUUID(),
+            });
+            const server = createWorkerServer(tracker);
+
+            // Wire close handler before connect — fires on disconnect (clean or broken SSE)
+            transport.onclose = () => {
+              const sid = transport.sessionId;
+              if (sid) {
+                const entry = tracker.remove(sid);
+                if (entry?.claudeSid) killSessionWorkers(entry.claudeSid);
+                if (tracker.size === 0) hardShutdown();
+              }
+            };
+
+            await server.connect(transport);
+            await transport.handleRequest(req, res, parsed);
+
+            // Transport now has a session ID — register with tracker
+            const mcpSid = transport.sessionId;
+            if (mcpSid) tracker.register(mcpSid, { transport, server });
+            return;
+          }
+        }
+
+        // Invalid request
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32000, message: 'Bad Request' }, id: null }));
+        return;
+      }
+
+      res.writeHead(404);
+      res.end('Not found');
+    });
+
+
+    // Try to bind. If port occupied, check if it's our daemon.
+    const port = process.env.WORKER_PORT ? Number(process.env.WORKER_PORT) : 54321;
+    httpServer.on('error', async (err: NodeJS.ErrnoException) => {
+      if (err.code === 'EADDRINUSE') {
+        const existing = readLock();
+        if (existing && await isDaemonAlive(existing)) {
+          console.error(`Daemon already running on port ${existing.port} (PID ${existing.pid}). Reusing.`);
+          process.exit(0);
+        }
+        // Stale or foreign process — try to reclaim
+        console.error(`Port ${port} occupied. Removing stale lockfile and retrying...`);
+        removeLock();
+        httpServer.listen(port);
+      } else {
+        console.error('HTTP server error:', err);
+        process.exit(1);
+      }
+    });
+
+    httpServer.listen(port, () => {
+      const actualPort = (httpServer.address() as { port: number }).port;
+      if (!acquireLock(process.pid, actualPort)) {
+        console.error('Failed to acquire lockfile. Another daemon may have started.');
+        httpServer.close();
+        process.exit(1);
+      }
+      console.error(`Worker daemon listening on http://127.0.0.1:${actualPort}/mcp`);
+      startKeepalive(tracker);
+    });
+
+    const gracefulShutdown = () => { hardShutdown(); };
+    process.on('SIGTERM', gracefulShutdown);
+    process.on('SIGINT', gracefulShutdown);
+  } else {
+    // --- Stdio mode (default) → bridge to shared daemon ---
+    const { runBridge } = await import('./proxy.ts');
+    await runBridge();
+  }
 }

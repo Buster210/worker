@@ -100,14 +100,18 @@ export async function waitForUnlock(lockPath: string, serverPid = 0, handle?: st
   // ponytail: poll-only, NO fs.watch. On Bun/macOS, watch() on a lock that lives in a busy
   // dir (the ladder/ chain dir gets sibling .chain.meta + history writes) storms the kqueue
   // callback and pegs a core for the whole wait — the exact bug already removed from monitor.ts.
-  // A 1s existsSync poll is ~0 CPU and reactive enough for a completion blocker (workers run minutes).
+  // A 5s existsSync poll is ~0 CPU and reactive enough for a completion blocker (workers run minutes).
   const poll = () => {
     if (!existsSync(lockPath)) { settle('unlocked'); return; }
     if (handle && isNearTimeout(getJobFresh(handle), Date.now())) { settle('near_timeout'); return; }
     if (ownerDead(serverPid)) settle('unlocked');
   };
-  const poller = setInterval(poll, 1000);
-  poller.unref?.();
+  // ponytail: do NOT unref this timer. It IS the process's keep-alive until unlock, and
+  // unref'ing it while a top-level await is pending makes Bun busy-spin the event loop
+  // (~80% CPU for the whole wait) instead of sleeping between ticks. Leaving it ref'd lets
+  // the loop sleep (~0 CPU); the process still exits cleanly — settle() clears the interval
+  // (→ await resolves → main ends) and stdin-close hits process.exit(0).
+  const poller = setInterval(poll, 5000);
   poll(); // immediate: lock may already be gone / job already in near band / owner already dead
 
   return promise;

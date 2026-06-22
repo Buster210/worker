@@ -63,7 +63,6 @@ export function spawnReaper(): void {
     }
   } catch {}
 }
-
 // --- Repo guard ---
 const _repoChecked = new Set<string>();
 export function assertRepo(dir: string) {
