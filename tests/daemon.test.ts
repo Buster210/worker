@@ -72,16 +72,6 @@ describe('SessionTracker', () => {
     expect(tracker.size).toBe(1);
     const entry = tracker.get('mcp-1');
     expect(entry).toBeDefined();
-    expect(entry!.claudeSid).toBe('');
-  });
-
-  it('setClaudeSid updates entry', () => {
-    const tracker = new SessionTracker();
-    const mockTransport = { close: async () => {} };
-    const mockServer = { sendLoggingMessage: async () => {} };
-    tracker.register('mcp-1', { transport: mockTransport as never, server: mockServer as never });
-    tracker.setClaudeSid('mcp-1', 'claude-abc');
-    expect(tracker.get('mcp-1')!.claudeSid).toBe('claude-abc');
   });
 
   it('remove returns entry and deletes it', () => {
@@ -89,10 +79,8 @@ describe('SessionTracker', () => {
     const mockTransport = { close: async () => {} };
     const mockServer = { sendLoggingMessage: async () => {} };
     tracker.register('mcp-1', { transport: mockTransport as never, server: mockServer as never });
-    tracker.setClaudeSid('mcp-1', 'claude-abc');
     const removed = tracker.remove('mcp-1');
     expect(removed).toBeDefined();
-    expect(removed!.claudeSid).toBe('claude-abc');
     expect(tracker.size).toBe(0);
     expect(tracker.get('mcp-1')).toBeUndefined();
   });
@@ -108,8 +96,6 @@ describe('SessionTracker', () => {
     const mockServer = { sendLoggingMessage: async () => {} };
     tracker.register('mcp-1', { transport: mockTransport as never, server: mockServer as never });
     tracker.register('mcp-2', { transport: mockTransport as never, server: mockServer as never });
-    tracker.setClaudeSid('mcp-1', 'claude-a');
-    tracker.setClaudeSid('mcp-2', 'claude-b');
     const entries = [...tracker.entries()];
     expect(entries.length).toBe(2);
     expect(entries.map(e => e[0]).sort()).toEqual(['mcp-1', 'mcp-2']);

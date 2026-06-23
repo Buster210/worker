@@ -106,7 +106,7 @@ export function launch(
   backend: Backend,
   prompt: string,
   dir: string,
-  opts: { sid: string; model?: string; complex?: boolean; extraArgs?: string[]; timeoutMs?: number; deadlineAt?: number; completionLock?: string; seed?: SeedContext; reuseWorktree?: string; reuseBaseSha?: string },
+  opts: { mcpSid: string; model?: string; complex?: boolean; extraArgs?: string[]; timeoutMs?: number; deadlineAt?: number; completionLock?: string; seed?: SeedContext; reuseWorktree?: string; reuseBaseSha?: string },
 ): LaunchResult {
   const handle = newHandle(backend);
   trackLaunched(handle);
@@ -132,7 +132,7 @@ export function launch(
     // claude picks model by task hardness: complex → sonnet, else haiku. omp self-selects.
     const claudeModel = opts.complex ? 'sonnet' : 'haiku';
     const modelToUse = backend === 'claude' ? (opts.model ?? claudeModel) : backend === 'omp' ? undefined : opts.model;
-    insertJob({ handle, backend, sid: opts.sid, repo: dir, worktree_path: reuse ?? treePath, base_sha: opts.reuseBaseSha, model: modelToUse, task: prompt, log_path: lp, completion_lock: opts.completionLock, server_pid: process.pid, server_started: SERVER_STARTED, server_sid: SERVER_SID, deadline_at: opts.deadlineAt });
+    insertJob({ handle, backend, sid: opts.mcpSid, repo: dir, worktree_path: reuse ?? treePath, base_sha: opts.reuseBaseSha, model: modelToUse, task: prompt, log_path: lp, completion_lock: opts.completionLock, server_pid: process.pid, server_started: SERVER_STARTED, server_sid: SERVER_SID, deadline_at: opts.deadlineAt });
 
     let inPlace = false;
     let wt: string;

@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Resolve symlink chain to find package root
+SELF="$0"
+while [ -L "$SELF" ]; do
+  DIR="$(cd "$(dirname "$SELF")" && pwd)"
+  LINK="$(readlink "$SELF")"
+  SELF="$([ "${LINK#/}" = "$LINK" ] && echo "$DIR/$LINK" || echo "$LINK")"
+done
+PKG_DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
+exec bun run "$PKG_DIR/src/server.ts" "$@"

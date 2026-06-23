@@ -109,7 +109,6 @@ export async function isDaemonAlive(lock: DaemonLock): Promise<boolean> {
 // --- Session tracking ---
 
 export interface SessionEntry {
-  claudeSid: string;
   transport: StreamableHTTPServerTransport;
   server: McpServer;
 }
@@ -117,15 +116,9 @@ export interface SessionEntry {
 export class SessionTracker {
   private _map = new Map<string, SessionEntry>();
 
-  /** Register a new MCP session with transport + server refs. claudeSid filled later by tool handler. */
-  register(mcpSid: string, entry: Omit<SessionEntry, 'claudeSid'>): void {
-    this._map.set(mcpSid, { ...entry, claudeSid: '' });
-  }
-
-  /** Set the Claude session ID for an already-registered MCP session. */
-  setClaudeSid(mcpSid: string, claudeSid: string): void {
-    const e = this._map.get(mcpSid);
-    if (e) e.claudeSid = claudeSid;
+  /** Register a new MCP session with transport + server refs. */
+  register(mcpSid: string, entry: SessionEntry): void {
+    this._map.set(mcpSid, entry);
   }
 
   /** Remove and return the full session entry, or undefined if unknown. */
@@ -144,11 +137,11 @@ export class SessionTracker {
 // --- Per-session cleanup ---
 
 /**
- * Kill all workers belonging to a specific Claude session.
+ * Kill all workers belonging to a specific MCP session.
  * Called when a session disconnects (clean or detected-dead).
  */
-export function killSessionWorkers(claudeSid: string): void {
-  const jobs = getAllRunningJobsFresh().filter(j => j.sid === claudeSid && j.status === 'running');
+export function killSessionWorkers(mcpSid: string): void {
+  const jobs = getAllRunningJobsFresh().filter(j => j.sid === mcpSid && j.status === 'running');
   for (const job of jobs) {
     if (job.worker_pid > 0) {
       killProcessTree(job.worker_pid, 'SIGKILL');

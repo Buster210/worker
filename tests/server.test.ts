@@ -9,8 +9,8 @@ process.env.WORKER_STATE_DIR = STATE_DIR;
 const PLANS_DIR = join(tmpdir(), `wserver-plans-${process.pid}`);
 process.env.WORKER_PLANS_DIR = PLANS_DIR;
 
-// server.ts only boots the stdio transport under `import.meta.main`, so importing it
-// here registers the tools as a side effect but does NOT connect/hang the test runner.
+// Importing server.ts here registers tools as a side effect but does NOT boot the HTTP server
+// (the server only starts under `import.meta.main`).
 import { reply, handleStatus, handleKill, handleResume, handleList, handleDoctor } from '../src/server.ts';
 import { insertJob, updateJob, finalizeJob, getJob, logPath as stateLogPath, appendLadder, chainLockPath } from '../src/state.ts';
 import { workerEnv } from '../src/env.ts';

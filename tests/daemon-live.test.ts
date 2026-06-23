@@ -76,7 +76,7 @@ function httpDelete(port: number, path: string, headers: Record<string, string> 
 
 async function startDaemon(port: number): Promise<ChildProcess> {
   try { unlinkSync(LOCK_PATH); } catch {}
-  const proc = spawn('bun', ['run', 'src/server.ts', '--http'], {
+  const proc = spawn('bun', ['run', 'src/server.ts'], {
     cwd: join(import.meta.dir, '..'),
     stdio: ['ignore', 'pipe', 'pipe'],
     env: makeEnv(port),
@@ -87,7 +87,7 @@ async function startDaemon(port: number): Promise<ChildProcess> {
 
 /** Start daemon that is EXPECTED to fail (e.g. port occupied). Returns the process. */
 function startDaemonExpectedFail(port: number): ChildProcess {
-  return spawn('bun', ['run', 'src/server.ts', '--http'], {
+  return spawn('bun', ['run', 'src/server.ts'], {
     cwd: join(import.meta.dir, '..'),
     stdio: ['ignore', 'pipe', 'pipe'],
     env: makeEnv(port),
