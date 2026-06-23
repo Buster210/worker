@@ -3,12 +3,11 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { mkdirSync, writeFileSync, existsSync, unlinkSync } from 'fs';
 
-// Throwaway state store, set BEFORE importing report/state (resolution is lazy). A tiny report poll
-// interval keeps the waitForUnlock anti-hang test fast (reportPollMs() reads the env lazily per tick).
+
 const STATE_DIR = join(tmpdir(), `wreport-state-${process.pid}`);
 process.env.WORKER_STATE_DIR = STATE_DIR;
 process.env.WORKER_REPORT_POLL_MS = '20';
-process.env.WORKER_NEAR_EXPIRY_MS = '30000'; // pin the band so isNearTimeout boundary asserts are deterministic
+process.env.WORKER_NEAR_EXPIRY_MS = '30000'; 
 
 import { terminalStatus, statusLine, wantsDiff, renderReport, waitForUnlock, isNearTimeout } from '../src/report.ts';
 import { insertJob, updateJob, appendLadder, chainLockPath } from '../src/state.ts';
@@ -16,7 +15,7 @@ import { insertJob, updateJob, appendLadder, chainLockPath } from '../src/state.
 let seq = 0;
 const uniq = (p: string) => `${p}-${process.pid}-${seq++}`;
 
-// Seed a single-run job at the given terminal status; return its handle + a (non-chain) lock path.
+
 function seedRun(status: string): { handle: string; lockPath: string } {
   const handle = uniq('h');
   insertJob({ handle, backend: 'cmd', sid: uniq('s'), repo: '/repo/x', log_path: '/tmp/x.log' });
@@ -24,7 +23,7 @@ function seedRun(status: string): { handle: string; lockPath: string } {
   return { handle, lockPath: `/any/${handle}/.lock` };
 }
 
-// Seed a ladder audit trail whose last row carries `lastResult`; return a handle + the chain lock path.
+
 function seedLadder(lastResult: string): { handle: string; lockPath: string; sid: string } {
   const sid = uniq('sid');
   const handle = uniq('h');
@@ -151,23 +150,23 @@ describe('waitForUnlock — anti-hang', () => {
   it('resolves promptly when the lock is removed (owner alive)', async () => {
     const lock = join(STATE_DIR, `${uniq('lk')}.lock`);
     writeFileSync(lock, '');
-    const p = waitForUnlock(lock, process.pid); // own pid = a live owner
+    const p = waitForUnlock(lock, process.pid); 
     setTimeout(() => { try { unlinkSync(lock); } catch {} }, 30);
-    await p; // must resolve once the lock clears, not hang
+    await p; 
     expect(existsSync(lock)).toBe(false);
   });
 
   it('returns immediately when the lock is already gone', async () => {
     await waitForUnlock(join(STATE_DIR, `${uniq('lk')}.missing.lock`), process.pid);
-    expect(true).toBe(true); // resolved without throwing/hanging
+    expect(true).toBe(true); 
   });
 
   it('bails when the owning server is dead even though the lock persists', async () => {
     const lock = join(STATE_DIR, `${uniq('lk')}.lock`);
     writeFileSync(lock, '');
-    // PID space well above anything a fresh box allocated → process.kill(pid,0) throws → dead owner.
-    await waitForUnlock(lock, 42_000_321); // must resolve despite the lock still being held
-    expect(existsSync(lock)).toBe(true); // we bailed on the dead owner; lock was never cleared
+    
+    await waitForUnlock(lock, 42_000_321); 
+    expect(existsSync(lock)).toBe(true); 
   });
 
   it('legacy/unknown owner (serverPid 0) does NOT bail — only the lock removal resolves it', async () => {
@@ -175,7 +174,7 @@ describe('waitForUnlock — anti-hang', () => {
     writeFileSync(lock, '');
     let resolved = false;
     const p = waitForUnlock(lock, 0).then(() => { resolved = true; });
-    await Bun.sleep(80); // several poll ticks — must NOT have bailed
+    await Bun.sleep(80); 
     expect(resolved).toBe(false);
     unlinkSync(lock);
     await p;
@@ -184,19 +183,19 @@ describe('waitForUnlock — anti-hang', () => {
 
   it('breaks out with near_timeout when a watched running job crosses into the deadline band mid-wait', async () => {
     const lock = join(STATE_DIR, `${uniq('lk')}.lock`);
-    writeFileSync(lock, ''); // lock never clears — only the deadline watch can end this wait
+    writeFileSync(lock, ''); 
     const handle = uniq('h');
     insertJob({ handle, backend: 'cmd', sid: uniq('s'), repo: '/repo/z', log_path: '/tmp/z.log' });
-    updateJob(handle, { status: 'running', deadline_at: Date.now() + 60 }); // ~60ms out, well inside NEAR
+    updateJob(handle, { status: 'running', deadline_at: Date.now() + 60 }); 
     const why = await waitForUnlock(lock, 0, handle);
     expect(why).toBe('near_timeout');
-    expect(existsSync(lock)).toBe(true); // we bailed on the deadline, never cleared the lock
+    expect(existsSync(lock)).toBe(true); 
     unlinkSync(lock);
   });
 });
 
 describe('isNearTimeout — band predicate', () => {
-  const near = 30_000; // WORKER_NEAR_EXPIRY_MS default
+  const near = 30_000; 
   const run = (deadline_at?: number, status = 'running') => ({ status, deadline_at });
   it('fires inside [deadline-NEAR, deadline+NEAR] for a running job', () => {
     const now = 1_000_000;
@@ -205,8 +204,8 @@ describe('isNearTimeout — band predicate', () => {
   });
   it('stays quiet outside the band', () => {
     const now = 1_000_000;
-    expect(isNearTimeout(run(now + near + 1), now)).toBe(false); // too early
-    expect(isNearTimeout(run(now - near - 1), now)).toBe(false); // long past — grace/kill territory
+    expect(isNearTimeout(run(now + near + 1), now)).toBe(false); 
+    expect(isNearTimeout(run(now - near - 1), now)).toBe(false); 
   });
   it('ignores non-running jobs and missing/zero deadlines', () => {
     const now = 1_000_000;

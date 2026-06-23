@@ -1,7 +1,6 @@
 import { describe, it, expect, afterAll, afterEach, beforeAll, setDefaultTimeout } from 'bun:test';
 
-// Live-backend tests budget 60s internally via runToLog; bun's 5s default would kill
-// them before any real LLM call returns. Raise the per-test ceiling so they can complete.
+
 setDefaultTimeout(70_000);
 import { spawn, spawnSync } from 'child_process';
 import { writeFileSync, readFileSync, rmSync, mkdtempSync, statSync } from 'fs';
@@ -16,6 +15,9 @@ process.env.WORKER_LOGIN_SHELL = '0';
 
 import { resolveStatus } from '../src/status.ts';
 import { emitsJsonLog } from '../src/backends.ts';
+import { backendShellArgv } from '../src/runner.ts';
+import { readSentinel } from '../src/logParse.ts';
+import { isProcessAlive, killProcessTree } from '../src/process.ts';
 
 const REPO = mkdtempSync(join(tmpdir(), 'wperbe-repo-'));
 const tmpFiles: string[] = [];
@@ -26,7 +28,7 @@ let seq = 0;
 function safeRm(p: string) { try { rmSync(p, { recursive: true, force: true }); } catch {} }
 
 afterEach(() => {
-  for (const pid of frozenPids) { try { process.kill(-pid, 'SIGKILL'); } catch {} }
+  for (const pid of frozenPids) { try { killProcessTree(pid, 'SIGKILL'); } catch {} }
   frozenPids.length = 0;
   for (const f of tmpFiles) safeRm(f);
   tmpFiles.length = 0;
@@ -47,23 +49,22 @@ function fakeScript(body: string): { path: string; argv: string[] } {
 
 async function runToLog(argv: string[], logPath: string, timeoutMs: number): Promise<{ rc: number; timedOut: boolean; content: string; killedByUs: boolean }> {
   const fd = require('fs').openSync(logPath, 'a');
-  const proc = spawn(argv[0], argv.slice(1), { detached: true, stdio: ['ignore', fd, fd] });
+  const wrapped = backendShellArgv(argv);
+  const proc = spawn(wrapped[0], wrapped.slice(1), { detached: true, stdio: ['ignore', fd, fd] });
   proc.unref();
   frozenPids.push(proc.pid!);
   const start = Date.now();
   let sawTerminal = false;
   let terminalSince = 0;
   let killedByUs = false;
+  const json = emitsJsonLog(argv[0] as any);
   while (Date.now() - start < timeoutMs) {
-    try {
-      process.kill(proc.pid!, 0);
-    } catch { break; }
+    if (!isProcessAlive(proc.pid!)) break;
     try {
       if (statSync(logPath).size > 0) {
-        const head = readFileSync(logPath, 'utf8').slice(-2000);
-        if (/^\s*(DONE|FAILED(:|\s|$)|"stopReason":\s*"end_turn"|"agent_end"|"turn.completed")/m.test(head)) {
+        if (readSentinel(logPath, json).status !== null) {
           if (!sawTerminal) { sawTerminal = true; terminalSince = Date.now(); }
-          if (Date.now() - terminalSince > 3000) { try { process.kill(-proc.pid!, 'SIGTERM'); } catch {} killedByUs = true; break; }
+          if (Date.now() - terminalSince > 3000) { killProcessTree(proc.pid!, 'SIGTERM'); killedByUs = true; break; }
         }
       }
     } catch {}

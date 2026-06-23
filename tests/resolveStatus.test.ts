@@ -14,8 +14,7 @@ describe('resolveStatus', () => {
     testLogs.length = 0;
   });
 
-  // --- Text-mode backends: sentinel detection still works ---
-
+  
   it('returns "done" when log last line is DONE', () => {
     const tmpLogPath = `${tmpdir()}/resolveStatus-${process.pid}-${Date.now()}-1.log`;
     writeFileSync(tmpLogPath, 'Some log line\nDONE');
@@ -85,8 +84,7 @@ describe('resolveStatus', () => {
     expect(result).toBe('done');
   });
 
-  // --- JSON mode: omp/codex log with assistant text sentinels ---
-
+  
   it('omp json log ending assistant text "DONE" -> done', () => {
     const tmpLogPath = `${tmpdir()}/resolveStatus-${process.pid}-${Date.now()}-9.log`;
     const events = [
@@ -186,8 +184,8 @@ describe('resolveStatus', () => {
 
   it('json log whose final events exceed cap -> readSentinel null -> exit-code fallthrough', () => {
     const tmpLogPath = `${tmpdir()}/resolveStatus-${process.pid}-${Date.now()}-12.log`;
-    // Write a log where the only real content is a giant line exceeding the cap.
-    // The cap is set via the env in the test; we use a tiny cap.
+    
+    
     const giantText = 'x'.repeat(500);
     const events = [
       JSON.stringify({ message: { role: 'assistant', content: [{ type: 'text', text: giantText }] } }),
@@ -196,11 +194,7 @@ describe('resolveStatus', () => {
     writeFileSync(tmpLogPath, events);
     testLogs.push(tmpLogPath);
 
-    // Set a tiny cap so the giant line is the only thing in the tail window,
-    // but the DONE line is also within the cap since both are small.
-    // Actually, to truly test "exceeds cap", write a log where the DONE line
-    // is in a giant JSONL line that alone exceeds the cap.
-    // Simpler: write only a giant line, no sentinel → readSentinel returns null.
+    
     const tmpLogPath2 = `${tmpdir()}/resolveStatus-${process.pid}-${Date.now()}-12b.log`;
     const hugeEvents = [
       JSON.stringify({ message: { role: 'assistant', content: [{ type: 'text', text: 'x'.repeat(2000) }] } }),
@@ -208,12 +202,11 @@ describe('resolveStatus', () => {
     writeFileSync(tmpLogPath2, hugeEvents);
     testLogs.push(tmpLogPath2);
 
-    // With a 100-byte cap, the tail will only see part of the giant line.
-    // readSentinel should return null; fall through to exit code.
+    
     process.env.WORKER_STATUS_TAIL_BYTES = '100';
     expect(readSentinel(tmpLogPath2, true).status).toBeNull();
-    expect(resolveStatus('omp', 0, tmpLogPath2, false)).toBe('done'); // rc=0
-    expect(resolveStatus('omp', 1, tmpLogPath2, false)).toBe('failed'); // rc!=0
+    expect(resolveStatus('omp', 0, tmpLogPath2, false)).toBe('done'); 
+    expect(resolveStatus('omp', 1, tmpLogPath2, false)).toBe('failed'); 
     delete process.env.WORKER_STATUS_TAIL_BYTES;
   });
 
@@ -221,7 +214,7 @@ describe('resolveStatus', () => {
     const tmpLogPath = `${tmpdir()}/resolveStatus-${process.pid}-${Date.now()}-13.log`;
     writeFileSync(tmpLogPath, 'info: starting\ninfo: working\nDONE');
     testLogs.push(tmpLogPath);
-    // cmd is a text backend (not emitsJsonLog)
+    
     expect(resolveStatus('cmd', 0, tmpLogPath, false)).toBe('done');
   });
 
@@ -258,7 +251,7 @@ describe('tailCapped', () => {
 
   it('reads <= cap bytes from a file larger than cap', () => {
     const tmpLogPath = `${tmpdir()}/tailCapped-${process.pid}-${Date.now()}-2.log`;
-    // Write a file with known content: padding + sentinel at the end.
+    
     const padding = 'A'.repeat(900);
     const sentinel = 'DONE';
     writeFileSync(tmpLogPath, `${padding}\n${sentinel}\n`);
@@ -266,14 +259,14 @@ describe('tailCapped', () => {
 
     const cap = 200;
     const result = tailCapped(tmpLogPath, cap);
-    // The tail should not contain the full padding (900 bytes > 200 cap).
-    expect(result.length).toBeLessThanOrEqual(cap + 10); // small margin for partial-line handling
+    
+    expect(result.length).toBeLessThanOrEqual(cap + 10); 
     expect(result).toContain('DONE');
   });
 
   it('never loads the whole file — asserts read offset when capped', () => {
     const tmpLogPath = `${tmpdir()}/tailCapped-${process.pid}-${Date.now()}-3.log`;
-    // 3KB file: first 2KB is noise, last 100 bytes has sentinel.
+    
     const noise = 'x'.repeat(2900);
     writeFileSync(tmpLogPath, `${noise}\nDONE\n`);
     testLogs.push(tmpLogPath);
@@ -283,7 +276,7 @@ describe('tailCapped', () => {
     expect(size).toBeGreaterThan(cap);
 
     const result = tailCapped(tmpLogPath, cap);
-    // The result should be at most cap bytes (plus partial-line overhead).
+    
     expect(result.length).toBeLessThanOrEqual(cap + 50);
     expect(result).toContain('DONE');
   });

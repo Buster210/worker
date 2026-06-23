@@ -111,7 +111,8 @@ export async function waitForUnlock(lockPath: string, serverPid = 0, handle?: st
   // (~80% CPU for the whole wait) instead of sleeping between ticks. Leaving it ref'd lets
   // the loop sleep (~0 CPU); the process still exits cleanly — settle() clears the interval
   // (→ await resolves → main ends) and stdin-close hits process.exit(0).
-  const poller = setInterval(poll, 5000);
+  const pollMs = Number(process.env.WORKER_REPORT_POLL_MS);
+  const poller = setInterval(poll, Number.isFinite(pollMs) && pollMs > 0 ? pollMs : 5000);
   poll(); // immediate: lock may already be gone / job already in near band / owner already dead
 
   return promise;

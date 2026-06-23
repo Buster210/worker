@@ -8,7 +8,7 @@ import http from 'http';
 const LOCK_DIR = join(tmpdir(), `worker-daemon-test-${process.pid}`);
 const LOCK_PATH = join(LOCK_DIR, 'server.json');
 
-// Override lock path for testing
+
 process.env.WORKER_STATE_DIR = LOCK_DIR;
 
 describe('lockfile protocol', () => {
@@ -31,7 +31,7 @@ describe('lockfile protocol', () => {
     acquireLock(11111, 3000);
     const result = acquireLock(22222, 3001);
     expect(result).toBe(false);
-    // Original lock unchanged
+    
     const lock = readLock();
     expect(lock!.pid).toBe(11111);
   });
@@ -107,7 +107,7 @@ describe('HTTP daemon integration', () => {
   let port: number;
 
   beforeAll(async () => {
-    // Start a minimal HTTP server that mimics the daemon's /health endpoint
+    
     server = http.createServer((req, res) => {
       if (req.url === '/health' && req.method === 'GET') {
         res.writeHead(200, { 'Content-Type': 'application/json' });

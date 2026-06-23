@@ -3,7 +3,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { mkdirSync, rmSync } from 'fs';
 
-// Throwaway state store — set BEFORE importing server/state (resolution is lazy).
+
 const STATE_DIR = join(tmpdir(), `wexit-${process.pid}`);
 process.env.WORKER_STATE_DIR = STATE_DIR;
 
@@ -22,7 +22,7 @@ afterEach(() => {
   try { rmSync(STATE_DIR, { recursive: true, force: true }); } catch {}
 });
 
-// Insert a job on disk and return its handle.
+
 function seedJob(status: string, opts: { pid?: number; token?: string } = {}): string {
   const handle = `wexit-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
   insertJob({ handle, backend: 'cmd', sid: 'test', repo: REPO, log_path: stateLogPath(handle, REPO) });
@@ -33,7 +33,7 @@ function seedJob(status: string, opts: { pid?: number; token?: string } = {}): s
   return handle;
 }
 
-// Stub process.exit so the test runner isn't killed; callCount tracks invocations.
+
 function stubExit(): { calls: number } {
   const state = { calls: 0 };
   spyOn(process, 'exit').mockImplementation((..._args: unknown[]) => {
@@ -56,7 +56,7 @@ describe('shutdown', () => {
 
     await shutdown();
 
-    // Tracked jobs: finalized resumable with their resume_token
+    
     const j1 = getJob(trackedRunning)!;
     expect(j1.status).toBe('failed');
     expect(j1.resume_token).toBe('tok-aaa');
@@ -65,7 +65,7 @@ describe('shutdown', () => {
     expect(j2.status).toBe('failed');
     expect(j2.resume_token).toBe('tok-bbb');
 
-    // Untracked job: untouched
+    
     const j3 = getJob(untracked)!;
     expect(j3.status).toBe('running');
     expect(j3.resume_token).toBe('tok-xxx');
@@ -82,7 +82,7 @@ describe('shutdown', () => {
     trackLaunched(h2);
 
     await shutdown();
-    await shutdown(); // second call — no-op
+    await shutdown(); 
 
     expect(exitState.calls).toBe(1);
     expect(getJob(h1)!.status).toBe('failed');
@@ -92,7 +92,7 @@ describe('shutdown', () => {
   it('skips kill for a stopped job without worker_pid', async () => {
     const exitState = stubExit();
 
-    // Stopped with no pid (anomalous) — shutdown should finalize but not kill
+    
     const h = seedJob('stopped', { token: 'tok-nopid' });
     trackLaunched(h);
 

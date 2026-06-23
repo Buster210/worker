@@ -4,8 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync, realpathSync } from 'fs'
 import { join } from 'path';
 import { tmpdir } from 'os';
 
-// Hermetic state dir — set BEFORE importing worktree.ts (which imports state.ts lazily).
-// Use realpathSync to resolve macOS /var → /private/var symlink, matching git's output.
+
 const STATE_DIR_RAW = join(tmpdir(), `wworktree-state-${process.pid}`);
 mkdirSync(STATE_DIR_RAW, { recursive: true });
 const STATE_DIR = realpathSync(STATE_DIR_RAW);
@@ -14,8 +13,7 @@ process.env.WORKER_STATE_DIR = STATE_DIR;
 import { existsSync } from 'fs';
 import { addWorktree, addWorktreeAsync, removeWorktree, listWorktrees, clearStaleIndexLock } from '../src/worktree.ts';
 
-// Set up a temp repo WITH an initial commit so HEAD exists (worktree add requires HEAD).
-// realpathSync resolves /var → /private/var on macOS so paths match git worktree list output.
+
 const REPO = realpathSync(mkdtempSync(join(tmpdir(), 'wworktree-repo-')));
 spawnSync('git', ['init', '-q'], { cwd: REPO });
 spawnSync('git', ['config', 'user.email', 'test@test.com'], { cwd: REPO });
@@ -35,12 +33,12 @@ describe('addWorktree', () => {
     const handle = 'test-handle-add';
     const path = addWorktree(REPO, handle);
 
-    // The returned path exists as a git worktree
+    
     const listResult = spawnSync('git', ['-C', REPO, 'worktree', 'list', '--porcelain'], { encoding: 'utf8' });
     expect(listResult.stdout).toContain(path);
     expect(listResult.stdout).toContain(`worker/${handle}`);
 
-    // The directory itself exists
+    
     const statResult = spawnSync('test', ['-d', path]);
     expect(statResult.status).toBe(0);
   });
@@ -73,7 +71,7 @@ describe('listWorktrees', () => {
   it('returns at least the main worktree path', () => {
     const paths = listWorktrees(REPO);
     expect(paths.length).toBeGreaterThanOrEqual(1);
-    // The main repo itself is always listed
+    
     expect(paths.some(p => p === REPO)).toBe(true);
   });
 
@@ -90,13 +88,13 @@ describe('removeWorktree', () => {
     const handle = 'test-handle-remove';
     const wtPath = addWorktree(REPO, handle);
 
-    // Confirm it's there
+    
     let paths = listWorktrees(REPO);
     expect(paths).toContain(wtPath);
 
     removeWorktree(REPO, wtPath);
 
-    // Should no longer appear
+    
     paths = listWorktrees(REPO);
     expect(paths).not.toContain(wtPath);
   });
@@ -105,7 +103,7 @@ describe('removeWorktree', () => {
     const handle = 'test-handle-remove2';
     const wtPath = addWorktree(REPO, handle);
     removeWorktree(REPO, wtPath);
-    // Second call should not throw
+    
     expect(() => removeWorktree(REPO, wtPath)).not.toThrow();
   });
 });
@@ -114,11 +112,11 @@ describe('clearStaleIndexLock', () => {
   it('removes a leftover index.lock from a worktree so the next rung can reuse it', () => {
     const handle = 'test-handle-lock';
     const wtPath = addWorktree(REPO, handle);
-    // Resolve the worktree's real index.lock path the way git itself reports it.
+    
     const r = spawnSync('git', ['-C', wtPath, 'rev-parse', '--git-path', 'index.lock'], { encoding: 'utf8' });
     const rel = r.stdout.trim();
     const lock = rel.startsWith('/') ? rel : join(wtPath, rel);
-    writeFileSync(lock, '');                    // simulate a SIGKILL'd git mid-write
+    writeFileSync(lock, '');                    
     expect(existsSync(lock)).toBe(true);
 
     clearStaleIndexLock(wtPath);

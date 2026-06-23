@@ -151,7 +151,7 @@ describe('killProcessTree — signal first, sweep second', () => {
       await Bun.sleep(10); waited += 10;
     }
     for (const d of descendants) {
-      try { process.kill(d, 0); expect(true).toBe(false); } catch { /* dead = pass */ }
+      try { process.kill(d, 0); expect(true).toBe(false); } catch {  }
     }
   });
 });

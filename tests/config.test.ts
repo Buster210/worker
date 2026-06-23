@@ -72,7 +72,7 @@ describe('loadFileConfig', () => {
     const configPath = join(tempDir, 'config.json');
     writeFileSync(configPath, JSON.stringify({
       ladder: 'not-an-array',
-      skip: [1, 2, 3], // not strings
+      skip: [1, 2, 3], 
       retainMs: 'not-a-number'
     }));
     const config = loadFileConfig(configPath);

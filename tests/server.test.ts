@@ -3,14 +3,13 @@ import { writeFileSync, rmSync, mkdirSync, mkdtempSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
-// Throwaway state store, set BEFORE importing server/state (resolution is lazy).
+
 const STATE_DIR = join(tmpdir(), `wserver-state-${process.pid}`);
 process.env.WORKER_STATE_DIR = STATE_DIR;
 const PLANS_DIR = join(tmpdir(), `wserver-plans-${process.pid}`);
 process.env.WORKER_PLANS_DIR = PLANS_DIR;
 
-// Importing server.ts here registers tools as a side effect but does NOT boot the HTTP server
-// (the server only starts under `import.meta.main`).
+
 import { reply, handleStatus, handleKill, handleResume, handleList, handleDoctor } from '../src/server.ts';
 import { insertJob, updateJob, finalizeJob, getJob, logPath as stateLogPath, appendLadder, chainLockPath } from '../src/state.ts';
 import { workerEnv } from '../src/env.ts';
@@ -55,9 +54,9 @@ describe('handleStatus', () => {
     const handle = seedJob('running');
     const s = handleStatus({ handle });
     expect(s.status).toBe('running');
-    expect(s.alive).toBe(false); // worker_pid 0 → not alive
+    expect(s.alive).toBe(false); 
     expect('started' in s).toBe(true);
-    // caller-known context (handle/repo/task) and internals (backend/worker_pid/resume_token/log_path) are not echoed back
+    
     for (const k of ['handle', 'repo', 'task', 'backend', 'worker_pid', 'resume_token', 'log_path', 'kill_requested', 'sid', 'model']) {
       expect(k in s).toBe(false);
     }
@@ -73,9 +72,9 @@ describe('handleKill', () => {
     expect(handleKill({ handle })).toBe(`already done`);
   });
   it('finalizes a dead-pid running job and applies kill precedence', () => {
-    const handle = seedJob('running'); // worker_pid 0 → no live process, no SIGTERM/timer
-    writeFileSync(stateLogPath(handle, REPO), 'FAILED\n'); // resolveStatus → failed
-    expect(handleKill({ handle })).toBe(`killed: ${handle} (killed)`); // kill_requested beats failed
+    const handle = seedJob('running'); 
+    writeFileSync(stateLogPath(handle, REPO), 'FAILED\n'); 
+    expect(handleKill({ handle })).toBe(`killed: ${handle} (killed)`); 
     expect(getJob(handle)?.status).toBe('killed');
   });
 });
@@ -95,7 +94,7 @@ describe('handleList', () => {
 
     const all = handleList({});
     const found = all.map(j => j.handle);
-    expect(found).toContain(a);            // pre-fix one-level read returned [] for every nested job
+    expect(found).toContain(a);            
     expect(found).toContain(b);
     expect(all.every(j => !('backend' in j))).toBe(true);
 
@@ -112,7 +111,7 @@ describe('handleList', () => {
   });
 
   it('orders by started desc and honors limit', () => {
-    // Use 2027 timestamps (future) so they sort above any existing 2026 jobs
+    
     const h1 = seedJob('done');
     updateJob(h1, { started: '2027-01-01T00:00:00.000Z' });
     const h2 = seedJob('running');
@@ -122,7 +121,7 @@ describe('handleList', () => {
 
     const all = handleList({ limit: 50 });
     const handles = all.map(j => j.handle);
-    // h2 (Jun) > h3 (Mar) > h1 (Jan) by started desc
+    
     expect(handles.indexOf(h2)).toBeLessThan(handles.indexOf(h3));
     expect(handles.indexOf(h3)).toBeLessThan(handles.indexOf(h1));
 
@@ -138,7 +137,7 @@ describe('handleList', () => {
 
     const result = handleList({ status: 'failed' }).map(j => j.handle);
     expect(result).toContain(failed);
-    // 'failed:max-turns' does NOT match status === 'failed'
+    
     expect(result).not.toContain(failedReason);
     expect(result).not.toContain(running);
   });
@@ -165,7 +164,7 @@ describe('handleStatus — chain handle', () => {
     const handle = `srv-${process.pid}-${seq++}`;
     chainHandles.push(handle);
     insertJob({ handle, backend: 'codex', sid: 'test', repo: REPO, log_path: stateLogPath(handle, REPO), completion_lock: chainLockPath(sid) });
-    updateJob(handle, { status: 'failed' }); // first rung failed
+    updateJob(handle, { status: 'failed' }); 
     return handle;
   }
 
@@ -174,9 +173,9 @@ describe('handleStatus — chain handle', () => {
     const handle = seedChain(sid);
     appendLadder(sid, 1, 'codex', 'failed');
     appendLadder(sid, 2, 'cmd', 'done');
-    try { rmSync(chainLockPath(sid), { force: true }); } catch {} // ensure chain lock absent (chain finished)
+    try { rmSync(chainLockPath(sid), { force: true }); } catch {} 
     const s = handleStatus({ handle });
-    expect(s.status).toBe('done');   // NOT 'failed'
+    expect(s.status).toBe('done');   
     expect(s.alive).toBe(false);
   });
 
@@ -184,7 +183,7 @@ describe('handleStatus — chain handle', () => {
     const sid2 = `chain-${process.pid}-${seq++}`;
     const handle2 = seedChain(sid2);
     appendLadder(sid2, 1, 'codex', 'failed');
-    writeFileSync(chainLockPath(sid2), ''); // chain lock present → running
+    writeFileSync(chainLockPath(sid2), ''); 
     const s2 = handleStatus({ handle: handle2 });
     expect(s2.status).toBe('running');
     expect(s2.alive).toBe(true);

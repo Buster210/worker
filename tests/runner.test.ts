@@ -4,11 +4,10 @@ import { writeFileSync, readFileSync, rmSync, mkdtempSync, openSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
-// Point the state store at a throwaway dir BEFORE any state/runner fn runs. Safe because
-// state.ts resolves WORKER_STATE_DIR lazily (no eager import-time mkdir).
+
 const STATE_DIR = join(tmpdir(), `wrunner-state-${process.pid}`);
 process.env.WORKER_STATE_DIR = STATE_DIR;
-// Hermetic: empty WORKER_RC so the backend shell sources no host rc (fakeScripts need no env/keys).
+
 process.env.WORKER_RC = '';
 
 import { runWorker, type RunResult } from '../src/runner.ts';
@@ -17,9 +16,7 @@ import { isProcessAlive, parseEtimeSeconds } from '../src/process.ts';
 import { activitySig } from '../src/monitor.ts';
 import { insertJob, getJob, updateJob, logPath as stateLogPath } from '../src/state.ts';
 
-// Real subprocess fakes: a short bash script we spawn for real, so the tests exercise
-// genuine signal/timing/process-control — not mocks. argv[0] is the command the non-interactive
-// shell wrapper invokes ($0); ['bash', path] runs `bash <path>`.
+
 const REPO = mkdtempSync(join(tmpdir(), 'wrunner-repo-'));
 spawnSync('git', ['-C', REPO, 'init', '-q'], { encoding: 'utf8' });
 spawnSync('git', ['-C', REPO, 'config', 'user.email', 'test@test.com'], { encoding: 'utf8' });
@@ -45,8 +42,7 @@ function seedJob(handle: string): string {
   return lp;
 }
 
-// Spawn a real detached process group writing to the log, mimicking a worker that
-// watchExisting re-attaches to (it spawns nothing itself — only observes a live pid).
+
 function spawnDetached(body: string, lp: string): number {
   const [cmd, path] = fakeScript(body);
   const fd = openSync(lp, 'a');
@@ -70,8 +66,8 @@ afterAll(() => {
 });
 
 describe('runWorker lifecycle (real subprocess)', () => {
-  // The leading blank `echo` guarantees the sentinel lands on its own clean line (separated from any
-  // shell preamble), so resolveStatus's log scan matches it directly (not the rc fallback).
+  
+  
   it('resolves "done" when the worker prints DONE and exits 0', async () => {
     const handle = `done-${seq}`;
     const lp = seedJob(handle);
@@ -100,8 +96,8 @@ describe('runWorker lifecycle (real subprocess)', () => {
     process.env.WORKER_WATCHDOG_MS = '50';
     process.env.WORKER_STALL_MS = '200';
     process.env.WORKER_STALL_MS_QUIET = '5000';
-    // Write a change first (so the commit gate passes), then go silent for 400ms — past the
-    // 200ms normal stall but within the 5000ms quiet stall. Codex must NOT be killed in that gap.
+    
+    
     const r = await runWorker(fakeScript(`echo work > ${handle}.out; sleep 0.4; echo; echo DONE`), REPO, handle, 'codex', lp, '', 60_000);
     expect(r.status).toBe('done');
     expect(r.exit_code).toBe(0);
@@ -112,8 +108,8 @@ describe('runWorker lifecycle (real subprocess)', () => {
     const lp = seedJob(handle);
     process.env.WORKER_WATCHDOG_MS = '50';
     process.env.WORKER_STALL_MS = '200';
-    // Silent + alive + not self-failed, idle past the stall window → terminal SIGKILL + 'stalled'
-    // (no freeze, no leaked suspended corpse). Deadline far off so the stall, not deadline+grace, ends it.
+    
+    
     const started = Date.now();
     const r = await runWorker(fakeScript('sleep 20'), REPO, handle, 'cmd', lp, '', 60_000);
     const elapsed = Date.now() - started;
@@ -121,12 +117,12 @@ describe('runWorker lifecycle (real subprocess)', () => {
     expect(elapsed).toBeLessThan(1500);
     const job = getJob(handle);
     expect(job?.status).toBe('stalled');
-    expect(job?.finished).toBeTruthy();              // finalized as terminal
+    expect(job?.finished).toBeTruthy();              
     const pid = job?.worker_pid;
     if (pid) {
       await Bun.sleep(100);
-      expect(isProcessAlive(pid)).toBe(false);       // SIGKILLed, not suspended
-      frozenPids.push(pid);                           // defensive reap
+      expect(isProcessAlive(pid)).toBe(false);       
+      frozenPids.push(pid);                           
     }
   });
 
@@ -135,32 +131,32 @@ describe('runWorker lifecycle (real subprocess)', () => {
     const lp = seedJob(handle);
     process.env.WORKER_POLL_MS = '50';
     process.env.WORKER_STALL_MS = '200';
-    // Declared FAILED but still alive and idle → terminal SIGKILL, resolves its self-declared failure.
+    
     const r = await runWorker(fakeScript('echo; echo FAILED; sleep 20'), REPO, handle, 'cmd', lp, '', 60_000);
     expect(r.status).toBe('failed');
     expect(r.exit_code).toBe(124);
-  }, 30_000); // real subprocess SIGKILL+grace + first-spawn login-env build exceeds bun's 5s default
+  }, 30_000); 
 
   it('kills a productive worker at deadline+grace when nobody extends → "timeout"', async () => {
     const handle = `grace-${seq}`;
     const lp = seedJob(handle);
     process.env.WORKER_POLL_MS = '50';
     process.env.WORKER_GRACE_MS = '150';
-    // Productive (never stalls), but the deadline passes and no worker_extend lands within the
-    // grace window → hard terminal kill, no freeze, no resume.
+    
+    
     const r = await runWorker(fakeScript('while true; do echo working; sleep 0.1; done'), REPO, handle, 'cmd', lp, '', 200);
     expect(r.status).toBe('timeout');
     expect(r.exit_code).toBe(124);
     expect(getJob(handle)?.status).toBe('timeout');
-  }, 30_000); // real subprocess SIGKILL+grace + first-spawn login-env build exceeds bun's 5s default
+  }, 30_000); 
 
   it('does NOT kill when the deadline is pushed out (worker_extend) before grace expires', async () => {
     const handle = `extend-${seq}`;
     const lp = seedJob(handle);
     process.env.WORKER_POLL_MS = '50';
     process.env.WORKER_GRACE_MS = '150';
-    // deadline 100 + grace 150 = kill at ~250ms, but at 120ms we bump deadline_at far out
-    // (what worker_extend does) and the watchdog reads it fresh → the worker runs to "done".
+    
+    
     setTimeout(() => updateJob(handle, { deadline_at: Date.now() + 60_000 }), 120).unref?.();
     const r = await runWorker(fakeScript(`for i in 1 2 3; do echo working $i; sleep 0.1; done; echo work > ${handle}.out; echo; echo DONE`), REPO, handle, 'cmd', lp, '', 100);
     expect(r.status).toBe('done');
@@ -176,22 +172,20 @@ describe('runWorker lifecycle (real subprocess)', () => {
   });
 
   it('resolves "failed" when the spawn errors before the process starts', async () => {
-    // Spawn error (e.g., ENOENT for missing command) still resolves via the error handler
+    
     const handle = `spawn-err-${seq}`;
     const lp = seedJob(handle);
-    // Fake script with a non-existent command - spawn will fail
+    
     const nonExistentDir = join(tmpdir(), `nonexistent-${process.pid}`);
     const badScriptPath = join(nonExistentDir, 'fake.cmd');
     try { rmSync(nonExistentDir, { recursive: true, force: true }); } catch {}
-    // No script written - running it will error at spawn time
+    
     const r = await runWorker(['bash', badScriptPath], REPO, handle, 'cmd', lp, '');
     expect(r.status).toBe('failed');
   });
 });
 
-// Use process.pid (this test runner — guaranteed alive) rather than a freshly spawned child,
-// so there is no spawn/ps startup race to flake on. Derive the start from etime (elapsed) to
-// match getProcessStartTime — a lstart wall-clock parse would be TZ-skewed under `bun test` (UTC).
+
 function realStart(pid: number): string {
   const r = spawnSync('ps', ['-o', 'etime=', '-p', String(pid)], { encoding: 'utf8' });
   return new Date(Date.now() - (parseEtimeSeconds(r.stdout) ?? 0) * 1000).toISOString();
@@ -205,9 +199,9 @@ describe('isProcessAlive PID-reuse guard', () => {
   });
 
   it('accepts a matching start and rejects one that skews from the real process start (reuse defense)', () => {
-    // Recorded start matches the real process start → accepted.
+    
     expect(isProcessAlive(process.pid, realStart(process.pid))).toBe(true);
-    // Recorded start 10 min off the real start → treated as a recycled pid → rejected.
+    
     const skewed = new Date(Date.now() - 10 * 60 * 1000).toISOString();
     expect(isProcessAlive(process.pid, skewed)).toBe(false);
   });
@@ -215,19 +209,19 @@ describe('isProcessAlive PID-reuse guard', () => {
 
 describe('parseEtimeSeconds', () => {
   it('parses every ps etime shape and rejects junk', () => {
-    expect(parseEtimeSeconds('00:01')).toBe(1);          // mm:ss
+    expect(parseEtimeSeconds('00:01')).toBe(1);          
     expect(parseEtimeSeconds('05:23')).toBe(323);
-    expect(parseEtimeSeconds('01:05:23')).toBe(3923);    // hh:mm:ss
-    expect(parseEtimeSeconds('2-01:05:23')).toBe(176723); // dd-hh:mm:ss
-    expect(parseEtimeSeconds('  03:04  ')).toBe(184);    // surrounding whitespace from `ps -o etime=`
+    expect(parseEtimeSeconds('01:05:23')).toBe(3923);    
+    expect(parseEtimeSeconds('2-01:05:23')).toBe(176723); 
+    expect(parseEtimeSeconds('  03:04  ')).toBe(184);    
     expect(parseEtimeSeconds('garbage')).toBeNull();
     expect(parseEtimeSeconds('')).toBeNull();
   });
 });
 
 describe('reapStoppedJobs (stale frozen-job reaper)', () => {
-  // Isolated state dir: reapStoppedJobs scans the WHOLE store, so without this the reaper would
-  // also reclaim frozen leftovers from earlier tests — making these cases order/timing dependent.
+  
+  
   const REAP_DIR = join(tmpdir(), `wrunner-reap-${process.pid}`);
   let prevStateDir: string;
   beforeAll(() => { prevStateDir = process.env.WORKER_STATE_DIR!; process.env.WORKER_STATE_DIR = REAP_DIR; });
@@ -240,13 +234,13 @@ describe('reapStoppedJobs (stale frozen-job reaper)', () => {
     const handle = `reap-old-${seq}`;
     const lp = seedJob(handle);
     const pid = spawnDetached('sleep 100', lp);
-    // Frozen long ago (stopped_at well past the 100ms window below), still alive → reclaim.
+    
     updateJob(handle, { status: 'stopped', worker_pid: pid, stopped_at: '2020-01-01T00:00:00.000Z' });
     process.env.WORKER_REAP_MS = '100';
     reapStoppedJobs();
     expect(getJob(handle)?.status).toBe('timeout');
     await Bun.sleep(100);
-    expect(isProcessAlive(pid)).toBe(false); // SIGKILLed by the reaper
+    expect(isProcessAlive(pid)).toBe(false); 
     frozenPids.push(pid);
   });
 
@@ -255,7 +249,7 @@ describe('reapStoppedJobs (stale frozen-job reaper)', () => {
     const lp = seedJob(handle);
     const pid = spawnDetached('sleep 100', lp);
     updateJob(handle, { status: 'stopped', worker_pid: pid, stopped_at: new Date().toISOString() });
-    // Default 15-min window → a seconds-old freeze is nowhere near stale.
+    
     reapStoppedJobs();
     expect(getJob(handle)?.status).toBe('stopped');
     expect(isProcessAlive(pid)).toBe(true);
@@ -265,7 +259,7 @@ describe('reapStoppedJobs (stale frozen-job reaper)', () => {
   it('finalizes a frozen job whose pid is already dead as "failed:server-restart"', () => {
     const handle = `reap-dead-${seq}`;
     seedJob(handle);
-    const dead = spawnSync('true'); // exits immediately → pid is dead by the time we reap
+    const dead = spawnSync('true'); 
     updateJob(handle, { status: 'stopped', worker_pid: dead.pid ?? 999999, stopped_at: new Date().toISOString() });
     reapStoppedJobs();
     expect(getJob(handle)?.status).toBe('failed:server-restart');
@@ -277,17 +271,16 @@ describe('activitySig log-first probing (#6b)', () => {
     const repo = mkdtempSync(join(tmpdir(), 'wrunner-git-'));
     tmpDirs.push(repo);
     spawnSync('git', ['init', '-q'], { cwd: repo });
-    writeFileSync(join(repo, 'dirty.txt'), 'uncommitted\n'); // makes `git status --porcelain` non-empty
+    writeFileSync(join(repo, 'dirty.txt'), 'uncommitted\n'); 
     const lp = join(repo, 'run.log');
     writeFileSync(lp, 'one\n');
 
-    // Log advanced vs lastLog → activity proven by the log alone; sig is exactly the log
-    // component, i.e. git was NOT consulted (else the dirty file would show up in sig).
+    
     const grew = activitySig(repo, lp, '');
     expect(grew.sig).toBe(grew.log);
     expect(grew.sig).not.toContain('dirty.txt');
 
-    // Log idle (lastLog === current) → fall back to git, which surfaces the dirty file.
+    
     const idle = activitySig(repo, lp, grew.log);
     expect(idle.sig).toContain('dirty.txt');
     expect(idle.sig).not.toBe(idle.log);

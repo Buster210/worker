@@ -5,7 +5,6 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import http from 'http';
 
-// --- helpers ---
 
 const TEST_DIR = join(tmpdir(), `worker-daemon-live-${process.pid}`);
 const LOCK_PATH = join(TEST_DIR, 'server.json');
@@ -85,7 +84,7 @@ async function startDaemon(port: number): Promise<ChildProcess> {
   return proc;
 }
 
-/** Start daemon that is EXPECTED to fail (e.g. port occupied). Returns the process. */
+
 function startDaemonExpectedFail(port: number): ChildProcess {
   return spawn('bun', ['run', 'src/server.ts'], {
     cwd: join(import.meta.dir, '..'),
@@ -94,9 +93,9 @@ function startDaemonExpectedFail(port: number): ChildProcess {
   });
 }
 
-/** Wait for process to exit, then wait for lockfile to be removed. Full cleanup. */
+
 async function stopDaemon(proc: ChildProcess): Promise<void> {
-  // Wait for process exit
+  
   const { promise: exitWait, resolve: exitResolve } = Promise.withResolvers<void>();
   if (proc.exitCode !== null) { exitResolve(); } else {
     proc.on('exit', () => exitResolve());
@@ -104,14 +103,14 @@ async function stopDaemon(proc: ChildProcess): Promise<void> {
   }
   await exitWait;
 
-  // Poll until lockfile is gone (hardShutdown removes it synchronously, but process needs time)
+  
   for (let i = 0; i < 20; i++) {
     if (!existsSync(LOCK_PATH)) return;
     await new Promise(r => setTimeout(r, 100));
   }
 }
 
-/** Parse SSE stream from MCP StreamableHTTPServerTransport → extract JSON-RPC response. */
+
 function parseSseBody(raw: string): unknown {
   for (const line of raw.split('\n')) {
     if (line.startsWith('data: ')) {
@@ -119,7 +118,7 @@ function parseSseBody(raw: string): unknown {
       if (data) return JSON.parse(data);
     }
   }
-  // Try raw JSON fallback (transport may return plain JSON for some responses)
+  
   return JSON.parse(raw);
 }
 
@@ -140,7 +139,6 @@ const BASE_PORT = 15500 + (process.pid % 1000) * 10;
 let nextPort = BASE_PORT;
 function allocPort(): number { return nextPort++; }
 
-// --- tests ---
 
 describe('live daemon', () => {
   beforeAll(() => {
@@ -188,13 +186,13 @@ describe('live daemon', () => {
 
   it('stale lockfile with dead PID → reclaims on restart', async () => {
     const port = allocPort();
-    // Use a PID that's guaranteed dead (99999 is typically not running on any OS)
+    
     writeFileSync(LOCK_PATH, JSON.stringify({ pid: 99999, port, started_at: '2020-01-01T00:00:00Z' }));
     expect(existsSync(LOCK_PATH)).toBe(true);
 
     const daemon = await startDaemon(port);
 
-    // Daemon should have reclaimed — health works
+    
     const health = await httpGet(port, '/health');
     expect(health.status).toBe(200);
     expect(JSON.parse(health.body).ok).toBe(true);
@@ -206,32 +204,32 @@ describe('live daemon', () => {
     const port = allocPort();
     try { unlinkSync(LOCK_PATH); } catch {}
 
-    // Occupy the port
+    
     const blocker = http.createServer((_req, res) => { res.writeHead(200); res.end('blocker'); });
     const { promise: blockerReady, resolve: ready } = Promise.withResolvers<void>();
     blocker.listen(port, () => ready());
     await blockerReady;
 
-    // Start daemon — it will hit EADDRINUSE
+    
     const daemon = startDaemonExpectedFail(port);
 
-    // Give it time to detect EADDRINUSE and try to reclaim
+    
     await new Promise(r => setTimeout(r, 1500));
 
-    // Release the port
+    
     const { promise: blockerDone, resolve: done } = Promise.withResolvers<void>();
     blocker.close(() => done());
     await blockerDone;
 
-    // Give daemon time to retry and bind
+    
     await new Promise(r => setTimeout(r, 1500));
 
-    // Check if daemon came up after blocker was removed
+    
     try {
       const health = await httpGet(port, '/health');
       expect(health.status).toBe(200);
     } catch {
-      // Daemon may have given up after one retry — acceptable, the key test is it didn't crash
+      
     }
 
     daemon.kill('SIGTERM');
@@ -246,7 +244,7 @@ describe('live daemon', () => {
     const { sessionId } = await mcpInitialize(port);
     expect(sessionId).toBeTruthy();
 
-    // Health should show 1 session
+    
     const health = await httpGet(port, '/health');
     expect(JSON.parse(health.body).sessions).toBe(1);
 
@@ -292,19 +290,19 @@ describe('live daemon', () => {
 
     const { sessionId } = await mcpInitialize(port);
 
-    // Verify session is tracked
+    
     const health1 = await httpGet(port, '/health');
     expect(JSON.parse(health1.body).sessions).toBe(1);
 
-    // Disconnect the session — daemon may exit before sending response
+    
     try {
       await httpDelete(port, '/mcp', { 'mcp-session-id': sessionId });
     } catch {
-      // ECONNREFUSED is expected — daemon exits via hardShutdown → process.exit(0)
-      // which closes the socket before the response is sent
+      
+      
     }
 
-    // Wait for process to exit and lockfile to be removed
+    
     for (let i = 0; i < 20; i++) {
       if (!existsSync(LOCK_PATH)) break;
       await new Promise(r => setTimeout(r, 200));
@@ -321,20 +319,20 @@ describe('live daemon', () => {
     const s1 = await mcpInitialize(port);
     const s2 = await mcpInitialize(port);
 
-    // Both tracked
+    
     const health1 = await httpGet(port, '/health');
     expect(JSON.parse(health1.body).sessions).toBe(2);
 
-    // Disconnect session 1 — session 2 should survive
-    try { await httpDelete(port, '/mcp', { 'mcp-session-id': s1.sessionId }); } catch { /* may ECONNREFUSED */ }
+    
+    try { await httpDelete(port, '/mcp', { 'mcp-session-id': s1.sessionId }); } catch {  }
     await new Promise(r => setTimeout(r, 500));
 
-    // Daemon should still be alive with 1 session
+    
     const health2 = await httpGet(port, '/health');
     expect(JSON.parse(health2.body).sessions).toBe(1);
 
-    // Disconnect session 2 → daemon exits
-    try { await httpDelete(port, '/mcp', { 'mcp-session-id': s2.sessionId }); } catch { /* daemon exits */ }
+    
+    try { await httpDelete(port, '/mcp', { 'mcp-session-id': s2.sessionId }); } catch {  }
     for (let i = 0; i < 20; i++) {
       if (!existsSync(LOCK_PATH)) break;
       await new Promise(r => setTimeout(r, 200));

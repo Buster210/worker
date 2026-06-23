@@ -21,6 +21,14 @@ function readLogStat(logPath: string): string {
 // callback per write (Bun/macOS kqueue event storm -> a pegged core for the whole run) while the
 // watchdog never observes the sub-5s updates anyway. If a backend ever needs finer stall timing,
 // shrink WORKER_WATCHDOG_MS rather than re-adding a watcher.
+export function activitySig(repo: string, logPath: string, lastLog: string): { sig: string; log: string } {
+  const log = readLogStat(logPath);
+  if (log !== lastLog) return { sig: log, log };
+  const r = spawnSync('git', ['-C', repo, 'status', '--porcelain'], { encoding: 'utf8' });
+  const git = typeof r.stdout === 'string' ? r.stdout.trim() : '';
+  return { sig: `${log}\n${git}`, log };
+}
+
 export function startActivityMonitor(repo: string, logPath: string): ActivityMonitor {
   const key = `${repo}\0${logPath}`;
   let cachedLog = readLogStat(logPath);

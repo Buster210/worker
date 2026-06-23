@@ -51,7 +51,7 @@ describe('loginShellEnv with a fake shell', () => {
 
     const fakeShell = join(dir, 'fake-shell.sh');
     const customVar = `LOGIN_TEST_${Date.now()}`;
-    // Fake shell: emit a banner, then marker + env JSON
+    
     writeFileSync(fakeShell, [
       '#!/bin/sh',
       'echo "Welcome to my shell"',
@@ -61,7 +61,7 @@ describe('loginShellEnv with a fake shell', () => {
     ].join('\n'));
     chmodSync(fakeShell, 0o755);
 
-    // Run a login shell (-l -c) through the fake shell — same snippet loginShellEnv uses
+    
     const snippet =
       `printf '%s\\n' '${MARKER}'; exec "${process.execPath}" -e 'var e=Object.assign({},process.env);e.${customVar}="captured";process.stdout.write(JSON.stringify(e))'`;
     const result = spawnSync(fakeShell, ['-l', '-c', snippet], { encoding: 'utf8', timeout: 5000 });
@@ -70,7 +70,7 @@ describe('loginShellEnv with a fake shell', () => {
     const parsed = parseEnvSnapshot(result.stdout, MARKER);
     expect(parsed).not.toBeNull();
     expect(parsed![customVar]).toBe('captured');
-    // Banner text should not be inside the parsed env values
+    
     expect(parsed!['Welcome to my shell']).toBeUndefined();
   });
 });
@@ -80,7 +80,7 @@ describe('loginShellEnv opt-out', () => {
     const prev = process.env.WORKER_LOGIN_SHELL;
     process.env.WORKER_LOGIN_SHELL = '0';
     try {
-      // Opt-out is checked before the memo cache, so this holds regardless of prior calls.
+      
       expect(loginShellEnv()).toBeNull();
     } finally {
       if (prev === undefined) delete process.env.WORKER_LOGIN_SHELL;
@@ -93,27 +93,27 @@ describe('workerEnv laziness', () => {
   test('env helpers do NOT build workerEnv (lazy); only an explicit workerEnv() call builds it, memoized', () => {
     const prev = process.env.WORKER_LOGIN_SHELL;
     process.env.WORKER_LOGIN_SHELL = '0';
-    __resetLoginEnvCache(); // freshly unbuilt state
+    __resetLoginEnvCache(); 
     try {
-      // After reset, the env object is not built.
+      
       expect(__isWorkerEnvBuilt()).toBe(false);
-      // Using pure env-read helpers must NOT build workerEnv / trigger a login-shell spawn.
+      
       graceMs();
       defaultTimeoutMs();
-      expect(__isWorkerEnvBuilt()).toBe(false); // proves laziness — helpers didn't build it
-      // Only the explicit call builds it.
+      expect(__isWorkerEnvBuilt()).toBe(false); 
+      
       const env = workerEnv();
       expect(__isWorkerEnvBuilt()).toBe(true);
-      // PATH must contain the hardcoded bin dirs regardless of login shell.
+      
       expect(env.PATH).toContain('/.bun/bin');
       expect(env.PATH).toContain('/opt/homebrew/bin');
       expect(env.PATH).toContain('/usr/local/bin');
-      // Same instance is returned on repeated calls (memoized).
+      
       expect(workerEnv()).toBe(env);
     } finally {
       if (prev === undefined) delete process.env.WORKER_LOGIN_SHELL;
       else process.env.WORKER_LOGIN_SHELL = prev;
-      __resetLoginEnvCache(); // restore for subsequent tests
+      __resetLoginEnvCache(); 
     }
   });
 });

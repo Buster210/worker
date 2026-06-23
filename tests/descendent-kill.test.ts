@@ -3,16 +3,15 @@ import { spawnSync, spawn } from 'child_process';
 import * as childProcess from 'child_process';
 import { listDescendants, killProcessTree, killProcessTrees } from '../src/process.ts'
 
-// Spawn a detached process tree: top pid forks a child, which forks a grandchild,
-// which forks a great-grandchild — all `sleep 30`.
+
 function spawnTree(): { topPid: number; allPids: number[] } {
-  // Use a single script that forks 3 nested sleep children via bash subshells.
-  const script = 'sleep 30 & exec sleep 30'; // 2 children; each backgrounded child also forks
-  // Simpler: chain 4 levels explicitly.
+  
+  const script = 'sleep 30 & exec sleep 30'; 
+  
   const fullScript = [
-    'sleep 30 &',          // child 1
-    'sleep 30 &',          // child 2
-    'exec sleep 30',       // replace self (top becomes grandchild-ish)
+    'sleep 30 &',          
+    'sleep 30 &',          
+    'exec sleep 30',       
   ].join(' ');
   const proc = spawn('bash', ['-c', fullScript], {
     detached: true,
@@ -21,7 +20,7 @@ function spawnTree(): { topPid: number; allPids: number[] } {
   proc.unref();
   const topPid = proc.pid!;
 
-  // Give the tree time to spawn.
+  
   const deadline = Date.now() + 500;
   while (Date.now() < deadline) {
     const desc = listDescendants(topPid);
@@ -35,7 +34,7 @@ function spawnTree(): { topPid: number; allPids: number[] } {
 
 function isAlive(pid: number): boolean {
   try { process.kill(pid, 0); } catch { return false; }
-  // kill(pid,0) succeeds for zombies — check actual state via ps.
+  
   const ps = spawnSync('ps', ['-o', 'stat=', '-p', String(pid)], { stdio: ['ignore', 'pipe', 'ignore'] });
   const stat = ps.stdout?.toString().trim() ?? '';
   return !stat.startsWith('Z');
@@ -44,7 +43,7 @@ function isAlive(pid: number): boolean {
 const allSpawned: number[] = [];
 
 afterAll(() => {
-  // Cleanup: best-effort kill anything still alive.
+  
   for (const p of allSpawned) {
     try { process.kill(p, 'SIGKILL'); } catch {}
   }
@@ -56,7 +55,7 @@ describe('listDescendants', () => {
     allSpawned.push(...allPids);
     const descendants = listDescendants(topPid);
     expect(descendants.length).toBeGreaterThanOrEqual(2);
-    // All descendants should be in the allPids set.
+    
     for (const d of descendants) {
       expect(allPids).toContain(d);
     }
@@ -84,10 +83,10 @@ describe('listDescendants', () => {
   });
 
   it('skips malformed ps output lines (no crash, no false pids)', () => {
-    // Mock ps output with junk lines mixed with valid ones
-    // ps -axo pid=,ppid= outputs "child_pid parent_pid" format
+    
+    
     const psSpy = spyOn(childProcess, 'spawnSync').mockReturnValue({
-      stdout: `123 bogus\n789 1\n`, // first line has invalid parent (no space after child), second is valid child of pid 1
+      stdout: `123 bogus\n789 1\n`, 
       status: 0,
       signal: null,
       pid: 0,
@@ -96,7 +95,7 @@ describe('listDescendants', () => {
     } as any);
     try {
       const desc = listDescendants(1);
-      // Only the valid line extracted; junk lines skipped
+      
       expect(desc).toEqual([789]);
     } finally {
       psSpy.mockRestore();
@@ -111,7 +110,7 @@ describe('killProcessTree', () => {
 
     killProcessTree(topPid, 'SIGKILL');
 
-    // Poll up to 1s: all pids should be dead.
+    
     const deadline = Date.now() + 1000;
     while (Date.now() < deadline) {
       const alive = allPids.filter(isAlive);
@@ -126,7 +125,7 @@ describe('killProcessTree', () => {
   it('no-ops for pid <= 0', () => {
     killProcessTree(0, 'SIGKILL');
     killProcessTree(-1, 'SIGKILL');
-    // No throw = pass.
+    
   });
 });
 
@@ -150,11 +149,10 @@ describe('killProcessTrees (batch)', () => {
   it('no-ops for empty or non-positive pids', () => {
     killProcessTrees([], 'SIGKILL');
     killProcessTrees([0, -1], 'SIGKILL');
-    // No throw = pass.
+    
   });
 
-  // The whole point of the batch form: ONE `ps` enumeration per pass regardless of
-  // tree count — not one (doubled) enumeration per pid like calling killProcessTree N times.
+  
   it('enumerates once per pass for N trees (not per pid)', () => {
     const P1 = 999991, C1 = 888881, P2 = 999992, C2 = 888882;
     const order: string[] = [];
@@ -168,7 +166,7 @@ describe('killProcessTrees (batch)', () => {
     const killSpy = spyOn(process, 'kill').mockImplementation((() => true) as any);
     try {
       killProcessTrees([P1, P2], 'SIGKILL');
-      // 2 passes (kill + survivor), ONE enumerate each — 2 total, not 2 per pid.
+      
       expect(order).toEqual(['enumerate', 'enumerate']);
     } finally {
       psSpy.mockRestore();
@@ -176,11 +174,7 @@ describe('killProcessTrees (batch)', () => {
     }
   });
 
-  // Regression guard: descendants MUST be snapshotted while the tree is still
-  // intact (before the group kill). If the group is killed first, an intermediate
-  // process dies and its children reparent to init — they vanish from the ppid
-  // walk and survive as orphans. This asserts ordering deterministically (no real
-  // processes, no flake) by recording the sequence of side effects.
+  
   it('enumerates descendants BEFORE killing the group (no reparent leak)', () => {
     const FAKE = 999999;
     const CHILD = 888888;
@@ -201,8 +195,8 @@ describe('killProcessTrees (batch)', () => {
 
     try {
       killProcessTree(FAKE, 'SIGKILL');
-      // Fix E: one extra post-kill pass re-enumerates descendants and re-SIGKILLs survivors.
-      // The mock always returns CHILD as a descendant, so we get a second enumerate+killchild.
+      
+      
       expect(order).toEqual(['enumerate', 'killgroup', 'killchild', 'enumerate', 'killchild']);
     } finally {
       psSpy.mockRestore();

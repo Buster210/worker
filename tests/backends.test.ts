@@ -37,7 +37,7 @@ describe('buildSpec', () => {
   it('all backends produce identical structure (preamble + task + contract)', () => {
     const backends: Backend[] = ['codex', 'cmd', 'pool', 'omp', 'opencode', 'claude'];
     const specs = backends.map(() => buildSpec('my task'));
-    // All specs are identical — spec is backend-independent
+    
     for (const spec of specs) {
       expect(spec).toBe(specs[0]);
     }
@@ -47,7 +47,7 @@ describe('buildSpec', () => {
     const spec = buildSpec('my task');
     expect(spec).toContain('Do NOT commit');
     expect(spec).toContain('harness makes the atomic commit on green');
-    // The old instruction must be gone
+    
     expect(spec).not.toContain('make ONE atomic commit only when all green');
   });
 });
@@ -267,7 +267,7 @@ describe('computeLadder', () => {
 
   it('drops cmd and codex when isAuthed returns false for them', () => {
     const result = computeLadder(() => false);
-    // codex and cmd removed; rest stay in ALL_BACKENDS order
+    
     expect(result).toEqual(['pool', 'omp', 'opencode', 'claude']);
     expect(result).not.toContain('cmd');
     expect(result).not.toContain('codex');

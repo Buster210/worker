@@ -3,8 +3,7 @@ import { rmSync, mkdirSync, readdirSync, readFileSync, writeFileSync, existsSync
 import { join } from 'path';
 import { tmpdir } from 'os';
 
-// Throwaway store set BEFORE importing state (resolution is lazy). Without this the tests would
-// read/write the real ~/.claude/workers and the cache test below would delete live job dirs.
+
 const STATE_DIR = join(tmpdir(), `wstate-state-${process.pid}`);
 process.env.WORKER_STATE_DIR = STATE_DIR;
 const PLANS_DIR = join(tmpdir(), `wstate-plans-${process.pid}`);
@@ -23,7 +22,7 @@ describe('finalizeJob', () => {
 
   afterEach(() => {
     for (const handle of testHandles) {
-      // Clean up job directory
+      
       const jobDir = join(workersDir(), 'finalizetest', handle);
       try { rmSync(jobDir, { recursive: true, force: true }); } catch {}
     }
@@ -35,7 +34,7 @@ describe('finalizeJob', () => {
     const logPath = `/tmp/${handle}.log`;
     testHandles.push(handle);
 
-    // Insert a throwaway job
+    
     insertJob({
       handle,
       backend: 'cmd',
@@ -44,14 +43,14 @@ describe('finalizeJob', () => {
       log_path: logPath,
     });
     
-    // Set kill_requested
+    
     updateJob(handle, { kill_requested: true });
 
-    // Finalize with 'failed' status - should return 'killed'
+    
     const result = finalizeJob(handle, 'failed');
     expect(result).toBe('killed');
 
-    // Verify status persisted
+    
     const persistedJob = getJob(handle);
     expect(persistedJob?.status).toBe('killed');
   });
@@ -61,7 +60,7 @@ describe('finalizeJob', () => {
     const logPath = `/tmp/${handle}.log`;
     testHandles.push(handle);
 
-    // Insert a throwaway job with kill_requested set
+    
     insertJob({
       handle,
       backend: 'cmd',
@@ -70,14 +69,14 @@ describe('finalizeJob', () => {
       log_path: logPath,
     });
     
-    // Set kill_requested
+    
     updateJob(handle, { kill_requested: true });
 
-    // Finalize with 'done' status - should return 'done' (completion wins)
+    
     const result = finalizeJob(handle, 'done');
     expect(result).toBe('done');
 
-    // Verify status persisted
+    
     const persistedJob = getJob(handle);
     expect(persistedJob?.status).toBe('done');
   });
@@ -92,14 +91,14 @@ describe('finalizeJob', () => {
     expect(first).toBe('done');
 
     const firstFinished = getJob(handle)!.finished;
-    // Wait a moment so a second call would have a different timestamp
+    
     const start = Date.now();
-    const second = finalizeJob(handle, 'failed'); // would be 'failed', but idempotent
-    expect(second).toBe('done'); // returns first result, NOT 'failed'
+    const second = finalizeJob(handle, 'failed'); 
+    expect(second).toBe('done'); 
 
     const job = getJob(handle)!;
-    expect(job.status).toBe('done'); // status NOT changed to failed
-    expect(job.finished).toBe(firstFinished); // finished time unchanged
+    expect(job.status).toBe('done'); 
+    expect(job.finished).toBe(firstFinished); 
   });
 });
 
@@ -109,7 +108,7 @@ describe('getJobFresh bypasses in-memory cache', () => {
     const handle = `fresh-test-${process.pid}-${Date.now()}`;
     insertJob({ handle, backend: 'cmd', sid: 't', repo: '/tmp/fresh-test', log_path: 'x' });
 
-    // Both agree on 'running' initially
+    
     expect(getJob(handle)?.status).toBe('running');
     expect(getJobFresh(handle)?.status).toBe('running');
 
@@ -118,9 +117,9 @@ describe('getJobFresh bypasses in-memory cache', () => {
     disk.status = 'done';
     writeFileSync(jobPath, JSON.stringify(disk, null, 2));
 
-    // getJob still returns the stale in-memory 'running'
+    
     expect(getJob(handle)?.status).toBe('running');
-    // getJobFresh reads disk and returns the updated 'done'
+    
     expect(getJobFresh(handle)?.status).toBe('done');
   });
 });
@@ -133,9 +132,9 @@ describe('pruneOldJobs', () => {
         updateJob(handle, { status, finished: new Date(Date.now() - (finishedAgoMs ?? 0)).toISOString() });
       }
     };
-    mk('old-term', 'done', 8 * 86_400_000);  // 8 days old -> prune
-    mk('fresh-term', 'done', 1000);          // 1s old -> keep
-    mk('run', 'running');                    // running -> keep
+    mk('old-term', 'done', 8 * 86_400_000);  
+    mk('fresh-term', 'done', 1000);          
+    mk('run', 'running');                    
     const oldDir = handleDirUncached('old-term', '/tmp/prune-repo');
     expect(pruneOldJobs(Date.now())).toBe(1);
     expect(getJob('old-term')).toBeNull();
@@ -145,24 +144,24 @@ describe('pruneOldJobs', () => {
   });
 
   it('keeps terminal jobs without finished field (no finished = not stale)', () => {
-    // A terminal job with no finished timestamp is NOT considered stale
+    
     const handle = `prune-nofinish-${process.pid}-${Date.now()}`;
     insertJob({ handle, backend: 'cmd', sid: 's', repo: '/tmp/prune-nofinish', log_path: '/tmp/x' });
-    updateJob(handle, { status: 'done' }); // done but no finished timestamp
-    expect(pruneOldJobs()).toBe(0); // nothing pruned
+    updateJob(handle, { status: 'done' }); 
+    expect(pruneOldJobs()).toBe(0); 
     expect(getJob(handle)).not.toBeNull();
-    // Clean up
+    
     rmSync(handleDirUncached(handle, '/tmp/prune-nofinish'), { recursive: true, force: true });
   });
 
   it('keeps terminal jobs with invalid finished timestamp', () => {
-    // Invalid/NaN finished is treated as "not stale"
+    
     const handle = `prune-invalid-finished-${process.pid}-${Date.now()}`;
     insertJob({ handle, backend: 'cmd', sid: 's', repo: '/tmp/prune-invalid', log_path: '/tmp/x' });
     updateJob(handle, { status: 'done', finished: 'not-a-timestamp' });
     expect(pruneOldJobs()).toBe(0);
     expect(getJob(handle)).not.toBeNull();
-    // Clean up
+    
     rmSync(handleDirUncached(handle, '/tmp/prune-invalid'), { recursive: true, force: true });
   });
 });
@@ -210,7 +209,7 @@ describe('plansDir + readSpec', () => {
     expect(() => readSpec('../escape')).toThrow();
   });
 
-  // ".." with no path separator — must trip the traversal guard, not the slash guard.
+  
   it('rejects a bare filename containing ".." (no separator)', () => {
     expect(() => readSpec('foo..bar')).toThrow(/path traversal/);
     expect(() => readSpec('..foo')).toThrow(/path traversal/);
@@ -232,8 +231,7 @@ describe('handleDirUncached does not poison the handle-dir cache', () => {
     const repo = `/tmp/wstate-cache-${process.pid}-${Date.now()}`;
     insertJob({ handle, backend: 'omp', sid: 's', repo, log_path: join(STATE_DIR, 'logs', handle, 'run.log') });
 
-    // Simulate what omp argv builder does: derive a session-dir from the worktree path.
-    // This must NOT poison the cache so that finalizeJob writes to the canonical dir.
+    
     const wt = join(handleDirUncached(handle, repo), 'tree');
     handleDirUncached(handle, wt);
 
@@ -280,6 +278,6 @@ describe('pruneTranscript', () => {
     insertJob({ handle, backend: 'cmd', sid: 's', repo, log_path: join(dir, 'run.log') });
     updateJob(handle, { status: 'done' });
     expect(pruneTranscript(handle)).toBe('pruned');
-    expect(pruneTranscript(handle)).toBe('pruned'); // ENOENT → still pruned
+    expect(pruneTranscript(handle)).toBe('pruned'); 
   });
 });

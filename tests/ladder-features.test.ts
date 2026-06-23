@@ -96,10 +96,10 @@ describe('Ladder feature tests', () => {
     const repo = makeRepo('wladder-extend-');
     const originalDeadline = Date.now() + 10_000;
 
-    // Set up the chain budget exactly as handleLadder would.
+    
     saveChainMeta(sid, { deadlineAt: originalDeadline });
 
-    // A running chain handle: its completion_lock is the chain lock so handleExtend detects it.
+    
     const chainHandle = `chain-${sid}`;
     insertJob({
       handle: chainHandle,
@@ -111,27 +111,23 @@ describe('Ladder feature tests', () => {
       deadline_at: originalDeadline,
     });
 
-    // Drive the REAL extend path (sid extraction from completion_lock + chain-meta bump).
+    
     const seconds = 120;
     const ret = handleExtend({ handle: chainHandle, seconds });
 
-    // Chain-meta deadline is bumped...
+    
     const meta = loadChainMeta(sid);
     expect(meta).not.toBeNull();
     expect(meta!.deadlineAt).toBeGreaterThan(originalDeadline);
     expect(meta!.deadlineAt).toBe(ret.deadline_at);
 
-    // ...and a subsequently-launched rung reads the EXTENDED deadline, not the original. Drive the
-    // REAL production read path (effectiveChainDeadline, used by runLadderChain + each launch).
-    // We pass the PRE-extend deadline as the fallback: if the production re-read of loadChainMeta
-    // were removed/regressed, this would return the stale `originalDeadline` and the test would FAIL.
+    
     const effective = effectiveChainDeadline(sid, originalDeadline);
     expect(effective).toBe(meta!.deadlineAt);
     expect(effective).toBeGreaterThan(originalDeadline);
     expect(effective - originalDeadline).toBeGreaterThanOrEqual(seconds * 1000 - 1000);
 
-    // The extend must ALSO work after rung 0 has finished (it climbed on) — the running-only
-    // guard must not block the chain-wide bump.
+    
     updateJob(chainHandle, { status: 'failed' });
     const before = loadChainMeta(sid)!.deadlineAt;
     const ret2 = handleExtend({ handle: chainHandle, seconds: 60 });
