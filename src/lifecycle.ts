@@ -4,7 +4,7 @@ import { readFileSync, unlinkSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { killProcessTree, killProcessTrees, getProcessStartTime } from './process.ts';
 import {
-  handleDir, insertJob, getJob, updateJob, logPath as workerLogPath, finalizeJob, reaperPidPath,
+  handleDirUncached, insertJob, getJob, updateJob, logPath as workerLogPath, finalizeJob, reaperPidPath,
   isInPlaceOwner,
 } from './state.ts';
 import { addWorktreeAsync, clearStaleIndexLock } from './worktree.ts';
@@ -128,7 +128,7 @@ export function launch(
     // see only themselves). Project dir may idle if the in-place worker exits while
     // younger worktree workers persist -- safe, not optimal; re-elect oldest-alive
     // to dir on drain if reuse matters.
-    const treePath = join(handleDir(handle, dir), 'tree');
+    const treePath = join(handleDirUncached(handle, dir), 'tree');
     // claude picks model by task hardness: complex → sonnet, else haiku. omp self-selects.
     const claudeModel = opts.complex ? 'sonnet' : 'haiku';
     const modelToUse = backend === 'claude' ? (opts.model ?? claudeModel) : backend === 'omp' ? undefined : opts.model;

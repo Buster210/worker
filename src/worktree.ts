@@ -1,10 +1,10 @@
 import { spawn, spawnSync } from 'child_process';
 import { rmSync } from 'fs';
 import { isAbsolute, join } from 'path';
-import { handleDir } from './state.ts';
+import { handleDirUncached } from './state.ts';
 
 export function addWorktree(repo: string, handle: string): string {
-  const path = join(handleDir(handle, repo), 'tree');
+  const path = join(handleDirUncached(handle, repo), 'tree');
   const branch = `worker/${handle}`;
   const r = spawnSync('git', ['-C', repo, 'worktree', 'add', '-b', branch, path, 'HEAD'], { encoding: 'utf8' });
   if (r.error) throw new Error(`worktree add failed for ${handle}: ${r.error.message}`);
@@ -54,7 +54,7 @@ function gitWorktreeAdd(repo: string, handle: string, path: string, branch: stri
 }
 
 export async function addWorktreeAsync(repo: string, handle: string): Promise<string> {
-  const path = join(handleDir(handle, repo), 'tree');
+  const path = join(handleDirUncached(handle, repo), 'tree');
   const branch = `worker/${handle}`;
   await gitWorktreeAdd(repo, handle, path, branch);
   return path;

@@ -1,7 +1,7 @@
 import { describe, it, expect, test, beforeEach, afterEach } from 'bun:test';
 import { buildSpec, buildRunArgv, buildResumeArgv, getResumeToken, emitsJsonLog, computeLadder, ALL_BACKENDS, QUIET_BACKENDS, type Backend } from '../src/backends.ts';
 import { stallTimeoutMs, quietStallMs } from '../src/env.ts';
-import { handleDir } from '../src/state.ts';
+import { handleDirUncached } from '../src/state.ts';
 import { join } from 'path';
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
@@ -63,7 +63,7 @@ describe('buildRunArgv', () => {
 
   it('builds omp argv with a per-job session dir and no model/provider', () => {
     const argv = buildRunArgv('omp', 'spec', '/repo', 'sid123');
-    expect(argv).toEqual(['omp', '-p', 'spec', '--session-dir', handleDir('sid123', '/repo'), '--approval-mode=yolo', '--mode=json']);
+    expect(argv).toEqual(['omp', '-p', 'spec', '--session-dir', handleDirUncached('sid123', '/repo'), '--approval-mode=yolo', '--mode=json']);
     expect(argv).not.toContain('--model');
     expect(argv).not.toContain('--provider');
   });
@@ -116,7 +116,7 @@ describe('buildResumeArgv', () => {
 
   it('builds omp resume argv with the same session dir plus --continue', () => {
     const argv = buildResumeArgv('omp', 'spec', '/repo', 'token123');
-    expect(argv).toEqual(['omp', '-p', 'spec', '--session-dir', handleDir('token123', '/repo'), '--continue', '--approval-mode=yolo', '--mode=json']);
+    expect(argv).toEqual(['omp', '-p', 'spec', '--session-dir', handleDirUncached('token123', '/repo'), '--continue', '--approval-mode=yolo', '--mode=json']);
   });
 
   it('builds opencode resume argv with token and skips permissions like run', () => {

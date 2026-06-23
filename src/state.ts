@@ -80,7 +80,7 @@ const _handleDirCache = new Map<string, string>();
 export function handleDirUncached(handle: string, repo: string): string {
   return join(workersDir(), projectName(repo), handle);
 }
-export function handleDir(handle: string, repo?: string): string {
+function handleDir(handle: string, repo?: string): string {
   if (repo) {
     const dir = handleDirUncached(handle, repo);
     _handleDirCache.set(handle, dir);

@@ -11,7 +11,7 @@ const PLANS_DIR = join(tmpdir(), `wstate-plans-${process.pid}`);
 process.env.WORKER_PLANS_DIR = PLANS_DIR;
 mkdirSync(PLANS_DIR, { recursive: true });
 
-import { finalizeJob, insertJob, getJob, getJobFresh, updateJob, workersDir, handleDir, handleDirUncached, lockPath, resolveHandleDir, pruneOldJobs, readSpec, plansDir, saveChainMeta, removeChainMeta, chainMetaPath, pruneTranscript } from '../src/state.ts';
+import { finalizeJob, insertJob, getJob, getJobFresh, updateJob, workersDir, handleDirUncached, lockPath, resolveHandleDir, pruneOldJobs, readSpec, plansDir, saveChainMeta, removeChainMeta, chainMetaPath, pruneTranscript } from '../src/state.ts';
 
 afterAll(() => {
   try { rmSync(STATE_DIR, { recursive: true, force: true }); } catch {}
@@ -103,21 +103,6 @@ describe('finalizeJob', () => {
   });
 });
 
-describe('handleDir cache (#5)', () => {
-  it('resolves a known handle from cache, not a WORKERS_DIR walk', () => {
-    const handle = `cache-${process.pid}-${Date.now()}`;
-    insertJob({ handle, backend: 'cmd', sid: 't', repo: '/tmp/wcache-proj', log_path: 'x' });
-
-    // No-repo lookup hits the cache seeded by insertJob → the project-scoped dir, not the flat fallback.
-    const cachedDir = handleDir(handle);
-    expect(cachedDir).toBe(join(workersDir(), 'tmp-wcache-proj', handle));
-
-    // Wipe the on-disk job so a cold walk would find nothing...
-    rmSync(join(workersDir(), 'tmp-wcache-proj'), { recursive: true, force: true });
-    expect(resolveHandleDir(handle)).toBeNull();   // the scan now yields nothing
-    expect(handleDir(handle)).toBe(cachedDir);      // ...yet handleDir still returns it → served from cache
-  });
-});
 
 describe('getJobFresh bypasses in-memory cache', () => {
   it('reads the latest disk state while getJob returns stale cache', () => {
@@ -128,7 +113,7 @@ describe('getJobFresh bypasses in-memory cache', () => {
     expect(getJob(handle)?.status).toBe('running');
     expect(getJobFresh(handle)?.status).toBe('running');
 
-    const jobPath = join(handleDir(handle), 'job.json');
+    const jobPath = join(handleDirUncached(handle, '/tmp/fresh-test'), 'job.json');
     const disk = JSON.parse(readFileSync(jobPath, 'utf8'));
     disk.status = 'done';
     writeFileSync(jobPath, JSON.stringify(disk, null, 2));
@@ -151,7 +136,7 @@ describe('pruneOldJobs', () => {
     mk('old-term', 'done', 8 * 86_400_000);  // 8 days old -> prune
     mk('fresh-term', 'done', 1000);          // 1s old -> keep
     mk('run', 'running');                    // running -> keep
-    const oldDir = handleDir('old-term', '/tmp/prune-repo');
+    const oldDir = handleDirUncached('old-term', '/tmp/prune-repo');
     expect(pruneOldJobs(Date.now())).toBe(1);
     expect(getJob('old-term')).toBeNull();
     expect(existsSync(oldDir)).toBe(false);
@@ -167,7 +152,7 @@ describe('pruneOldJobs', () => {
     expect(pruneOldJobs()).toBe(0); // nothing pruned
     expect(getJob(handle)).not.toBeNull();
     // Clean up
-    rmSync(handleDir(handle), { recursive: true, force: true });
+    rmSync(handleDirUncached(handle, '/tmp/prune-nofinish'), { recursive: true, force: true });
   });
 
   it('keeps terminal jobs with invalid finished timestamp', () => {
@@ -178,7 +163,7 @@ describe('pruneOldJobs', () => {
     expect(pruneOldJobs()).toBe(0);
     expect(getJob(handle)).not.toBeNull();
     // Clean up
-    rmSync(handleDir(handle), { recursive: true, force: true });
+    rmSync(handleDirUncached(handle, '/tmp/prune-invalid'), { recursive: true, force: true });
   });
 });
 
@@ -249,7 +234,7 @@ describe('handleDirUncached does not poison the handle-dir cache', () => {
 
     // Simulate what omp argv builder does: derive a session-dir from the worktree path.
     // This must NOT poison the cache so that finalizeJob writes to the canonical dir.
-    const wt = join(handleDir(handle, repo), 'tree');
+    const wt = join(handleDirUncached(handle, repo), 'tree');
     handleDirUncached(handle, wt);
 
     finalizeJob(handle, 'done');
@@ -261,7 +246,7 @@ describe('pruneTranscript', () => {
   it('prunes run.log when status is done; keeps job.json', () => {
     const handle = `pt-done-${process.pid}-${Date.now()}`;
     const repo = `/tmp/wstate-pt-${process.pid}`;
-    const dir = handleDir(handle, repo);
+    const dir = handleDirUncached(handle, repo);
     mkdirSync(dir, { recursive: true });
     const log = join(dir, 'run.log');
     writeFileSync(log, 'agent output');
@@ -274,7 +259,7 @@ describe('pruneTranscript', () => {
   it('keeps run.log when status is not done', () => {
     const handle = `pt-stall-${process.pid}-${Date.now()}`;
     const repo = `/tmp/wstate-pt-${process.pid}`;
-    const dir = handleDir(handle, repo);
+    const dir = handleDirUncached(handle, repo);
     mkdirSync(dir, { recursive: true });
     const log = join(dir, 'run.log');
     writeFileSync(log, 'agent output');
@@ -289,7 +274,7 @@ describe('pruneTranscript', () => {
   it('is idempotent: re-prune of an already-gone log still returns pruned', () => {
     const handle = `pt-twice-${process.pid}-${Date.now()}`;
     const repo = `/tmp/wstate-pt-${process.pid}`;
-    const dir = handleDir(handle, repo);
+    const dir = handleDirUncached(handle, repo);
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, 'run.log'), 'agent output');
     insertJob({ handle, backend: 'cmd', sid: 's', repo, log_path: join(dir, 'run.log') });

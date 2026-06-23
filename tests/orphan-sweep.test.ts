@@ -19,7 +19,7 @@ process.env.CLAUDE_CODE_SESSION_ID = THIS_SID;
 
 import { sweepStaleJobs, sweepChainLocks } from '../src/maintenance.ts';
 import { isProcessAlive } from '../src/process.ts';
-import { insertJob, getJob, getJobFresh, updateJob, finalizeJob, pruneOldJobs, ownsWorktree, logPath as stateLogPath, chainLockPath, workersDir, handleDir, __resetStateForTest, getAllRunningJobs, getAllRunningJobsFresh } from '../src/state.ts';
+import { insertJob, getJob, getJobFresh, updateJob, finalizeJob, pruneOldJobs, ownsWorktree, logPath as stateLogPath, chainLockPath, workersDir, handleDirUncached, __resetStateForTest, getAllRunningJobs, getAllRunningJobsFresh } from '../src/state.ts';
 import { SERVER_STARTED, forceKillJob, spawnReaper, resetShutdownState } from '../src/lifecycle.ts';
 import { addWorktree } from '../src/worktree.ts';
 import { reaperPidPath } from '../src/state.ts';
@@ -477,11 +477,11 @@ describe('getAllRunningJobsFresh — stale cache regression', () => {
     const repo = join(tmpdir(), `fresh-reap-repo-${process.pid}-${seq++}`);
     initGitRepo(repo);
 
-    // Write a running orphan job directly to disk. Use handleDir(handle, repo) —
+    // Write a running orphan job directly to disk. Use handleDirUncached(handle, repo) —
     // the same path addWorktree resolves — so finalizeJob's write and
     // getJobFresh's read (both via the repo-derived/cached handle dir) agree.
     const handle = `fresh-reap-${process.pid}-${seq++}`;
-    const jobDir = handleDir(handle, repo);
+    const jobDir = handleDirUncached(handle, repo);
     mkdirSync(jobDir, { recursive: true });
     const wt = addWorktree(repo, handle);
     const workerPid = spawnSleep();
