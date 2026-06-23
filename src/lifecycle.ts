@@ -10,7 +10,6 @@ import {
 import { addWorktreeAsync, clearStaleIndexLock } from './worktree.ts';
 import { buildSpec, buildRunArgv, buildResumeArgv, getResumeToken, type Backend } from './backends.ts';
 import { runWorker, type RunResult } from './runner.ts';
-import { runClaudeTmux } from './claudeTmux.ts';
 import { loginShellEnvAsync } from './env.ts';
 import { isProcessAlive } from './process.ts';
 import { buildContinuationPreamble, type SeedContext } from './seed.ts';
@@ -79,9 +78,7 @@ export function assertRepo(dir: string) {
 // (forceKillJob path); shutdown passes false so jobs stay resumable.
 function killByBackend(job: { handle: string; backend: string; worker_pid: number }, markRequested: boolean): void {
   if (markRequested) updateJob(job.handle, { kill_requested: true });
-  if (job.backend === 'claude_tmux') {
-    try { spawnSync('tmux', ['kill-session', '-t', job.handle], { stdio: 'ignore' }); } catch {}
-  } else if (job.worker_pid > 0) {
+  if (job.worker_pid > 0) {
     killProcessTree(job.worker_pid, 'SIGKILL');
   }
 }
@@ -132,9 +129,9 @@ export function launch(
     // younger worktree workers persist -- safe, not optimal; re-elect oldest-alive
     // to dir on drain if reuse matters.
     const treePath = join(handleDir(handle, dir), 'tree');
-    // claude/claude_tmux pick model by task hardness: complex → sonnet, else haiku. omp self-selects.
+    // claude picks model by task hardness: complex → sonnet, else haiku. omp self-selects.
     const claudeModel = opts.complex ? 'sonnet' : 'haiku';
-    const modelToUse = (backend === 'claude' || backend === 'claude_tmux') ? (opts.model ?? claudeModel) : backend === 'omp' ? undefined : opts.model;
+    const modelToUse = backend === 'claude' ? (opts.model ?? claudeModel) : backend === 'omp' ? undefined : opts.model;
     insertJob({ handle, backend, sid: opts.sid, repo: dir, worktree_path: reuse ?? treePath, base_sha: opts.reuseBaseSha, model: modelToUse, task: prompt, log_path: lp, completion_lock: opts.completionLock, server_pid: process.pid, server_started: SERVER_STARTED, server_sid: SERVER_SID, deadline_at: opts.deadlineAt });
 
     let inPlace = false;
@@ -194,9 +191,6 @@ export function launch(
       throw err;
     }
 
-    if (backend === 'claude_tmux') {
-      return runClaudeTmux(spec, wt, handle, handle, opts.model ?? claudeModel, opts.timeoutMs, opts.deadlineAt);
-    }
     const argv = buildRunArgv(backend, spec, wt, handle, modelToUse, opts.extraArgs);
     const initToken = backend === 'opencode' ? '' : getResumeToken(backend, handle, lp);
     const result = await runWorker(argv, wt, handle, backend, lp, initToken, opts.timeoutMs, opts.deadlineAt);
@@ -229,13 +223,10 @@ export async function shutdown(): Promise<void> {
   launchedHandles.clear();
 
   // Batch-kill every pid-backed worker tree from ONE process-table snapshot (2 `ps`
-  // enumerations total) instead of one doubled enumeration per job; tmux jobs killed
-  // by session. Jobs stay resumable (finalized 'failed', not kill_requested).
-  killProcessTrees(jobs.filter(j => j.backend !== 'claude_tmux' && j.worker_pid > 0).map(j => j.worker_pid), 'SIGKILL');
+  // Batch-kill every pid-backed worker tree from ONE process-table snapshot.
+  // Jobs stay resumable (finalized 'failed', not kill_requested).
+  killProcessTrees(jobs.filter(j => j.worker_pid > 0).map(j => j.worker_pid), 'SIGKILL');
   for (const job of jobs) {
-    if (job.backend === 'claude_tmux') {
-      try { spawnSync('tmux', ['kill-session', '-t', job.handle], { stdio: 'ignore' }); } catch {}
-    }
     finalizeJob(job.handle, 'failed', { resume_token: job.resume_token });
   }
   process.exit(0);

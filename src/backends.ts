@@ -6,9 +6,9 @@ import { tailCapped } from './logParse.ts';
 import { FILE_CONFIG, type FileConfig } from './config.ts';
 import { authProbeMs, maxTurns } from './env.ts';
 
-export type Backend = 'pool' | 'omp' | 'opencode' | 'cmd' | 'claude' | 'claude_tmux' | 'codex';
+export type Backend = 'pool' | 'omp' | 'opencode' | 'cmd' | 'claude' | 'codex';
 
-export const ALL_BACKENDS: readonly Backend[] = ['codex', 'cmd', 'pool', 'omp', 'opencode', 'claude', 'claude_tmux'];
+export const ALL_BACKENDS: readonly Backend[] = ['codex', 'cmd', 'pool', 'omp', 'opencode', 'claude'];
 
 // Quiet backends do NOT emit thinking/reasoning to the log, so long silent gaps are normal work,
 // not a stall — they get a longer stall timeout (env.ts quietStallMs). Membership is hardcoded:

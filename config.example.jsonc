@@ -1,7 +1,7 @@
 {
   // Backend try-order, highest priority first. Subset/reorder of:
-  // "codex" | "cmd" | "pool" | "omp" | "opencode" | "claude" | "claude_tmux"
-  "ladder": ["codex", "cmd", "pool", "omp", "opencode", "claude", "claude_tmux"],
+  // "codex" | "cmd" | "pool" | "omp" | "opencode" | "claude"
+  "ladder": ["codex", "cmd", "pool", "omp", "opencode", "claude"],
 
   // Backend names to remove from the ladder. Same names as above. [] = skip none.
   "skip": [],

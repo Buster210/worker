@@ -11,6 +11,7 @@ export type FileConfig = {
   reportPollMs?: number;
   rc?: string;
   loginShell?: boolean;
+  cpuQos?: string;
 };
 
 function loadFileConfig(pathOverride?: string): FileConfig {
@@ -69,6 +70,10 @@ function loadFileConfig(pathOverride?: string): FileConfig {
 
   if (typeof parsed.loginShell === 'boolean') {
     result.loginShell = parsed.loginShell;
+  }
+
+  if (typeof parsed.cpuQos === 'string') {
+    result.cpuQos = parsed.cpuQos;
   }
 
   return result;

@@ -16,7 +16,6 @@ import { getAllRunningJobsFresh, finalizeJob, type Job } from './state.ts';
 import type { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { killProcessTree, killProcessTrees } from './process.ts';
-import { spawnSync } from 'child_process';
 
 // --- Lockfile ---
 
@@ -154,9 +153,6 @@ export function killSessionWorkers(claudeSid: string): void {
     if (job.worker_pid > 0) {
       killProcessTree(job.worker_pid, 'SIGKILL');
     }
-    if (job.backend === 'claude_tmux') {
-      try { spawnSync('tmux', ['kill-session', '-t', job.handle], { stdio: 'ignore' }); } catch { /* ignore */ }
-    }
     finalizeJob(job.handle, 'failed:session-killed', { resume_token: job.resume_token });
   }
 }
@@ -175,9 +171,6 @@ export function hardShutdown(): void {
       killProcessTrees(pids, 'SIGKILL');
     }
     for (const job of jobs) {
-      if (job.backend === 'claude_tmux') {
-        try { spawnSync('tmux', ['kill-session', '-t', job.handle], { stdio: 'ignore' }); } catch { /* ignore */ }
-      }
       finalizeJob(job.handle, 'failed:daemon-shutdown', { resume_token: job.resume_token });
     }
   }

@@ -231,7 +231,7 @@ describe('proxy → daemon tool calls', () => {
     expect(listResp.result).toBeDefined();
     const tools = (listResp.result as Record<string, unknown>).tools as unknown[];
     expect(tools.length).toBeGreaterThan(0);
-    const toolNames = tools.map((t: Record<string, unknown>) => t.name);
+    const toolNames = tools.map((t) => (t as Record<string, unknown>).name);
     expect(toolNames).toContain('worker_ladder');
   });
 });

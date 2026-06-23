@@ -18,6 +18,19 @@ export function graceMs(): number { return envMs('WORKER_GRACE_MS', 60_000); }
 export function authProbeMs(): number { return envMs('WORKER_AUTH_PROBE_MS', 2_000); }
 export function maxTurns(): number { return envMs('WORKER_MAX_TURNS', 10_000); }
 
+// ponytail: clamp spawned backends (and every cargo/rustc/etc they fork) to a
+// macOS QoS band so heavy builds yield under contention instead of pinning all
+// cores hot. Lossless — work still completes, just at lower scheduling priority.
+// 'utility' (default) = throttle but keep decent throughput; 'background'/
+// 'maintenance' = harder throttle; 'off' = disable. macOS-only (taskpolicy).
+// Upgrade path: per-backend QoS if one backend needs full speed.
+export function cpuThrottleArgv(): string[] {
+  if (process.platform !== 'darwin') return [];
+  const q = (process.env.WORKER_CPU_QOS ?? FILE_CONFIG.cpuQos ?? 'utility').toLowerCase();
+  if (!['utility', 'background', 'maintenance'].includes(q)) return [];
+  return ['/usr/sbin/taskpolicy', '-c', q];
+}
+
 const HOME = process.env.HOME ?? '';
 
 const LOGIN_ENV_MARKER = '__WORKER_ENV_a7f3__';

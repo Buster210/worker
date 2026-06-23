@@ -78,16 +78,6 @@ describe('handleKill', () => {
     expect(handleKill({ handle })).toBe(`killed: ${handle} (killed)`); // kill_requested beats failed
     expect(getJob(handle)?.status).toBe('killed');
   });
-  it('kills claude_tmux job when tmux session does not exist (swallows error)', () => {
-    // claude_tmux backend fires tmux kill-session; if the session never existed,
-    // tmux returns error but the code catches it silently and proceeds to finalize.
-    const handle = seedJob('running', { worker_pid: 0 }); // claude_tmux jobs have worker_pid 0
-    updateJob(handle, { backend: 'claude_tmux' }); // override to claude_tmux
-    writeFileSync(stateLogPath(handle, REPO), 'FAILED\n');
-    // tmux kill-session will fail (no session), but we still get killed status
-    expect(handleKill({ handle })).toBe(`killed: ${handle} (killed)`);
-    expect(getJob(handle)?.status).toBe('killed');
-  });
 });
 
 describe('handleResume', () => {

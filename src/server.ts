@@ -60,10 +60,6 @@ export function handleKill(args: { handle: string }): string {
   }
   updateJob(handle, { kill_requested: true });
   const finalizeKilled = () => finalizeJob(handle, resolveStatus(job.backend, 0, job.log_path, false));
-  if (job.backend === 'claude_tmux') {
-    forceKillJob(job);
-    return `killed: ${handle} (${finalizeKilled()})`;
-  }
   if (job.status === 'stopped' && job.worker_pid) {
     forceKillJob(job);
     return `killed: ${handle} (${finalizeKilled()})`;
@@ -105,7 +101,7 @@ export function handleStatus(args: { handle: string }): Record<string, unknown> 
 }
 
 export function handleDoctor(args: { backend?: string }): string {
-  const backends = args.backend ? [args.backend] : ALL_BACKENDS.filter(be => be !== 'claude_tmux');
+  const backends = args.backend ? [args.backend] : [...ALL_BACKENDS];
   const down = backends.filter(be => {
     const [cmd, ...probeArgs] = backendShellArgv([be, '--version']);
     const r = spawnSync(cmd, probeArgs, { stdio: 'ignore', env: workerEnv(), timeout: 10_000 });
@@ -191,92 +187,91 @@ export function createWorkerServer(tracker?: SessionTracker): McpServer {
 
   const bareFilename = (v: string) => !v.includes('/') && !v.includes('\\') && v !== '.' && v !== '..' && !v.includes('..');
 
-  s.tool('worker_ladder',
-    `Default lane. Run task on bg agent, climbs backend ladder. → {handle, status:'running'} on worker/<handle> or current branch. Spec + report loop → server instructions.`,
-    {
+  s.registerTool('worker_ladder', {
+    description: `Default lane. Run task on bg agent, climbs backend ladder. → {handle, status:'running'} on worker/<handle> or current branch. Spec + report loop → server instructions.`,
+    inputSchema: z.object({
       sid: z.string().describe('Session ID ($CLAUDE_CODE_SESSION_ID)'),
       specFile: z.string().min(1).refine(bareFilename, 'bare filename only (no path separators or ..)').describe('Spec filename (bare, no slashes) from ~/.claude/plans/'),
       dir: z.string().min(1).refine(v => v.startsWith('/'), 'absolute path required').describe('Repo directory (absolute path, required)'),
       timeout: z.number().int().min(1).max(3600).optional().describe('Hard timeout seconds (1..3600, default 600)'),
       complex: z.boolean().optional().describe('true=hard; server picks model. Never pass model yourself.'),
-    },
-    async ({ sid, specFile, dir, timeout, complex }, extra) => {
+    }),
+  }, async ({ sid, specFile, dir, timeout, complex }, extra) => {
       if (tracker && extra.sessionId) tracker.setClaudeSid(extra.sessionId, sid);
       const prompt = readSpec(specFile);
       return reply(handleLadder({ sid, prompt, dir, timeout, complex }));
     }
   );
 
-  s.tool('worker_run',
-    `Run task on a named backend — use only when user names one, else worker_ladder. → {handle, status:'running'}. Report loop → server instructions.`,
-    {
+  s.registerTool('worker_run', {
+    description: `Run task on a named backend — use only when user names one, else worker_ladder. → {handle, status:'running'}. Report loop → server instructions.`,
+    inputSchema: z.object({
       backend: z.string().describe('Named backend to run.'),
       specFile: z.string().min(1).refine(bareFilename, 'bare filename only (no path separators or ..)').describe('Spec filename (bare, no slashes) from ~/.claude/plans/'),
       model: z.string().regex(/^[A-Za-z9._:-]+$/).optional().describe('Model override. Ignored by workers that pin their own model.'),
       dir: z.string().min(1).refine(v => v.startsWith('/'), 'absolute path required').describe('Repo directory (absolute path, required)'),
       timeout: z.number().int().min(1).max(3600).optional().describe('Hard timeout seconds (1..3600, default 600)'),
       extraArgs: z.array(z.string().max(4096)).optional().describe('Raw worker CLI args.'),
-    },
-    async ({ backend, ...rest }) => {
+    }),
+  }, async ({ backend, ...rest }) => {
       if (!LADDER.includes(backend as Backend)) return reply(`Unknown worker: ${backend}`);
       return reply(handleRun({ backend: backend as Backend, ...rest }));
     }
   );
 
-  s.tool('worker_resume',
-    'Resume stopped worker / retry failed|timeout. Pass original specFile + dir.',
-    {
+  s.registerTool('worker_resume', {
+    description: 'Resume stopped worker / retry failed|timeout. Pass original specFile + dir.',
+    inputSchema: z.object({
       handle: z.string(),
       specFile: z.string().min(1).refine(bareFilename, 'bare filename only (no path separators or ..)').describe('Spec filename (bare, no slashes) from ~/.claude/plans/'),
       dir: z.string().min(1).refine(v => v.startsWith('/'), 'absolute path required').describe('Repo directory (absolute path, required)'),
       timeout: z.number().int().min(1).max(3600).optional(),
       extraArgs: z.array(z.string().max(4096)).optional().describe('Raw worker CLI args.'),
-    },
-    async (args) => reply(handleResume(args))
+    }),
+  }, async (args) => reply(handleResume(args))
   );
 
-  s.tool('worker_kill',
-    'Kill a running worker.',
-    { handle: z.string() },
-    async (args) => reply(handleKill(args))
+  s.registerTool('worker_kill', {
+    description: 'Kill a running worker.',
+    inputSchema: z.object({ handle: z.string() }),
+  }, async (args) => reply(handleKill(args))
   );
 
-  s.tool('worker_status',
-    'Worker state: status, pid, timing. Not a done-signal — use worker-report to wait for completion.',
-    { handle: z.string() },
-    async (args) => reply(handleStatus(args))
+  s.registerTool('worker_status', {
+    description: 'Worker state: status, pid, timing. Not a done-signal — use worker-report to wait for completion.',
+    inputSchema: z.object({ handle: z.string() }),
+  }, async (args) => reply(handleStatus(args))
   );
 
-  s.tool('worker_extend',
-    'Push worker deadline +N sec (1..86400). Repeatable. Unextended → hard-killed ~60s past deadline.',
-    {
+  s.registerTool('worker_extend', {
+    description: 'Push worker deadline +N sec (1..86400). Repeatable. Unextended → hard-killed ~60s past deadline.',
+    inputSchema: z.object({
       handle: z.string().describe('Worker handle'),
       seconds: z.number().describe('Seconds to extend the deadline (1..86400)'),
-    },
-    async (args) => reply(handleExtend(args))
+    }),
+  }, async (args) => reply(handleExtend(args))
   );
 
-  s.tool('worker_doctor',
-    'Health check: names broken workers, else all-fine.',
-    { backend: z.string().optional() },
-    async (args) => reply(handleDoctor(args))
+  s.registerTool('worker_doctor', {
+    description: 'Health check: names broken workers, else all-fine.',
+    inputSchema: z.object({ backend: z.string().optional() }),
+  }, async (args) => reply(handleDoctor(args))
   );
 
-  s.tool('worker_list',
-    'List recent jobs.',
-    {
+  s.registerTool('worker_list', {
+    description: 'List recent jobs.',
+    inputSchema: z.object({
       status: z.string().optional().describe('Filter by status: running|stopped|done|failed|timeout|killed'),
       limit: z.number().optional().describe('Max results (default 20)'),
-    },
-    async (args) => reply(handleList(args))
+    }),
+  }, async (args) => reply(handleList(args))
   );
 
-  s.tool('worker_cleanup',
-    'Drop transcript (run.log) after diff reviewed. Keeps job.json + worktree + branch. No-op unless worker done.',
-    { handle: z.string() },
-    async (args) => reply(handleCleanup(args))
+  s.registerTool('worker_cleanup', {
+    description: 'Drop transcript (run.log) after diff reviewed. Keeps job.json + worktree + branch. No-op unless worker done.',
+    inputSchema: z.object({ handle: z.string() }),
+  }, async (args) => reply(handleCleanup(args))
   );
-
   return s;
 }
 

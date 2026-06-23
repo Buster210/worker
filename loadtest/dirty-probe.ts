@@ -13,7 +13,6 @@ process.env.SKIP_pool = '1';
 process.env.SKIP_cmd = '1';
 process.env.SKIP_opencode = '1';
 process.env.SKIP_claude = '1';
-process.env.SKIP_claude_tmux = '1';
 process.env.PATH = `${process.env.HOME}/.bun/bin:/usr/local/bin:/usr/bin:/bin`;
 
 spawnSync('git', ['init', '-q'], { cwd: REPO });

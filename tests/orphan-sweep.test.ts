@@ -120,10 +120,10 @@ describe('sweepStaleJobs — orphan branch', () => {
     expect(isProcessAlive(workerPid)).toBe(true);     // worker still alive
   });
 
-  it('leaves a worker_pid=0 job (claude_tmux / insert window) whose owning server is alive untouched', () => {
+  it('leaves a worker_pid=0 job (insert window) whose owning server is alive untouched', () => {
     const serverPid = spawnSleep();                   // owner server still running
     const handle = seedRunning({
-      worker_pid: 0,                                   // tmux jobs carry 0; also the post-insert window
+      worker_pid: 0,
       server_pid: serverPid,
       server_started: new Date().toISOString(),
     });
@@ -288,29 +288,6 @@ describe('sweepChainLocks', () => {
   });
 });
 
-describe('forceKillJob / shutdown — claude_tmux worker_pid===0', () => {
-  it('forceKillJob on a claude_tmux job does NOT skip on worker_pid===0', () => {
-    // forceKillJob branches on backend === 'claude_tmux' and calls tmux kill-session,
-    // ignoring worker_pid entirely. Confirm it doesn't throw and returns without requiring pid>0.
-    // We use a fake handle that won't match any real tmux session so the spawnSync silently fails.
-    const handle = `tmux-kill-test-${process.pid}-${seq++}`;
-    insertJob({
-      handle, backend: 'claude_tmux', sid: 'test', repo: REPO,
-      log_path: stateLogPath(handle, REPO),
-      worker_pid: 0,  // tmux jobs have worker_pid === 0
-      server_pid: process.pid,
-      server_started: SERVER_STARTED,
-    });
-
-    const job = { handle, backend: 'claude_tmux', worker_pid: 0, log_path: stateLogPath(handle, REPO) };
-
-    // Should NOT throw even with worker_pid === 0
-    expect(() => forceKillJob(job)).not.toThrow();
-    // The tmux kill-session path was taken (not the worker_pid>0 killProcessTree path)
-    // Verified implicitly: if it branched on worker_pid>0, it would have been skipped entirely,
-    // not killing the tmux session. The function completing without throw confirms the tmux branch ran.
-  });
-});
 
 describe('spawnReaper single-instance guard', () => {
   afterEach(() => {

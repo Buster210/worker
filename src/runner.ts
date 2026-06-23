@@ -8,7 +8,7 @@ import { killProcessTree } from './process.ts';
 import { startActivityMonitor } from './monitor.ts';
 import { maybeVerifyAndCommit } from './commit.ts';
 
-import { defaultTimeoutMs, workerEnv, watchdogMs, stallTimeoutMs, quietStallMs, graceMs } from './env.ts';
+import { defaultTimeoutMs, workerEnv, watchdogMs, stallTimeoutMs, quietStallMs, graceMs, cpuThrottleArgv } from './env.ts';
 
 export type RunResult = {
   status: string;
@@ -31,7 +31,7 @@ function markStallOutcome(handle: string, pid: number, logPath: string, backend:
 
 export function backendShellArgv(argv: string[]): string[] {
   const shell = process.env.SHELL ?? '/bin/zsh';
-  return [shell, '-c', '[ -n "$WORKER_RC" ] && [ -f "$WORKER_RC" ] && . "$WORKER_RC"; "$0" "$@"', ...argv];
+  return [...cpuThrottleArgv(), shell, '-c', '[ -n "$WORKER_RC" ] && [ -f "$WORKER_RC" ] && . "$WORKER_RC"; "$0" "$@"', ...argv];
 }
 
 function launchAndWait(

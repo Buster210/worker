@@ -22,7 +22,6 @@ process.env.SKIP_pool = '1';
 process.env.SKIP_cmd = '1';
 process.env.SKIP_opencode = '1';
 process.env.SKIP_claude = '1';
-process.env.SKIP_claude_tmux = '1';
 process.env.WORKER_POLL_MS = String(parseInt(process.env.LOAD_POLL_MS ?? '500', 10));
 process.env.WORKER_RESUME_POLL_MS = String(parseInt(process.env.LOAD_RESUME_POLL_MS ?? '500', 10));
 

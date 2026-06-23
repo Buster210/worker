@@ -219,7 +219,7 @@ describe('base-ref diff — committed work still surfaces', () => {
 
 // ---------------------------------------------------------------------------
 // Integration: the REAL wired completion sequence against a REAL git worktree.
-// Drives the exact path runner.ts/claudeTmux.ts use on a green clean exit —
+// Drives the exact path lifecycle.launch() uses on a green clean exit —
 //   finalizeJob(handle, maybeVerifyAndCommit(handle, wt, resolveStatus(...)), ...)
 // — through resolveStatus (empty log + rc 0 → 'done'), and asserts the commit
 // actually lands on the worktree and the base-ref diff surfaces the committed work.
@@ -250,10 +250,9 @@ describe('integration — wired completion sequence commits on a real worktree',
 
     // Dirty the worktree as a real worker would.
     writeFileSync(join(WT, 'feature.txt'), 'real work product\n');
-
+    // EXACT wired completion sequence (lifecycle.launch non-stopped branch).
     const before = commitCount(WT);
 
-    // EXACT wired completion sequence (runner.ts non-stopped branch / claudeTmux clean exit).
     const natural = resolveStatus('cmd', 0, emptyLog, false);
     expect(natural).toBe('done');
     const gated = maybeVerifyAndCommit(handle, WT, natural);

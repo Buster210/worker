@@ -221,8 +221,8 @@ describe('resolveStatus', () => {
     const tmpLogPath = `${tmpdir()}/resolveStatus-${process.pid}-${Date.now()}-13.log`;
     writeFileSync(tmpLogPath, 'info: starting\ninfo: working\nDONE');
     testLogs.push(tmpLogPath);
-    // claude_tmux is a text backend (not emitsJsonLog)
-    expect(resolveStatus('claude_tmux', 0, tmpLogPath, false)).toBe('done');
+    // cmd is a text backend (not emitsJsonLog)
+    expect(resolveStatus('cmd', 0, tmpLogPath, false)).toBe('done');
   });
 
   it('json log with non-assistant lines ignored, assistant DONE found', () => {

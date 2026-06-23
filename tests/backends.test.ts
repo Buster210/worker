@@ -35,7 +35,7 @@ describe('buildSpec', () => {
   });
 
   it('all backends produce identical structure (preamble + task + contract)', () => {
-    const backends: Backend[] = ['codex', 'cmd', 'pool', 'omp', 'opencode', 'claude', 'claude_tmux'];
+    const backends: Backend[] = ['codex', 'cmd', 'pool', 'omp', 'opencode', 'claude'];
     const specs = backends.map(() => buildSpec('my task'));
     // All specs are identical — spec is backend-independent
     for (const spec of specs) {
@@ -199,7 +199,6 @@ describe('emitsJsonLog', () => {
     expect(emitsJsonLog('opencode')).toBe(false);
     expect(emitsJsonLog('claude')).toBe(false);
     expect(emitsJsonLog('cmd')).toBe(false);
-    expect(emitsJsonLog('claude_tmux')).toBe(false);
   });
 });
 
@@ -232,19 +231,19 @@ describe('computeLadder', () => {
 
   it('reorders: ["claude","codex"] puts them first, rest appended in ALL_BACKENDS order', () => {
     const result = computeLadder({ ladder: ['claude', 'codex'] });
-    const expected: Backend[] = ['claude', 'codex', 'cmd', 'pool', 'omp', 'opencode', 'claude_tmux'];
+    const expected: Backend[] = ['claude', 'codex', 'cmd', 'pool', 'omp', 'opencode'];
     expect(result).toEqual(expected);
   });
 
   it('drops unknown names, keeps valid ones in file order', () => {
     const result = computeLadder({ ladder: ['bogus', 'omp'] });
-    const expected: Backend[] = ['omp', 'codex', 'cmd', 'pool', 'opencode', 'claude', 'claude_tmux'];
+    const expected: Backend[] = ['omp', 'codex', 'cmd', 'pool', 'opencode', 'claude'];
     expect(result).toEqual(expected);
   });
 
   it('deduplicates: ["omp","omp"] -> single omp', () => {
     const result = computeLadder({ ladder: ['omp', 'omp'] });
-    const expected: Backend[] = ['omp', 'codex', 'cmd', 'pool', 'opencode', 'claude', 'claude_tmux'];
+    const expected: Backend[] = ['omp', 'codex', 'cmd', 'pool', 'opencode', 'claude'];
     expect(result).toEqual(expected);
   });
 
@@ -258,7 +257,7 @@ describe('computeLadder', () => {
     process.env.SKIP_pool = '1';
     try {
       const result = computeLadder({ ladder: ['codex', 'omp'] });
-      const expected: Backend[] = ['codex', 'omp', 'cmd', 'opencode', 'claude', 'claude_tmux'];
+      const expected: Backend[] = ['codex', 'omp', 'cmd', 'opencode', 'claude'];
       expect(result).toEqual(expected);
     } finally {
       if (origSkip === undefined) delete process.env.SKIP_pool;
@@ -269,7 +268,7 @@ describe('computeLadder', () => {
   it('drops cmd and codex when isAuthed returns false for them', () => {
     const result = computeLadder(() => false);
     // codex and cmd removed; rest stay in ALL_BACKENDS order
-    expect(result).toEqual(['pool', 'omp', 'opencode', 'claude', 'claude_tmux']);
+    expect(result).toEqual(['pool', 'omp', 'opencode', 'claude']);
     expect(result).not.toContain('cmd');
     expect(result).not.toContain('codex');
   });
@@ -278,7 +277,7 @@ describe('computeLadder', () => {
     const result = computeLadder(be => be !== 'codex');
     expect(result).not.toContain('codex');
     expect(result).toContain('cmd');
-    expect(result).toEqual(['cmd', 'pool', 'omp', 'opencode', 'claude', 'claude_tmux']);
+    expect(result).toEqual(['cmd', 'pool', 'omp', 'opencode', 'claude']);
   });
 
   it('default isAuthed keeps all backends when WORKER_SKIP_AUTH_GATE=1', () => {
