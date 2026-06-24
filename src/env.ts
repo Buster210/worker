@@ -62,11 +62,19 @@ export function __resetLoginEnvCache(): void {
 }
 export function __isWorkerEnvBuilt(): boolean { return _workerEnv !== undefined; }
 
-export function loginShellEnv(): Record<string, string> | null {
+// Shared setup for both login-shell variants. Returns a discriminated result:
+// disabled → caller returns null; cached → caller returns the value (may be null);
+// otherwise the context needed to spawn the login shell.
+type LoginPreamble =
+  | { disabled: true }
+  | { cached: Record<string, string> | null }
+  | { shell: string; sig: string; cachePath: string; snippet: string };
+
+function _loginShellPreamble(): LoginPreamble {
   // Disabled when WORKER_LOGIN_SHELL='0' OR (WORKER_LOGIN_SHELL unset AND FILE_CONFIG.loginShell === false)
   const loginShellEnvRaw = process.env.WORKER_LOGIN_SHELL;
-  if (loginShellEnvRaw === '0' || (loginShellEnvRaw === undefined && FILE_CONFIG.loginShell === false)) return null;
-  if (_loginEnvCache !== undefined) return _loginEnvCache;
+  if (loginShellEnvRaw === '0' || (loginShellEnvRaw === undefined && FILE_CONFIG.loginShell === false)) return { disabled: true };
+  if (_loginEnvCache !== undefined) return { cached: _loginEnvCache };
   const shell = process.env.SHELL ?? '/bin/zsh';
   const sig = loginEnvSig(shell);
   const cachePath = loginEnvCachePath();
@@ -74,25 +82,37 @@ export function loginShellEnv(): Record<string, string> | null {
     const cached = JSON.parse(readFileSync(cachePath, 'utf8')) as { shell?: string; sig?: string; env?: Record<string, string> };
     if (cached.shell === shell && cached.sig === sig && cached.env) {
       _loginEnvCache = cached.env;
-      return cached.env;
+      return { cached: cached.env };
     }
   } catch {}
   const bunPath = process.execPath;
-  const snippet =
-    `printf '%s\\n' '${LOGIN_ENV_MARKER}'; exec "${bunPath}" -e 'process.stdout.write(JSON.stringify(process.env))'`;
+  const snippet = `printf '%s\\n' '${LOGIN_ENV_MARKER}'; exec "${bunPath}" -e 'process.stdout.write(JSON.stringify(process.env))'`;
+  return { shell, sig, cachePath, snippet };
+}
+
+// Parse the spawned stdout, populate _loginEnvCache, and persist the cache file. Returns parsed env (or null).
+function _commitLoginEnvResult(stdout: string, shell: string, sig: string, cachePath: string): Record<string, string> | null {
+  const parsed = parseEnvSnapshot(stdout, LOGIN_ENV_MARKER);
+  _loginEnvCache = parsed;
+  if (parsed) {
+    try {
+      const tmp = `${cachePath}.${process.pid}.tmp`;
+      writeFileSync(tmp, JSON.stringify({ shell, sig, env: parsed }));
+      renameSync(tmp, cachePath);
+    } catch {}
+  }
+  return parsed;
+}
+
+export function loginShellEnv(): Record<string, string> | null {
+  const pre = _loginShellPreamble();
+  if ('disabled' in pre) return null;
+  if ('cached' in pre) return pre.cached;
+  const { shell, sig, cachePath, snippet } = pre;
   try {
     const r = spawnSync(shell, ['-l', '-c', snippet], { encoding: 'utf8', timeout: 5000 });
     if (r.error || r.status !== 0) { _loginEnvCache = null; return null; }
-    const parsed = parseEnvSnapshot(r.stdout ?? '', LOGIN_ENV_MARKER);
-    _loginEnvCache = parsed;
-    if (parsed) {
-      try {
-        const tmp = `${cachePath}.${process.pid}.tmp`;
-        writeFileSync(tmp, JSON.stringify({ shell, sig, env: parsed }));
-        renameSync(tmp, cachePath);
-      } catch {}
-    }
-    return parsed;
+    return _commitLoginEnvResult(r.stdout ?? '', shell, sig, cachePath);
   } catch {
     _loginEnvCache = null;
     return null;
@@ -100,44 +120,23 @@ export function loginShellEnv(): Record<string, string> | null {
 }
 
 export async function loginShellEnvAsync(): Promise<Record<string, string> | null> {
-  // Disabled when WORKER_LOGIN_SHELL='0' OR (WORKER_LOGIN_SHELL unset AND FILE_CONFIG.loginShell === false)
-  const loginShellEnvRaw = process.env.WORKER_LOGIN_SHELL;
-  if (loginShellEnvRaw === '0' || (loginShellEnvRaw === undefined && FILE_CONFIG.loginShell === false)) return null;
-  if (_loginEnvCache !== undefined) return _loginEnvCache;
-  const shell = process.env.SHELL ?? '/bin/zsh';
-  const sig = loginEnvSig(shell);
-  const cachePath = loginEnvCachePath();
-  try {
-    const cached = JSON.parse(readFileSync(cachePath, 'utf8')) as { shell?: string; sig?: string; env?: Record<string, string> };
-    if (cached.shell === shell && cached.sig === sig && cached.env) {
-      _loginEnvCache = cached.env;
-      return cached.env;
-    }
-  } catch {}
-  const bunPath = process.execPath;
-  const snippet = `printf '%s\\n' '${LOGIN_ENV_MARKER}'; exec "${bunPath}" -e 'process.stdout.write(JSON.stringify(process.env))'`;
+  const pre = _loginShellPreamble();
+  if ('disabled' in pre) return null;
+  if ('cached' in pre) return pre.cached;
+  const { shell, sig, cachePath, snippet } = pre;
   return new Promise<Record<string, string> | null>(resolve => {
     const chunks: Buffer[] = [];
     let settled = false;
     const finish = (stdout: string) => {
       if (settled) return;
       settled = true;
-      const parsed = parseEnvSnapshot(stdout, LOGIN_ENV_MARKER);
-      _loginEnvCache = parsed;
-      if (parsed) {
-        try {
-          const tmp = `${cachePath}.${process.pid}.tmp`;
-          writeFileSync(tmp, JSON.stringify({ shell, sig, env: parsed }));
-          renameSync(tmp, cachePath);
-        } catch {}
-      }
-      resolve(parsed);
+      resolve(_commitLoginEnvResult(stdout, shell, sig, cachePath));
     };
     const p = spawn(shell, ['-l', '-c', snippet], { stdio: ['ignore', 'pipe', 'ignore'] });
     p.stdout?.on('data', (d: Buffer) => chunks.push(d));
     const kill = setTimeout(() => { p.kill(); finish(''); }, 5000);
     p.on('close', () => { clearTimeout(kill); finish(Buffer.concat(chunks).toString()); });
-    p.on('error', () => { clearTimeout(kill); _loginEnvCache = null; finish(''); });
+    p.on('error', () => { clearTimeout(kill); settled = true; _loginEnvCache = null; resolve(null); });
   });
 }
 
@@ -160,6 +159,8 @@ export function workerEnv(): NodeJS.ProcessEnv {
       '/bin',
       loginEnv?.PATH ?? process.env.PATH ?? '',
     ].join(':'),
+    // ponytail: .common sets FUNCNEST=700 if unset; pre-set higher so shell-function backends don't hit limit
+    FUNCNEST: '999999',
   };
   return _workerEnv;
 }

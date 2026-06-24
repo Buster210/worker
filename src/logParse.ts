@@ -1,16 +1,12 @@
 import { statSync, openSync, readSync, closeSync } from 'fs';
+import { envMs } from './env.ts';
 
-function envBytes(key: string, def: number): number {
-  const v = Number(process.env[key]);
-  return Number.isFinite(v) && v > 0 ? v : def;
-}
-
-const STATUS_TAIL_BYTES = envBytes('WORKER_STATUS_TAIL_BYTES', 1_048_576);
-const SENTINEL_TAIL_BYTES = envBytes('WORKER_SENTINEL_TAIL_BYTES', 65_536);
+const STATUS_TAIL_BYTES = envMs('WORKER_STATUS_TAIL_BYTES', 1_048_576);
+const SENTINEL_TAIL_BYTES = envMs('WORKER_SENTINEL_TAIL_BYTES', 65_536);
 // Hard ceiling for the json-error full rescan. Without it a multi-MB streaming-json log gets
 // read whole into RAM on every cache-missing readSentinel (reaper sweep, per orphan, every 10s).
 // 8MB covers errors buried well before EOF; the 1MB tail above already catches terminal errors.
-const MAX_ERROR_SCAN_BYTES = envBytes('WORKER_MAX_ERROR_SCAN_BYTES', 8_388_608);
+const MAX_ERROR_SCAN_BYTES = envMs('WORKER_MAX_ERROR_SCAN_BYTES', 8_388_608);
 
 export function tailCapped(logPath: string, cap: number = STATUS_TAIL_BYTES): string {
   try {

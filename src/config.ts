@@ -8,7 +8,6 @@ export type FileConfig = {
   stateDir?: string;
   plansDir?: string;
   retainMs?: number;
-  reportPollMs?: number;
   rc?: string;
   loginShell?: boolean;
   cpuQos?: string;
@@ -58,10 +57,6 @@ function loadFileConfig(pathOverride?: string): FileConfig {
 
   if (typeof parsed.retainMs === 'number' && Number.isFinite(parsed.retainMs) && parsed.retainMs > 0) {
     result.retainMs = parsed.retainMs;
-  }
-
-  if (typeof parsed.reportPollMs === 'number' && Number.isFinite(parsed.reportPollMs) && parsed.reportPollMs > 0) {
-    result.reportPollMs = parsed.reportPollMs;
   }
 
   if (typeof parsed.rc === 'string') {

@@ -52,7 +52,6 @@ describe('loadFileConfig', () => {
       stateDir: '/custom/state',
       plansDir: '/custom/plans',
       retainMs: 12345,
-      reportPollMs: 200,
       rc: '/custom/.common',
       loginShell: false
     }));
@@ -63,7 +62,6 @@ describe('loadFileConfig', () => {
     expect(config.stateDir).toBe('/custom/state');
     expect(config.plansDir).toBe('/custom/plans');
     expect(config.retainMs).toBe(12345);
-    expect(config.reportPollMs).toBe(200);
     expect(config.rc).toBe('/custom/.common');
     expect(config.loginShell).toBe(false);
   });
