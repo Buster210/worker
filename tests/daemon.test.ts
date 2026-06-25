@@ -27,13 +27,14 @@ describe('lockfile protocol', () => {
     expect(lock!.port).toBe(54321);
   });
 
-  it('acquireLock returns false when lockfile already exists', () => {
-    acquireLock(11111, 3000);
+  it('acquireLock returns false when a live holder owns the lock', () => {
+    // process.pid is always alive → the live-foreign-lock guard must refuse to
+    // steal it. (A dead-pid lock is intentionally reclaimed; see daemon.ts.)
+    acquireLock(process.pid, 3000);
     const result = acquireLock(22222, 3001);
     expect(result).toBe(false);
-    
     const lock = readLock();
-    expect(lock!.pid).toBe(11111);
+    expect(lock!.pid).toBe(process.pid);
   });
 
   it('readLock returns null for missing lockfile', () => {
@@ -68,7 +69,7 @@ describe('SessionTracker', () => {
     const tracker = new SessionTracker();
     const mockTransport = { close: async () => {}, handleRequest: async () => ({}), sessionId: 'mcp-1' };
     const mockServer = { sendLoggingMessage: async () => {} };
-    tracker.register('mcp-1', { transport: mockTransport as never, server: mockServer as never });
+    tracker.register('mcp-1', { transport: mockTransport as never, server: mockServer as never, lastSeen: Date.now() });
     expect(tracker.size).toBe(1);
     const entry = tracker.get('mcp-1');
     expect(entry).toBeDefined();
@@ -78,7 +79,7 @@ describe('SessionTracker', () => {
     const tracker = new SessionTracker();
     const mockTransport = { close: async () => {} };
     const mockServer = { sendLoggingMessage: async () => {} };
-    tracker.register('mcp-1', { transport: mockTransport as never, server: mockServer as never });
+    tracker.register('mcp-1', { transport: mockTransport as never, server: mockServer as never, lastSeen: Date.now() });
     const removed = tracker.remove('mcp-1');
     expect(removed).toBeDefined();
     expect(tracker.size).toBe(0);
@@ -94,11 +95,25 @@ describe('SessionTracker', () => {
     const tracker = new SessionTracker();
     const mockTransport = { close: async () => {} };
     const mockServer = { sendLoggingMessage: async () => {} };
-    tracker.register('mcp-1', { transport: mockTransport as never, server: mockServer as never });
-    tracker.register('mcp-2', { transport: mockTransport as never, server: mockServer as never });
+    tracker.register('mcp-1', { transport: mockTransport as never, server: mockServer as never, lastSeen: Date.now() });
+    tracker.register('mcp-2', { transport: mockTransport as never, server: mockServer as never, lastSeen: Date.now() });
     const entries = [...tracker.entries()];
     expect(entries.length).toBe(2);
     expect(entries.map(e => e[0]).sort()).toEqual(['mcp-1', 'mcp-2']);
+  });
+
+  it('reapIdle drops only stale sessions, keeps fresh ones', () => {
+    const tracker = new SessionTracker();
+    let closed = 0;
+    const mockTransport = { close: async () => { closed++; } };
+    const mockServer = { sendLoggingMessage: async () => {} };
+    tracker.register('stale', { transport: mockTransport as never, server: mockServer as never, lastSeen: Date.now() - 60_000 });
+    tracker.register('fresh', { transport: mockTransport as never, server: mockServer as never, lastSeen: Date.now() });
+    const reaped = tracker.reapIdle(30_000);
+    expect(reaped).toBe(1);
+    expect(closed).toBe(1);
+    expect(tracker.get('stale')).toBeUndefined();
+    expect(tracker.get('fresh')).toBeDefined();
   });
 });
 

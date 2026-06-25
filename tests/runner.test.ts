@@ -13,7 +13,7 @@ process.env.WORKER_RC = '';
 import { runWorker, type RunResult } from '../src/runner.ts';
 import { reapStoppedJobs } from '../src/maintenance.ts';
 import { isProcessAlive, parseEtimeSeconds } from '../src/process.ts';
-import { activitySig } from '../src/monitor.ts';
+import { activitySig } from '../src/runner.ts';
 import { insertJob, getJob, updateJob, logPath as stateLogPath } from '../src/state.ts';
 
 

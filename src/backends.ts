@@ -106,13 +106,13 @@ export function buildRunArgv(backend: Backend, spec: string, repo: string, sid: 
     case 'omp':
       return ['omp', '-p', spec, '--session-dir', handleDirUncached(sid, repo), '--approval-mode=yolo', '--mode=json', ...(extraArgs ?? [])];
     case 'cmd':
-      return ['cmd', '-p', spec, '--yolo', '-t', '--skip-onboarding', '--max-turns', String(maxTurns()), '--add-dir', repo, ...(model ? ['--model', model] : []), ...(extraArgs ?? [])];
+      return ['cmd', '-p', spec, '--yolo', '-t', '--skip-onboarding', '--max-turns', String(maxTurns()), '--add-dir', repo, ...(extraArgs ?? [])];
     case 'opencode':
-      return ['opencode', 'run', spec, '--dir', repo, '--dangerously-skip-permissions', '--format', 'json', ...(model ? ['-m', model] : []), ...(extraArgs ?? [])];
+      return ['opencode', 'run', spec, '--dir', repo, '--dangerously-skip-permissions', '--format', 'json', ...(extraArgs ?? [])];
     case 'pool':
       return ['pool', 'exec', '-p', spec, '-d', repo, '--unsafe-auto-allow', ...(extraArgs ?? [])];
     case 'codex':
-      return ['codex', 'exec', '--json', '--cd', repo, '--skip-git-repo-check', '--dangerously-bypass-approvals-and-sandbox', ...(model ? ['-m', model] : []), spec];
+      return ['codex', 'exec', '--json', '--cd', repo, '--skip-git-repo-check', '--dangerously-bypass-approvals-and-sandbox', spec];
     default:
       throw new Error(`Unknown backend: ${backend}. Valid: ${ALL_BACKENDS.join(', ')}`);
   }
@@ -129,9 +129,9 @@ export function buildResumeArgv(backend: Backend, spec: string, repo: string, to
     case 'pool':
       return ['pool', 'exec', '-p', spec, '-d', repo, '--unsafe-auto-allow', '--continue', token, ...(extraArgs ?? [])];
     case 'cmd':
-      return ['cmd', '-p', spec, '--yolo', '-t', '--skip-onboarding', '--max-turns', String(maxTurns()), '--add-dir', repo, ...(model ? ['--model', model] : []), ...(extraArgs ?? [])];
+      return ['cmd', '-p', spec, '--yolo', '-t', '--skip-onboarding', '--max-turns', String(maxTurns()), '--add-dir', repo, ...(extraArgs ?? [])];
     case 'codex':
-      return ['codex', 'exec', 'resume', '--last', '--json', '--skip-git-repo-check', '--dangerously-bypass-approvals-and-sandbox', ...(model ? ['-m', model] : []), spec];
+      return ['codex', 'exec', 'resume', '--last', '--json', '--skip-git-repo-check', '--dangerously-bypass-approvals-and-sandbox', spec];
     default:
       throw new Error(`Unknown backend: ${backend}. Valid: ${ALL_BACKENDS.join(', ')}`);
   }
@@ -156,3 +156,12 @@ export function getResumeToken(backend: Backend, sid: string, logPath: string): 
   }
 }
 export function emitsJsonLog(backend: string): boolean { return backend === 'omp' || backend === 'codex' || backend === 'pool'; }
+
+export type SeedContext = {
+  priorBackend: string;
+  priorStatus: string;
+};
+
+export function buildContinuationPreamble(seed: SeedContext): string {
+  return `Continuation. A previous agent (${seed.priorBackend}) was interrupted (${seed.priorStatus}) — likely infra, not bad work. Its in-progress changes are ALREADY applied in this worktree. Review them, finish what is incomplete, do not restart from scratch.\n\n`;
+}

@@ -4,18 +4,22 @@
  * Lockfile: ~/.claude/workers/server.json
  * { pid, port, started_at }
  *
- * One daemon serves all Claude Code / OMP sessions via HTTP.
+ * One daemon serves all Claude Code / OMP instances via HTTP.
  * Sessions connect via StreamableHTTPServerTransport.
- * On last-session disconnect → hard kill all workers → exit.
+ *
+ * Lifecycle: The daemon runs indefinitely until explicitly shut down by the
+ * session-end hook (which runs only when the last Claude Code instance ends).
+ * Workers are reaped on shutdown. Orphaned workers (crashed but not cleaned up)
+ * are reaped after 60s grace period.
  */
-import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, openSync, closeSync, renameSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, openSync, closeSync, renameSync, readdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { homedir } from 'os';
 import { isProcessAlive } from './process.ts';
 import { getAllRunningJobsFresh, finalizeJob, type Job } from './state.ts';
 import type { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { killProcessTree, killProcessTrees } from './process.ts';
+import { killProcessTrees } from './process.ts';
 
 // --- Lockfile ---
 
@@ -58,7 +62,8 @@ export function acquireLock(pid: number, port: number): boolean {
         writeFileSync(fd, JSON.stringify(lock));
         closeSync(fd);
         return true;
-      } catch {
+      } catch (err) {
+        console.error('[worker] lock retry failed:', err instanceof Error ? err.message : err);
         return false;
       }
     }
@@ -67,7 +72,8 @@ export function acquireLock(pid: number, port: number): boolean {
     try {
       renameSync(tmpPath, lockPath());
       return true;
-    } catch {
+    } catch (err) {
+      console.error('[worker] lock atomic fallback failed:', err instanceof Error ? err.message : err);
       try { unlinkSync(tmpPath); } catch { /* ignore */ }
       return false;
     }
@@ -111,6 +117,7 @@ export async function isDaemonAlive(lock: DaemonLock): Promise<boolean> {
 export interface SessionEntry {
   transport: StreamableHTTPServerTransport;
   server: McpServer;
+  lastSeen: number; // epoch ms, refreshed on every request — used only for idle GC
 }
 
 export class SessionTracker {
@@ -119,6 +126,32 @@ export class SessionTracker {
   /** Register a new MCP session with transport + server refs. */
   register(mcpSid: string, entry: SessionEntry): void {
     this._map.set(mcpSid, entry);
+  }
+
+  /** Mark a session as just-used (cheap idle-GC bookkeeping, no I/O). */
+  touch(mcpSid: string): void {
+    const e = this._map.get(mcpSid);
+    if (e) e.lastSeen = Date.now();
+  }
+
+  /**
+   * Drop sessions untouched for longer than maxIdleMs and close their dead
+   * transports. Pure memory hygiene — a re-appearing client just re-initializes
+   * (the handler 404s an unknown session id). Never kills workers.
+   * ponytail: idle ceiling, not liveness; a truly-active client touches lastSeen
+   * on every tool call so it never trips this.
+   */
+  reapIdle(maxIdleMs: number): number {
+    const cutoff = Date.now() - maxIdleMs;
+    let n = 0;
+    for (const [sid, e] of [...this._map]) {
+      if (e.lastSeen < cutoff) {
+        this._map.delete(sid);
+        void Promise.resolve(e.transport.close()).catch(() => {});
+        n++;
+      }
+    }
+    return n;
   }
 
   /** Remove and return the full session entry, or undefined if unknown. */
@@ -134,60 +167,44 @@ export class SessionTracker {
   get(mcpSid: string): SessionEntry | undefined { return this._map.get(mcpSid); }
 }
 
-// --- Per-session cleanup ---
+// --- Shutdown (on signal) ---
 
-/**
- * Kill all workers belonging to a specific MCP session.
- * Called when a session disconnects (clean or detected-dead).
- */
-export function killSessionWorkers(mcpSid: string): void {
-  const jobs = getAllRunningJobsFresh().filter(j => j.sid === mcpSid && j.status === 'running');
+/** Kill every running worker. Only when no client remains (last instance out). */
+function reapAllWorkers(): void {
+  const jobs = getAllRunningJobsFresh();
+  if (jobs.length === 0) return;
+  const pids = jobs.filter(j => j.worker_pid > 0).map(j => j.worker_pid);
+  if (pids.length > 0) killProcessTrees(pids, 'SIGKILL');
   for (const job of jobs) {
-    if (job.worker_pid > 0) {
-      killProcessTree(job.worker_pid, 'SIGKILL');
-    }
-    finalizeJob(job.handle, 'failed:session-killed', { resume_token: job.resume_token });
+    finalizeJob(job.handle, 'failed:daemon-shutdown', { resume_token: job.resume_token });
   }
 }
 
-// --- Hard shutdown (last session out) ---
+/** Reap workers that crashed >60s ago (grace period for reconnection). */
+export function reapCrashedWorkers(): void {
+  const jobs = getAllRunningJobsFresh();
+  const now = Date.now();
+  const GRACE_MS = 60_000;
+
+  for (const job of jobs) {
+    if (job.status !== 'running' || job.worker_pid <= 0) continue;
+    if (isProcessAlive(job.worker_pid)) continue;
+
+    const elapsed = now - new Date(job.started).getTime();
+    if (elapsed > GRACE_MS) {
+      try { killProcessTrees([job.worker_pid], 'SIGKILL'); } catch {}
+      finalizeJob(job.handle, 'failed:orphaned', { resume_token: job.resume_token });
+      console.error(`[worker] reaped orphaned worker after ${Math.round(elapsed / 1000)}s: ${job.handle}`);
+    }
+  }
+}
 
 /**
- * Kill ALL remaining workers, remove lockfile, exit.
- * Called when the last session disconnects.
+ * Exit the daemon (SIGTERM/SIGINT). Reaps all workers and exits.
+ * Called only by session-end hook when the last Claude Code instance ends.
  */
 export function hardShutdown(): void {
-  const jobs = getAllRunningJobsFresh();
-  if (jobs.length > 0) {
-    const pids = jobs.filter(j => j.worker_pid > 0).map(j => j.worker_pid);
-    if (pids.length > 0) {
-      killProcessTrees(pids, 'SIGKILL');
-    }
-    for (const job of jobs) {
-      finalizeJob(job.handle, 'failed:daemon-shutdown', { resume_token: job.resume_token });
-    }
-  }
+  reapAllWorkers();
   removeLock();
   process.exit(0);
-}
-
-// --- Keepalive ---
-
-/**
- * Start a keepalive loop that pings all sessions every 15s.
- * If a ping fails, the transport is dead → force close → triggers onclose → cleanup.
- */
-export function startKeepalive(tracker: SessionTracker): NodeJS.Timeout {
-  const timer = setInterval(async () => {
-    for (const [mcpSid, session] of tracker.entries()) {
-      try {
-        await session.server.sendLoggingMessage({ level: 'debug', data: 'keepalive' });
-      } catch {
-        // Send failed → transport dead → force close triggers onclose
-        try { await session.transport.close(); } catch { /* ignore */ }
-      }
-    }
-  }, 15_000);
-  timer.unref();
-  return timer;
 }

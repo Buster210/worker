@@ -1,28 +1,28 @@
-import { basename } from 'path';
+import { basename, join } from 'path';
+import { homedir } from 'os';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
 import { randomUUID } from 'crypto';
 import { spawnSync } from 'child_process';
-import { existsSync } from 'fs';
+import { existsSync, appendFileSync } from 'fs';
 import http from 'http';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import {
-  getJob, updateJob, finalizeJob, getAllJobs, pruneOldJobs, readSpec, loadChainMeta, saveChainMeta,
+  getJob, updateJob, finalizeJob, getAllJobs, getAllRunningJobs, pruneOldJobs, readSpec, loadChainMeta, saveChainMeta,
   pruneTranscript, getLadderHistory,
 } from './state.ts';
 import { LADDER, ALL_BACKENDS, type Backend } from './backends.ts';
 import { backendShellArgv } from './runner.ts';
 import { workerEnv } from './env.ts';
-import { resolveStatus } from './status.ts';
+import { resolveStatus } from './runner.ts';
 import { isProcessAlive } from './process.ts';
 import { sweepStaleJobs, reapStoppedJobs, sweepChainLocks } from './maintenance.ts';
 import { launch, forceKillJob, assertRepo, resumeLaunch as lifecycleResumeLaunch, shutdown, spawnReaper } from './lifecycle.ts';
 import { handleLadder } from './chain.ts';
 import { terminalStatus } from './report.ts';
 import {
-  acquireLock, readLock, removeLock, isDaemonAlive, SessionTracker,
-  killSessionWorkers, hardShutdown, startKeepalive,
+  acquireLock, readLock, removeLock, isDaemonAlive, SessionTracker, hardShutdown, reapCrashedWorkers,
 } from './daemon.ts';
 
 // --- MCP tool handlers (keep in server.ts) ---
@@ -32,20 +32,20 @@ export function reply(r: unknown) {
   return { content: [{ type: 'text' as const, text }] };
 }
 
-export function handleRun(args: { backend: Backend; specFile: string; model?: string; dir: string; timeout?: number; extraArgs?: string[] }, mcpSid: string = randomUUID()): { handle: string; status: string } {
+export function handleRun(args: { backend: Backend; specFile: string; model?: string; dir: string; timeout?: number; extraArgs?: string[] }, mcpSid: string = randomUUID()): { handle: string; status: string; workdir: string } {
   assertRepo(args.dir);
   const prompt = readSpec(args.specFile);
-  const { handle, promise } = launch(args.backend, prompt, args.dir,
+  const { handle, promise, workdir } = launch(args.backend, prompt, args.dir,
     { mcpSid, model: args.model, extraArgs: args.extraArgs, timeoutMs: args.timeout ? args.timeout * 1000 : undefined });
   void promise.catch(() => {});
-  return { handle, status: 'running' };
+  return { handle, status: 'running', workdir };
 }
 
-export function handleResume(args: { handle: string; specFile: string; dir: string; timeout?: number; extraArgs?: string[] }): { handle: string; status: string } {
+export function handleResume(args: { handle: string; specFile: string; dir: string; timeout?: number; extraArgs?: string[] }): { handle: string; status: string; workdir: string } {
   const prompt = readSpec(args.specFile);
-  const { handle, promise } = lifecycleResumeLaunch({ handle: args.handle, prompt, dir: args.dir, timeout: args.timeout, extraArgs: args.extraArgs });
+  const { handle, promise, workdir } = lifecycleResumeLaunch({ handle: args.handle, prompt, dir: args.dir, timeout: args.timeout, extraArgs: args.extraArgs });
   void promise.catch(() => {});
-  return { handle, status: 'running' };
+  return { handle, status: 'running', workdir };
 }
 
 export function handleKill(args: { handle: string }): string {
@@ -273,24 +273,68 @@ export function createWorkerServer(tracker?: SessionTracker): McpServer {
   return s;
 }
 
+const stateDir = () => process.env.WORKER_STATE_DIR || join(homedir(), '.claude', 'workers');
+
+// Tee every [worker] console.error into one timestamped log in the state dir
+// (alongside config.json), so there's a single place to find why/when the daemon
+// died even when its launcher discards stderr.
+// ponytail: never rotated — add size-based rotation if this log ever gets large.
+function teeStderrToLog(): void {
+  const logFile = join(stateDir(), 'mcp-server.log');
+  const orig = console.error.bind(console);
+  console.error = (...args: unknown[]) => {
+    orig(...args);
+    const text = args.map(a => a instanceof Error ? (a.stack ?? a.message) : typeof a === 'string' ? a : JSON.stringify(a)).join(' ');
+    try { appendFileSync(logFile, `${new Date().toLocaleString()} ${text}\n`); } catch {}
+  };
+}
+
 function initDaemon(): void {
+  teeStderrToLog();
+  console.error('[worker] daemon initializing');
   workerEnv();
   sweepStaleJobs();
   reapStoppedJobs();
   sweepChainLocks();
   pruneOldJobs();
-  setInterval(() => { reapStoppedJobs(); sweepStaleJobs(); sweepChainLocks(); pruneOldJobs(); }, 60_000).unref();
-  spawnReaper();
+  reapCrashedWorkers();
+  setInterval(() => {
+    reapStoppedJobs(); sweepStaleJobs(); sweepChainLocks(); pruneOldJobs(); reapCrashedWorkers();
+    // Reaper backstop: it is spawned lazily on launch (see lifecycle.launch) and self-exits when
+    // idle, so an idle server runs none. This respawns it (idempotent) if it died in the
+    // launch/self-exit race window while a worker is still running. Gated on job count so a
+    // truly idle server stays reaper-free.
+    if (getAllRunningJobs().length) spawnReaper();
+  }, 60_000).unref();
 }
 
 if (import.meta.main) {
   initDaemon();
+
+  // Process-level error handlers. console.error is tee'd to daemon.log (see
+  // teeStderrToLog), so crashes land in the state dir with a timestamp even if
+  // the launcher discards stderr.
+  const recordCrash = (kind: string, err: unknown) => {
+    const e = err instanceof Error ? `${err.message}\n${err.stack}` : String(err);
+    console.error(`[worker] ${kind} (pid ${process.pid}):\n${e}`);
+  };
+  process.on('uncaughtException', (err) => {
+    recordCrash('uncaught exception', err);
+    process.exit(1);
+  });
+  process.on('unhandledRejection', (reason) => {
+    recordCrash('unhandled rejection', reason);
+  });
+
   // --- HTTP daemon mode ---
   const tracker = new SessionTracker();
-  // Grace before idle teardown: onclose fires on transient SSE drops too, so a
-  // blip must not exit the daemon. Linger, and cancel if a session reconnects.
-  let shutdownTimer: NodeJS.Timeout | null = null;
-  const SHUTDOWN_GRACE_MS = 10_000;
+
+  // 404 tells the MCP client its session is gone → re-initialize. Returning a
+  // generic 400 here instead wedges the client forever (it replays the dead id).
+  const sessionNotFound = (res: http.ServerResponse) => {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32001, message: 'Session not found' }, id: null }));
+  };
 
   const httpServer = http.createServer(async (req, res) => {
     // Health endpoint
@@ -300,62 +344,71 @@ if (import.meta.main) {
       return;
     }
 
-    // MCP endpoint
+    // MCP endpoint — plain stateless-routing StreamableHTTP. Sessions are just a
+    // routing map; daemon lifecycle (and worker reaping) is owned by the
+    // session-start/session-end hooks via a client-PID refcount, NOT by these
+    // connections. SSE drops are transient and must never kill workers.
     if (req.url === '/mcp') {
+      const sessionId = req.headers['mcp-session-id'] as string | undefined;
+
+      // GET (open SSE stream) / DELETE (terminate session) on an existing session.
+      if (req.method === 'GET' || req.method === 'DELETE') {
+        const entry = sessionId ? tracker.get(sessionId) : undefined;
+        if (!entry) { sessionNotFound(res); return; }
+        entry.lastSeen = Date.now();
+        await entry.transport.handleRequest(req, res);
+        return;
+      }
+
+      // POST — pre-read body so we can route on the parsed JSON-RPC message.
       let body = '';
       for await (const chunk of req) body += chunk;
 
-      const sessionId = req.headers['mcp-session-id'] as string | undefined;
+      let parsed: unknown;
+      try {
+        parsed = body ? JSON.parse(body) : undefined;
+      } catch (err) {
+        console.error('[worker] JSON parse error:', err instanceof Error ? err.message : err);
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32700, message: 'Parse error' }, id: null }));
+        return;
+      }
 
       if (sessionId) {
         const entry = tracker.get(sessionId);
         if (entry) {
-          // Existing session — route to its transport (DELETE has no body)
-          const parsed = body ? JSON.parse(body) : undefined;
+          entry.lastSeen = Date.now();
           await entry.transport.handleRequest(req, res, parsed);
           return;
         }
+        // Known-looking id, unknown to this daemon (restart / reaped) → 404.
+        sessionNotFound(res);
+        return;
       }
 
-      if (!sessionId && req.method === 'POST') {
-        const parsed: unknown = JSON.parse(body);
-        if (isInitializeRequest(parsed)) {
-          // New session — create transport + server
-          const transport = new StreamableHTTPServerTransport({
-            sessionIdGenerator: () => randomUUID(),
-          });
-          const server = createWorkerServer(tracker);
+      // No session id → only an initialize request is valid.
+      if (isInitializeRequest(parsed)) {
+        const transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(),
+        });
+        const server = createWorkerServer(tracker);
+        // Disconnect just forgets the session — never kills workers. They run to
+        // completion; the last-instance-out hook (SIGTERM → hardShutdown) is the
+        // only reaper. The daemon never self-terminates on an idle tracker.
+        transport.onclose = () => {
+          const sid = transport.sessionId;
+          if (sid) tracker.remove(sid);
+        };
 
-          // Wire close handler before connect — fires on disconnect (clean or broken SSE)
-          transport.onclose = () => {
-            const sid = transport.sessionId;
-            if (sid) {
-              tracker.remove(sid);
-              killSessionWorkers(sid);
-              if (tracker.size === 0) {
-                // Don't exit on a transient drop — linger; a reconnect cancels this.
-                shutdownTimer = setTimeout(() => {
-                  if (tracker.size === 0) hardShutdown();
-                }, SHUTDOWN_GRACE_MS);
-                shutdownTimer.unref();
-              }
-            }
-          };
+        await server.connect(transport);
+        await transport.handleRequest(req, res, parsed);
 
-          await server.connect(transport);
-          await transport.handleRequest(req, res, parsed);
-
-          // Transport now has a session ID — register with tracker
-          const mcpSid = transport.sessionId;
-          if (mcpSid) {
-            if (shutdownTimer) { clearTimeout(shutdownTimer); shutdownTimer = null; }
-            tracker.register(mcpSid, { transport, server });
-          }
-          return;
-        }
+        const mcpSid = transport.sessionId;
+        if (mcpSid) tracker.register(mcpSid, { transport, server, lastSeen: Date.now() });
+        return;
       }
 
-      // Invalid request
+      // Not an init, no valid session.
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32000, message: 'Bad Request' }, id: null }));
       return;
@@ -391,11 +444,24 @@ if (import.meta.main) {
       httpServer.close();
       process.exit(1);
     }
-    console.error(`Worker daemon listening on http://127.0.0.1:${actualPort}/mcp`);
-    startKeepalive(tracker);
+    console.error(`[worker] daemon listening on http://127.0.0.1:${actualPort}/mcp`);
   });
 
-  const gracefulShutdown = () => { hardShutdown(); };
-  process.on('SIGTERM', gracefulShutdown);
-  process.on('SIGINT', gracefulShutdown);
+  // Idle-session GC: drop tracker entries unused for a long while. Memory
+  // hygiene only — never touches workers; a returning client just re-initializes
+  // (its stale id 404s). One coarse unref'd timer, no pings → ~zero idle cost.
+  const IDLE_TTL_MS = 30 * 60_000;
+  setInterval(() => tracker.reapIdle(IDLE_TTL_MS), 5 * 60_000).unref();
+
+  const gracefulShutdown = (sig: string) => () => {
+    console.error(`[worker] received ${sig} (pid ${process.pid}), shutting down`);
+    hardShutdown();
+  };
+  // Log signals/exit so a death leaves a trace. NOTE: SIGKILL, OOM-kill, and
+  // segfaults cannot be caught in-process — if the log just stops with no exit
+  // line below, the OS or a supervisor hard-killed it (check Console.app / `log show`).
+  process.on('SIGTERM', gracefulShutdown('SIGTERM'));
+  process.on('SIGINT', gracefulShutdown('SIGINT'));
+  process.on('SIGHUP', gracefulShutdown('SIGHUP'));
+  process.on('exit', (code) => { console.error(`[worker] process exit, code ${code} (pid ${process.pid})`); });
 }

@@ -283,60 +283,45 @@ describe('live daemon', () => {
 
     await stopDaemon(daemon);
   });
-  it('last session out via DELETE → daemon exits and removes lockfile', async () => {
+  it('last session out via DELETE → daemon stays alive; only SIGTERM exits', async () => {
     const port = allocPort();
-    try { unlinkSync(LOCK_PATH); } catch {}
     const daemon = await startDaemon(port);
 
     const { sessionId } = await mcpInitialize(port);
+    expect(JSON.parse((await httpGet(port, '/health')).body).sessions).toBe(1);
 
-    
-    const health1 = await httpGet(port, '/health');
-    expect(JSON.parse(health1.body).sessions).toBe(1);
+    try { await httpDelete(port, '/mcp', { 'mcp-session-id': sessionId }); } catch {  }
 
-    
-    try {
-      await httpDelete(port, '/mcp', { 'mcp-session-id': sessionId });
-    } catch {
-      
-      
-    }
+    // Connection lifecycle ≠ daemon lifecycle: dropping the last session must NOT
+    // tear down the shared daemon. It serves all instances and is reaped only by
+    // signal (last-instance-out hook). Lockfile stays; session count drops to 0.
+    await new Promise(r => setTimeout(r, 500));
+    expect(existsSync(LOCK_PATH)).toBe(true);
+    expect(JSON.parse((await httpGet(port, '/health')).body).sessions).toBe(0);
 
-    
-    for (let i = 0; i < 20; i++) {
-      if (!existsSync(LOCK_PATH)) break;
-      await new Promise(r => setTimeout(r, 200));
-    }
-
+    await stopDaemon(daemon); // SIGTERM → removeLock + exit
     expect(existsSync(LOCK_PATH)).toBe(false);
   });
 
-  it('two sessions, disconnect one → other stays alive, then last exits', async () => {
+  it('two sessions, disconnect one → other stays; last out keeps daemon alive', async () => {
     const port = allocPort();
-    try { unlinkSync(LOCK_PATH); } catch {}
     const daemon = await startDaemon(port);
 
     const s1 = await mcpInitialize(port);
     const s2 = await mcpInitialize(port);
+    expect(JSON.parse((await httpGet(port, '/health')).body).sessions).toBe(2);
 
-    
-    const health1 = await httpGet(port, '/health');
-    expect(JSON.parse(health1.body).sessions).toBe(2);
-
-    
     try { await httpDelete(port, '/mcp', { 'mcp-session-id': s1.sessionId }); } catch {  }
     await new Promise(r => setTimeout(r, 500));
+    expect(JSON.parse((await httpGet(port, '/health')).body).sessions).toBe(1);
 
-    
-    const health2 = await httpGet(port, '/health');
-    expect(JSON.parse(health2.body).sessions).toBe(1);
-
-    
     try { await httpDelete(port, '/mcp', { 'mcp-session-id': s2.sessionId }); } catch {  }
-    for (let i = 0; i < 20; i++) {
-      if (!existsSync(LOCK_PATH)) break;
-      await new Promise(r => setTimeout(r, 200));
-    }
+    await new Promise(r => setTimeout(r, 500));
+    // Last session gone — daemon still up (no connection-coupled self-exit).
+    expect(existsSync(LOCK_PATH)).toBe(true);
+    expect(JSON.parse((await httpGet(port, '/health')).body).sessions).toBe(0);
+
+    await stopDaemon(daemon);
     expect(existsSync(LOCK_PATH)).toBe(false);
   });
 });

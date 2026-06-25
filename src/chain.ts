@@ -3,10 +3,10 @@ import { LADDER, type Backend } from './backends.ts';
 import { type RunResult } from './runner.ts';
 import { launch, SERVER_STARTED } from './lifecycle.ts';
 import { defaultTimeoutMs } from './env.ts';
-import { type SeedContext } from './seed.ts';
+import { type SeedContext } from './backends.ts';
 import { randomUUID } from 'crypto';
 
-type LadderResult = { handle: string; status: string } | { status: 'exhausted'; note: string };
+type LadderResult = { handle: string; status: string; workdir: string } | { status: 'exhausted'; note: string };
 
 export type LadderDrivers = {
   // seed carries only the PRIOR rung's context for the continuation preamble — the prior work itself
@@ -56,7 +56,7 @@ export function handleLadder(args: { mcpSid: string; prompt: string; dir: string
     .finally(() => { removeChainLock(chainId); removeChainMeta(chainId); });
 
   void chainPromise;
-  return { handle: first.handle, status: 'running' };
+  return { handle: first.handle, status: 'running', workdir: first.workdir };
 }
 
 export async function runLadderChain(

@@ -1,7 +1,7 @@
 import { reapAgeMs } from './env.ts';
 import { getAllRunningJobs, getAllRunningJobsFresh, getAllStoppedJobs, finalizeJob, workersDir, ownsWorktree } from './state.ts';
 import { isProcessAlive, killProcessTree } from './process.ts'
-import { resolveStatus } from './status.ts'
+import { resolveStatus } from './runner.ts'
 import { removeWorktree } from './worktree.ts';
 import { SERVER_STARTED } from './lifecycle.ts';
 import { readFileSync, readdirSync, unlinkSync, statSync } from 'fs';

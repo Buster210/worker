@@ -13,7 +13,7 @@ process.env.WORKER_STATE_DIR = STATE_DIR;
 process.env.WORKER_RC = '';
 process.env.WORKER_LOGIN_SHELL = '0';
 
-import { resolveStatus } from '../src/status.ts';
+import { resolveStatus } from '../src/runner.ts';
 import { emitsJsonLog } from '../src/backends.ts';
 import { backendShellArgv } from '../src/runner.ts';
 import { readSentinel } from '../src/logParse.ts';

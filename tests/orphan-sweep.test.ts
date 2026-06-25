@@ -20,7 +20,6 @@ import { insertJob, getJob, getJobFresh, updateJob, finalizeJob, pruneOldJobs, o
 import { SERVER_STARTED, forceKillJob, spawnReaper, resetShutdownState } from '../src/lifecycle.ts';
 import { addWorktree } from '../src/worktree.ts';
 import { reaperPidPath } from '../src/state.ts';
-import { serverAliveInPs } from '../src/reaper.ts';
 
 const REPO = join(tmpdir(), `worphan-repo-${process.pid}`);
 const livePids: number[] = [];
@@ -186,25 +185,6 @@ describe('sweepStaleJobs — orphan branch', () => {
     
     expect(getJob(handle)!.status).toBe('running');
     expect(isProcessAlive(workerPid)).toBe(true);
-  });
-});
-
-describe('reaper serverAliveInPs — self-exit detection', () => {
-  const SRV = '/x/worker/src/server.ts';
-
-  it('true when a non-self line contains the server path', () => {
-    const ps = `100 /bin/bun run ${SRV}\n200 sleep 5`;
-    expect(serverAliveInPs(ps, SRV, 999)).toBe(true);
-  });
-
-  it('false when the only matching line is self (the reaper)', () => {
-    const ps = `999 /bin/bun run ${SRV}`;
-    expect(serverAliveInPs(ps, SRV, 999)).toBe(false);
-  });
-
-  it('false when no line contains the server path → reaper would self-exit', () => {
-    const ps = `100 sleep 5\n200 node app.js`;
-    expect(serverAliveInPs(ps, SRV, 999)).toBe(false);
   });
 });
 

@@ -73,10 +73,10 @@ describe('buildRunArgv', () => {
     expect(argv).toEqual(['cmd', '-p', 'spec', '--yolo', '-t', '--skip-onboarding', '--max-turns', '10000', '--add-dir', '/repo']);
   });
 
-  it('builds opencode argv with optional model', () => {
+  it('builds opencode argv without model (backends use their own defaults)', () => {
     const argv = buildRunArgv('opencode', 'spec', '/repo', 'sid123', 'gpt-4');
-    expect(argv).toContain('-m');
-    expect(argv).toContain('gpt-4');
+    expect(argv).not.toContain('-m');
+    expect(argv).not.toContain('gpt-4');
   });
 
   it('builds pool argv', () => {
@@ -92,10 +92,10 @@ describe('buildRunArgv', () => {
     ]);
   });
 
-  it('builds codex argv with model', () => {
+  it('builds codex argv without model (backends use their own defaults)', () => {
     const argv = buildRunArgv('codex', 'spec', '/repo', 'sid123', 'o4-mini');
-    expect(argv).toContain('-m');
-    expect(argv).toContain('o4-mini');
+    expect(argv).not.toContain('-m');
+    expect(argv).not.toContain('o4-mini');
     expect(argv[argv.length - 1]).toBe('spec');
   });
 

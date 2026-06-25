@@ -10,9 +10,8 @@ mkdirSync(STATE_DIR_RAW, { recursive: true });
 const STATE_DIR = realpathSync(STATE_DIR_RAW);
 process.env.WORKER_STATE_DIR = STATE_DIR;
 
-import { maybeVerifyAndCommit } from '../src/commit.ts';
+import { maybeVerifyAndCommit, resolveStatus } from '../src/runner.ts';
 import { insertJob, updateJob, finalizeJob, getJobFresh } from '../src/state.ts';
-import { resolveStatus } from '../src/status.ts';
 import { renderReport } from '../src/report.ts';
 
 

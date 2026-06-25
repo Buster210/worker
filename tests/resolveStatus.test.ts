@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from 'bun:test';
 import { writeFileSync, unlinkSync, statSync } from 'fs';
 import { tmpdir } from 'os';
-import { resolveStatus } from '../src/status.ts';
+import { resolveStatus } from '../src/runner.ts';
 import { tailCapped, extractAssistantTexts, readSentinel } from '../src/logParse.ts';
 
 describe('resolveStatus', () => {

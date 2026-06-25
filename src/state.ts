@@ -322,7 +322,9 @@ export function appendLadder(sid: string, turn: number, worker: string, result: 
 }
 
 function ensureLadderDir(): void {
-  try { mkdirSync(join(workersDir(), 'ladder'), { recursive: true }); } catch {}
+  try { mkdirSync(join(workersDir(), 'ladder'), { recursive: true }); } catch (err) {
+    console.error('[worker] failed to create ladder dir:', err instanceof Error ? err.message : err);
+  }
 }
 
 export function getLadderHistory(sid: string): { turn: number; worker: string; result: string }[] {

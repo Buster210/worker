@@ -12,7 +12,7 @@ import { buildSpec, buildRunArgv, buildResumeArgv, getResumeToken, type Backend 
 import { runWorker, type RunResult } from './runner.ts';
 import { loginShellEnvAsync } from './env.ts';
 import { isProcessAlive } from './process.ts';
-import { buildContinuationPreamble, type SeedContext } from './seed.ts';
+import { buildContinuationPreamble, type SeedContext } from './backends.ts';
 
 // --- Server lifecycle state ---
 // Use the OS-reported process start (ps etime), not module-import time. server_started is the
@@ -33,7 +33,11 @@ function readReaperPid(pidPath: string): number | null {
   try {
     const parsed = Number(readFileSync(pidPath, 'utf8').trim());
     return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
-  } catch {
+  } catch (err) {
+    // ENOENT is normal: no reaper has been spawned yet on a fresh start.
+    if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+      console.error('[worker] failed to read reaper pid:', err instanceof Error ? err.message : err);
+    }
     return null;
   }
 }
@@ -60,7 +64,9 @@ export function spawnReaper(): void {
     if (child.pid) {
       try { writeFileSync(pidPath, `${child.pid}\n`); } catch {}
     }
-  } catch {}
+  } catch (err) {
+    console.error('[worker] failed to spawn reaper:', err instanceof Error ? err.message : err);
+  }
 }
 // --- Repo guard ---
 const _repoChecked = new Set<string>();
@@ -92,7 +98,7 @@ function newHandle(backend: Backend): string {
   return backend === 'claude' ? id : `w-${id.slice(0, 8)}`;
 }
 
-type LaunchResult = { handle: string; promise: Promise<RunResult> };
+type LaunchResult = { handle: string; promise: Promise<RunResult>; workdir: string };
 
 // Finalize a job as failed when its run promise rejects, then rethrow.
 function failOnError(handle: string, p: Promise<RunResult>): Promise<RunResult> {
@@ -110,46 +116,34 @@ export function launch(
 ): LaunchResult {
   const handle = newHandle(backend);
   trackLaunched(handle);
+  const reuse = opts.reuseWorktree;
+  const lp = workerLogPath(handle, dir);
+  let spec = buildSpec(prompt);
+
+  if (opts.seed) {
+    spec = buildContinuationPreamble(opts.seed) + spec;
+  }
+
+  const treePath = join(handleDirUncached(handle, dir), 'tree');
+  const claudeModel = opts.complex ? 'sonnet' : 'haiku';
+  const modelToUse = backend === 'claude' ? (opts.model ?? claudeModel) : undefined;
+  insertJob({ handle, backend, sid: opts.mcpSid, repo: dir, worktree_path: reuse ?? treePath, base_sha: opts.reuseBaseSha, model: modelToUse, task: prompt, log_path: lp, completion_lock: opts.completionLock, server_pid: process.pid, server_started: SERVER_STARTED, server_sid: SERVER_SID, deadline_at: opts.deadlineAt });
+
+  // The job is now 'running' on disk; spawn the orphan reaper (idempotent) so a SIGKILL of
+  // this server still cleans up the worker. It self-exits once no running jobs remain, so an
+  // idle server with zero workers runs no reaper.
+  spawnReaper();
+
+  const inPlace = reuse ? false : isInPlaceOwner(handle, dir);
+  const wt = reuse ?? (inPlace ? dir : treePath);
+  if (inPlace) updateJob(handle, { worktree_path: dir });
+
   const promise: Promise<RunResult> = failOnError(handle, (async () => {
-    // Ladder reuse: a climbing/retrying rung runs IN the prior rung's workspace (its uncommitted +
-    // committed work is already there — no seed copy), sharing its base_sha so the report diff
-    // stays anchored to the chain's original HEAD.
-    const reuse = opts.reuseWorktree;
-    const lp = workerLogPath(handle, dir);
-    let spec = buildSpec(prompt);
-
-    // Prepend continuation preamble if seed is present
-    if (opts.seed) {
-      spec = buildContinuationPreamble(opts.seed) + spec;
-    }
-
-    // ponytail: write-first + earliest-alive election. Provably <=1 worker in the
-    // project dir (insert precedes read in program order -> two racers can't both
-    // see only themselves). Project dir may idle if the in-place worker exits while
-    // younger worktree workers persist -- safe, not optimal; re-elect oldest-alive
-    // to dir on drain if reuse matters.
-    const treePath = join(handleDirUncached(handle, dir), 'tree');
-    // claude picks model by task hardness: complex → sonnet, else haiku. omp self-selects.
-    const claudeModel = opts.complex ? 'sonnet' : 'haiku';
-    const modelToUse = backend === 'claude' ? (opts.model ?? claudeModel) : backend === 'omp' ? undefined : opts.model;
-    insertJob({ handle, backend, sid: opts.mcpSid, repo: dir, worktree_path: reuse ?? treePath, base_sha: opts.reuseBaseSha, model: modelToUse, task: prompt, log_path: lp, completion_lock: opts.completionLock, server_pid: process.pid, server_started: SERVER_STARTED, server_sid: SERVER_SID, deadline_at: opts.deadlineAt });
-
-    let inPlace = false;
-    let wt: string;
-    if (reuse) { wt = reuse; }
-    else {
-      inPlace = isInPlaceOwner(handle, dir);
-      wt = inPlace ? dir : treePath;
-      if (inPlace) updateJob(handle, { worktree_path: dir });
-    }
-
     try {
       if (reuse) {
-        // Ladder reuse: reusing prior rung's workspace (could be project dir or a worktree).
         clearStaleIndexLock(reuse);
         await loginShellEnvAsync();
       } else if (inPlace) {
-        // In-place: run directly in the project directory, no worktree.
         const [, base_sha, branch] = await Promise.all([
           loginShellEnvAsync(),
           new Promise<string | undefined>(resolve => {
@@ -170,7 +164,6 @@ export function launch(
         if (base_sha) updateJob(handle, { base_sha });
         updateJob(handle, { branch });
       } else {
-        // Concurrent worker — isolated worktree from HEAD.
         const [createdWt, , base_sha] = await Promise.all([
           addWorktreeAsync(dir, handle),
           loginShellEnvAsync(),
@@ -201,7 +194,7 @@ export function launch(
     return result;
   })()).finally(() => untrackLaunched(handle));
 
-  return { handle, promise };
+  return { handle, promise, workdir: wt };
 }
 
 export async function shutdown(): Promise<void> {
@@ -211,7 +204,9 @@ export async function shutdown(): Promise<void> {
   // Reaper kill is independent of worker teardown — fire it first (instant), don't gate
   // it behind the kills.
   if (_reaperOwned && _reaperPid) {
-    try { process.kill(_reaperPid, 'SIGTERM'); } catch {}
+    try { process.kill(_reaperPid, 'SIGTERM'); } catch (err) {
+      console.error('[worker] failed to kill reaper:', err instanceof Error ? err.message : err);
+    }
   }
 
   const jobs: NonNullable<ReturnType<typeof getJob>>[] = [];
@@ -234,7 +229,7 @@ export async function shutdown(): Promise<void> {
 let _shuttingDown = false;
 export function resetShutdownState(): void { _shuttingDown = false; launchedHandles.clear(); _reaperPid = undefined; _reaperOwned = false; }
 
-export function resumeLaunch(args: { handle: string; prompt: string; dir: string; timeout?: number; extraArgs?: string[] }): { handle: string; promise: Promise<RunResult> } {
+export function resumeLaunch(args: { handle: string; prompt: string; dir: string; timeout?: number; extraArgs?: string[] }): { handle: string; promise: Promise<RunResult>; workdir: string } {
   const { handle, prompt, dir, timeout, extraArgs } = args;
   const job = getJob(handle);
   if (!job) throw new Error(`No job found for handle: ${handle}`);
@@ -251,5 +246,5 @@ export function resumeLaunch(args: { handle: string; prompt: string; dir: string
   const argv = buildResumeArgv(be, spec, wtDir, job.resume_token, job.model, extraArgs);
   const p = runWorker(argv, wtDir, handle, be, lp,
     job.resume_token, timeout ? timeout * 1000 : undefined);
-  return { handle, promise: failOnError(handle, p) };
+  return { handle, promise: failOnError(handle, p), workdir: wtDir };
 }
