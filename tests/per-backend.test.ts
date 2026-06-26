@@ -18,6 +18,7 @@ import { emitsJsonLog } from '../src/backends.ts';
 import { backendShellArgv } from '../src/runner.ts';
 import { readSentinel } from '../src/logParse.ts';
 import { isProcessAlive, killProcessTree } from '../src/process.ts';
+import { workerEnv } from '../src/env.ts';
 
 const REPO = mkdtempSync(join(tmpdir(), 'wperbe-repo-'));
 const tmpFiles: string[] = [];
@@ -50,7 +51,7 @@ function fakeScript(body: string): { path: string; argv: string[] } {
 async function runToLog(argv: string[], logPath: string, timeoutMs: number): Promise<{ rc: number; timedOut: boolean; content: string; killedByUs: boolean }> {
   const fd = require('fs').openSync(logPath, 'a');
   const wrapped = backendShellArgv(argv);
-  const proc = spawn(wrapped[0], wrapped.slice(1), { detached: true, stdio: ['ignore', fd, fd] });
+  const proc = spawn(wrapped[0], wrapped.slice(1), { cwd: REPO, env: workerEnv(), detached: true, stdio: ['ignore', fd, fd] });
   proc.unref();
   frozenPids.push(proc.pid!);
   const start = Date.now();
