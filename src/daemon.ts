@@ -20,7 +20,6 @@ import { getAllRunningJobsFresh, finalizeJob, type Job } from './state.ts';
 import type { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { killProcessTrees } from './process.ts';
-import { selfTermCheckMs } from './env.ts';
 
 // --- Lockfile ---
 
@@ -233,7 +232,6 @@ const SELF_TERM_EMPTY_THRESHOLD = 2; // two consecutive empty ticks (~60s) befor
 let _clientPidCache: Set<string> | null = null;
 let _emptyTickCount = 0;
 let _everSeenClient = false;
-let _selfTermTimer: ReturnType<typeof setInterval> | null = null;
 
 /** Read numeric PID filenames from .active/worker/, excluding server.pid. */
 function readClientPids(): Set<string> {
@@ -262,7 +260,7 @@ function selfTerminate(): void {
   hardShutdown(); // removeLock + removeServerPid + exit
 }
 
-function checkClientLiveness(): void {
+export function checkClientLiveness(): void {
   // Safety gate: arm only after observing ≥1 live client at least once.
   if (!_everSeenClient) {
     _clientPidCache = readClientPids();
@@ -303,18 +301,6 @@ function checkClientLiveness(): void {
   }
 }
 
-/** Start the periodic client-liveness check. Safe to call once; idempotent. */
-export function startClientLivenessCheck(): void {
-  if (_selfTermTimer) return; // already running
-  const ms = selfTermCheckMs();
-  _selfTermTimer = setInterval(() => { try { checkClientLiveness(); } catch {} }, ms);
-  _selfTermTimer.unref?.();
-}
-
-/** Stop the liveness check timer (test cleanup / controlled shutdown). */
-export function stopClientLivenessCheck(): void {
-  if (_selfTermTimer) { clearInterval(_selfTermTimer); _selfTermTimer = null; }
-}
 /** Test-only: expose the liveness tick for direct invocation. */
 export function __checkClientLivenessForTest(): void { checkClientLiveness(); }
 
@@ -323,5 +309,4 @@ export function __resetLivenessStateForTest(): void {
   _clientPidCache = null;
   _emptyTickCount = 0;
   _everSeenClient = false;
-  stopClientLivenessCheck();
 }

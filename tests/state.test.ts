@@ -10,7 +10,8 @@ const PLANS_DIR = join(tmpdir(), `wstate-plans-${process.pid}`);
 process.env.WORKER_PLANS_DIR = PLANS_DIR;
 mkdirSync(PLANS_DIR, { recursive: true });
 
-import { finalizeJob, insertJob, getJob, getJobFresh, updateJob, workersDir, handleDirUncached, lockPath, resolveHandleDir, pruneOldJobs, readSpec, plansDir, saveChainMeta, removeChainMeta, chainMetaPath, pruneTranscript } from '../src/state.ts';
+import { finalizeJob, insertJob, getJob, getJobFresh, updateJob, workersDir, handleDirUncached, lockPath, resolveHandleDir, readSpec, plansDir, saveChainMeta, removeChainMeta, chainMetaPath, pruneTranscript } from '../src/state.ts';
+import { sweepStaleWorkerDirs } from '../src/maintenance.ts';
 
 afterAll(() => {
   try { rmSync(STATE_DIR, { recursive: true, force: true }); } catch {}
@@ -124,8 +125,16 @@ describe('getJobFresh bypasses in-memory cache', () => {
   });
 });
 
-describe('pruneOldJobs', () => {
+describe('sweepStaleWorkerDirs (retention)', () => {
+  const origRetainMs = process.env.WORKER_RETAIN_MS;
+  
+  afterEach(() => {
+    if (origRetainMs === undefined) delete process.env.WORKER_RETAIN_MS;
+    else process.env.WORKER_RETAIN_MS = origRetainMs;
+  });
+
   it('removes terminal jobs past retention, keeps fresh + running', () => {
+    process.env.WORKER_RETAIN_MS = '0'; // force immediate pruning for test
     const mk = (handle: string, status: string, finishedAgoMs?: number) => {
       insertJob({ handle, backend: 'cmd', sid: 's', repo: '/tmp/prune-repo', log_path: '/tmp/x' });
       if (status !== 'running') {
@@ -136,7 +145,7 @@ describe('pruneOldJobs', () => {
     mk('fresh-term', 'done', 1000);          
     mk('run', 'running');                    
     const oldDir = handleDirUncached('old-term', '/tmp/prune-repo');
-    expect(pruneOldJobs(Date.now())).toBe(1);
+    sweepStaleWorkerDirs();
     expect(getJob('old-term')).toBeNull();
     expect(existsSync(oldDir)).toBe(false);
     expect(getJob('fresh-term')).not.toBeNull();
@@ -144,22 +153,22 @@ describe('pruneOldJobs', () => {
   });
 
   it('keeps terminal jobs without finished field (no finished = not stale)', () => {
-    
+    process.env.WORKER_RETAIN_MS = '0';
     const handle = `prune-nofinish-${process.pid}-${Date.now()}`;
     insertJob({ handle, backend: 'cmd', sid: 's', repo: '/tmp/prune-nofinish', log_path: '/tmp/x' });
     updateJob(handle, { status: 'done' }); 
-    expect(pruneOldJobs()).toBe(0); 
+    sweepStaleWorkerDirs();
     expect(getJob(handle)).not.toBeNull();
     
     rmSync(handleDirUncached(handle, '/tmp/prune-nofinish'), { recursive: true, force: true });
   });
 
   it('keeps terminal jobs with invalid finished timestamp', () => {
-    
+    process.env.WORKER_RETAIN_MS = '0';
     const handle = `prune-invalid-finished-${process.pid}-${Date.now()}`;
     insertJob({ handle, backend: 'cmd', sid: 's', repo: '/tmp/prune-invalid', log_path: '/tmp/x' });
     updateJob(handle, { status: 'done', finished: 'not-a-timestamp' });
-    expect(pruneOldJobs()).toBe(0);
+    sweepStaleWorkerDirs();
     expect(getJob(handle)).not.toBeNull();
     
     rmSync(handleDirUncached(handle, '/tmp/prune-invalid'), { recursive: true, force: true });

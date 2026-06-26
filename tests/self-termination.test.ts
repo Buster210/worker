@@ -12,7 +12,6 @@ process.env.HOME = TEST_HOME;
 const ACTIVE_DIR = join(TEST_HOME, '.claude', '.active', 'worker');
 
 import {
-  startClientLivenessCheck, stopClientLivenessCheck,
   __resetLivenessStateForTest, writeServerPid, removeServerPid,
   __checkClientLivenessForTest,
 } from '../src/daemon.ts';
@@ -34,7 +33,7 @@ function spawnSleep(): number {
 function deadPid(): number { return 42_000_000 + seq++; }
 
 function seedRunning(fields: {
-  worker_pid: number; status?: string; server_pid?: number; backend?: string;
+  worker_pid: number; status?: string; server_pid?: number; backend?: string; finished?: string;
 }): string {
   const handle = `sterm-${process.pid}-${seq++}`;
   const dir = join(workersDir(), 'test-repo', handle);
@@ -45,7 +44,9 @@ function seedRunning(fields: {
     server_pid: fields.server_pid ?? 0,
     server_started: fields.server_pid ? new Date().toISOString() : '',
     server_sid: 'test-sid', status: fields.status ?? 'running',
-    started: new Date().toISOString(), resume_token: '', model: '', task: '',
+    started: new Date().toISOString(),
+    finished: fields.finished,
+    resume_token: '', model: '', task: '',
     completion_lock: join(dir, '.lock'),
   };
   writeFileSync(join(dir, 'job.json'), JSON.stringify(job));
@@ -71,7 +72,6 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  stopClientLivenessCheck();
   __resetLivenessStateForTest();
   for (const pid of livePids) { try { process.kill(pid, 'SIGKILL'); } catch {} }
   livePids.length = 0;
@@ -238,8 +238,8 @@ describe('self-termination after two consecutive empty ticks', () => {
 
 describe('sweepStaleWorkerDirs', () => {
   it('cleans terminal job dirs but preserves killed:no-client dirs', () => {
-    const doneHandle = seedRunning({ worker_pid: deadPid(), status: 'done' });
-    const killedHandle = seedRunning({ worker_pid: deadPid(), status: 'killed:no-client' });
+    const doneHandle = seedRunning({ worker_pid: deadPid(), status: 'done', finished: new Date(Date.now() - 8 * 86_400_000).toISOString() });
+    const killedHandle = seedRunning({ worker_pid: deadPid(), status: 'killed:no-client', finished: new Date(Date.now() - 8 * 86_400_000).toISOString() });
     const runningHandle = seedRunning({ worker_pid: spawnSleep(), status: 'running' });
 
     sweepStaleWorkerDirs();
@@ -254,6 +254,7 @@ describe('sweepStaleWorkerDirs', () => {
     const handle = seedRunning({
       worker_pid: deadPid(), status: 'done',
       server_pid: otherServerPid,
+      finished: new Date(Date.now() - 8 * 86_400_000).toISOString(),
     });
 
     sweepStaleWorkerDirs();
@@ -265,6 +266,7 @@ describe('sweepStaleWorkerDirs', () => {
     const handle = seedRunning({
       worker_pid: deadPid(), status: 'done',
       server_pid: deadPid(),
+      finished: new Date(Date.now() - 8 * 86_400_000).toISOString(),
     });
 
     sweepStaleWorkerDirs();

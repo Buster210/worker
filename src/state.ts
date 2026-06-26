@@ -300,10 +300,10 @@ export function isInPlaceOwner(handle: string, repo: string): boolean {
   });
 }
 
-function retainMs(): number {
+export function retainMs(): number {
   const v = Number(process.env.WORKER_RETAIN_MS);
   if (Number.isFinite(v) && v > 0) return v;
-  return FILE_CONFIG.retainMs ?? 604_800_000;
+  return FILE_CONFIG.retainMs ?? 86_400_000;
 }
 const TERMINAL_RE = /^(done|failed|timeout|killed|stalled)/;
 
@@ -314,24 +314,12 @@ const TERMINAL_RE = /^(done|failed|timeout|killed|stalled)/;
 export function ownsWorktree(job: { handle: string; repo: string; worktree_path?: string }): boolean {
   return !!job.worktree_path && job.worktree_path === join(handleDir(job.handle, job.repo), 'tree');
 }
-
-export function pruneOldJobs(now: number = Date.now()): number {
-  ensureBootstrapped();
-  const cutoff = now - retainMs();
-  let pruned = 0;
-  for (const job of _jobs.values()) {
-    if (!TERMINAL_RE.test(job.status)) continue;
-    const finishedAt = Date.parse(job.finished ?? '');
-    if (!Number.isFinite(finishedAt) || finishedAt > cutoff) continue;
-    if (ownsWorktree(job)) { try { removeWorktree(job.repo, job.worktree_path!); } catch {} }
-    try { rmSync(handleDir(job.handle, job.repo), { recursive: true, force: true }); } catch {}
-    _jobs.delete(job.handle);
-    _handleDirCache.delete(job.handle);
-    pruned++;
-  }
-  if (pruned > 0) console.error(`worker: pruned ${pruned} terminal job(s) past retention`);
-  return pruned;
+/** Remove a job from in-memory caches. Used by sweep after deleting from disk. */
+export function removeJobFromCache(handle: string): void {
+  _jobs.delete(handle);
+  _handleDirCache.delete(handle);
 }
+
 
 /** Test-only: reset module-level singletons so state is hermetic across test files. */
 export function __resetStateForTest(): void {

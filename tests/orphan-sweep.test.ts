@@ -14,9 +14,9 @@ process.env.WORKER_STATE_DIR = STATE_DIR;
 const THIS_SID = process.env.CLAUDE_CODE_SESSION_ID ?? `test-sid-${process.pid}`;
 process.env.CLAUDE_CODE_SESSION_ID = THIS_SID;
 
-import { sweepStaleJobs, sweepChainLocks } from '../src/maintenance.ts';
+import { sweepStaleJobs, sweepChainLocks, sweepStaleWorkerDirs } from '../src/maintenance.ts';
 import { isProcessAlive } from '../src/process.ts';
-import { insertJob, getJob, getJobFresh, updateJob, finalizeJob, pruneOldJobs, ownsWorktree, logPath as stateLogPath, chainLockPath, workersDir, handleDirUncached, __resetStateForTest, getAllRunningJobs, getAllRunningJobsFresh } from '../src/state.ts';
+import { insertJob, getJob, getJobFresh, updateJob, finalizeJob, ownsWorktree, logPath as stateLogPath, chainLockPath, workersDir, handleDirUncached, __resetStateForTest, getAllRunningJobs, getAllRunningJobsFresh } from '../src/state.ts';
 import { SERVER_STARTED, forceKillJob, spawnReaper, resetShutdownState } from '../src/lifecycle.ts';
 import { addWorktree } from '../src/worktree.ts';
 import { reaperPidPath } from '../src/state.ts';
@@ -280,8 +280,16 @@ describe('spawnReaper single-instance guard', () => {
   });
 });
 
-describe('worktree reap — pruneOldJobs and normal finalize', () => {
-  it('pruneOldJobs removes the worktree via removeWorktree before rmSync', () => {
+describe('worktree reap — sweepStaleWorkerDirs and normal finalize', () => {
+  const origRetainMs = process.env.WORKER_RETAIN_MS;
+  
+  afterEach(() => {
+    if (origRetainMs === undefined) delete process.env.WORKER_RETAIN_MS;
+    else process.env.WORKER_RETAIN_MS = origRetainMs;
+  });
+
+  it('sweepStaleWorkerDirs removes the worktree via removeWorktree before rmSync', () => {
+    process.env.WORKER_RETAIN_MS = '0'; // force immediate pruning for test
     const repo = join(tmpdir(), `wreap-repo-${process.pid}-${seq++}`);
     initGitRepo(repo);
 
@@ -299,7 +307,7 @@ describe('worktree reap — pruneOldJobs and normal finalize', () => {
     
     expect(existsSync(wt)).toBe(true);
 
-    pruneOldJobs(Date.now());
+    sweepStaleWorkerDirs();
 
     
     expect(existsSync(wt)).toBe(false);
@@ -349,7 +357,8 @@ describe('worktree reap — pruneOldJobs and normal finalize', () => {
     try { rmSync(repo, { recursive: true, force: true }); } catch {}
   });
 
-  it('pruneOldJobs on a reuse-sibling does NOT remove the shared worktree (owner gate)', () => {
+  it('sweepStaleWorkerDirs on a reuse-sibling does NOT remove the shared worktree (owner gate)', () => {
+    process.env.WORKER_RETAIN_MS = '0'; // force immediate pruning for test
     const repo = join(tmpdir(), `wreap-share-${process.pid}-${seq++}`);
     initGitRepo(repo);
     const owner = `wreap-shareowner-${process.pid}-${seq++}`;
@@ -365,7 +374,7 @@ describe('worktree reap — pruneOldJobs and normal finalize', () => {
     updateJob(sibling, { status: 'failed', finished: new Date(Date.now() - 8 * 86_400_000).toISOString() });
 
     expect(existsSync(wt)).toBe(true);
-    pruneOldJobs(Date.now());
+    sweepStaleWorkerDirs();
 
     expect(getJob(sibling)).toBeNull();          
     expect(getJob(owner)).not.toBeNull();        

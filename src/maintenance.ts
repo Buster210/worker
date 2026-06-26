@@ -1,6 +1,6 @@
 import { reapAgeMs } from './env.ts';
 import { FILE_CONFIG } from './config.ts';
-import { getAllRunningJobs, getAllRunningJobsFresh, getAllStoppedJobs, finalizeJob, workersDir, ownsWorktree, plansWorkerDir, isBareSpecName } from './state.ts';
+import { getAllRunningJobs, getAllRunningJobsFresh, getAllStoppedJobs, finalizeJob, workersDir, ownsWorktree, plansWorkerDir, isBareSpecName, retainMs, removeJobFromCache } from './state.ts';
 import { isProcessAlive, killProcessTree } from './process.ts'
 import { resolveStatus } from './runner.ts'
 import { removeWorktree } from './worktree.ts';
@@ -145,30 +145,32 @@ export function sweepStaleWorkerDirs(): void {
       const status = (jobJson?.status as string) ?? '';
 
       if (status && TERMINAL_SWEEP_RE.test(status)) {
-        // Preserve killed:* dirs (req 7a: user-inspectable mid-flight kills)
+        // User-inspectable mid-flight kills — preserve for debugging.
         if (status.startsWith('killed:')) continue;
-        // Preserve config skip-list entries (req 7b)
         const backend = (jobJson?.backend as string) ?? '';
         if (skipSet.has(handle) || skipSet.has(backend)) continue;
-        // Multi-server safety: never delete a dir owned by another live server
+        // Never delete a dir owned by another live server.
         const ownerPid = (jobJson?.server_pid as number) ?? 0;
         const ownerStarted = (jobJson?.server_started as string) ?? '';
         if (ownerPid > 0 && ownerPid !== SELF_PID && isProcessAlive(ownerPid, ownerStarted)) continue;
-        // Remove archived spec for this completed-properly dir
+        const finishedAt = Date.parse((jobJson?.finished as string) ?? '');
+        if (!Number.isFinite(finishedAt)) continue;
+        if (Date.now() - finishedAt < retainMs()) continue;
         const specFile = (jobJson?.spec_file as string) ?? '';
         if (specFile && isBareSpecName(specFile)) {
           try { unlinkSync(join(plansWorkerDir(), specFile)); } catch {}
         }
       } else if (!jobJson) {
-        // No job.json: only clean if no .lock file present (a running worker holds one)
+        // No job.json — only clean if unclaimed (no .lock).
         try {
           if (statSync(join(dirPath, '.lock')).isFile()) continue;
-        } catch { /* no lock → proceed to clean */ }
+        } catch {}
       } else {
-        continue; // non-terminal job, leave alone
+        continue;
       }
 
       try { rmSync(dirPath, { recursive: true, force: true }); } catch {}
+      removeJobFromCache(handle);
       cleaned++;
     }
   }

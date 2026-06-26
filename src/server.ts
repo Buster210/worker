@@ -9,7 +9,7 @@ import { existsSync, appendFileSync } from 'fs';
 import http from 'http';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import {
-  getJob, updateJob, finalizeJob, getAllJobs, getAllRunningJobs, pruneOldJobs, readSpec, loadChainMeta, saveChainMeta,
+  getJob, updateJob, finalizeJob, getAllJobs, getAllRunningJobs, readSpec, loadChainMeta, saveChainMeta,
   pruneTranscript, getLadderHistory,
 } from './state.ts';
 import { LADDER, ALL_BACKENDS, type Backend } from './backends.ts';
@@ -23,7 +23,7 @@ import { handleLadder } from './chain.ts';
 import { terminalStatus } from './report.ts';
 import {
   acquireLock, readLock, removeLock, isDaemonAlive, SessionTracker, hardShutdown, reapCrashedWorkers,
-  writeServerPid, removeServerPid, startClientLivenessCheck,
+  writeServerPid, removeServerPid, checkClientLiveness,
 } from './daemon.ts';
 
 // --- MCP tool handlers (keep in server.ts) ---
@@ -303,18 +303,8 @@ function initDaemon(): void {
   sweepStaleJobs();
   reapStoppedJobs();
   sweepChainLocks();
-  pruneOldJobs();
   reapCrashedWorkers();
   sweepStaleWorkerDirs();
-  startClientLivenessCheck();
-  setInterval(() => {
-    reapStoppedJobs(); sweepStaleJobs(); sweepChainLocks(); pruneOldJobs(); reapCrashedWorkers();
-    // Reaper backstop: it is spawned lazily on launch (see lifecycle.launch) and self-exits when
-    // idle, so an idle server runs none. This respawns it (idempotent) if it died in the
-    // launch/self-exit race window while a worker is still running. Gated on job count so a
-    // truly idle server stays reaper-free.
-    if (getAllRunningJobs().length) spawnReaper();
-  }, 60_000).unref();
 }
 
 if (import.meta.main) {
@@ -338,6 +328,21 @@ if (import.meta.main) {
 
   // --- HTTP daemon mode ---
   const tracker = new SessionTracker();
+  const IDLE_TTL_MS = 30 * 60_000;
+  let tick = 0;
+  setInterval(() => {
+    try { checkClientLiveness(); } catch {}
+    if (tick % 2 === 0) {
+      reapStoppedJobs(); sweepStaleJobs(); sweepChainLocks();
+      reapCrashedWorkers(); sweepStaleWorkerDirs();
+      // Respawn reaper if it died while workers are running.
+      if (getAllRunningJobs().length) spawnReaper();
+    }
+    if (tick % 10 === 0) {
+      try { tracker.reapIdle(IDLE_TTL_MS); } catch {}
+    }
+    tick = (tick + 1) % 10;
+  }, 30_000).unref();
 
   // 404 tells the MCP client its session is gone → re-initialize. Returning a
   // generic 400 here instead wedges the client forever (it replays the dead id).
@@ -458,11 +463,6 @@ if (import.meta.main) {
     writeServerPid();
   });
 
-  // Idle-session GC: drop tracker entries unused for a long while. Memory
-  // hygiene only — never touches workers; a returning client just re-initializes
-  // (its stale id 404s). One coarse unref'd timer, no pings → ~zero idle cost.
-  const IDLE_TTL_MS = 30 * 60_000;
-  setInterval(() => tracker.reapIdle(IDLE_TTL_MS), 5 * 60_000).unref();
 
   const gracefulShutdown = (sig: string) => () => {
     console.error(`[worker] received ${sig} (pid ${process.pid}), shutting down`);

@@ -17,7 +17,6 @@ export function nearExpiryMs(): number { return envMs('WORKER_NEAR_EXPIRY_MS', 3
 export function graceMs(): number { return envMs('WORKER_GRACE_MS', 60_000); }
 export function authProbeMs(): number { return envMs('WORKER_AUTH_PROBE_MS', 2_000); }
 export function maxTurns(): number { return envMs('WORKER_MAX_TURNS', 10_000); }
-export function selfTermCheckMs(): number { return envMs('WORKER_SELF_TERM_MS', 30_000); }
 
 // ponytail: clamp spawned backends (and every cargo/rustc/etc they fork) to a
 // macOS QoS band so heavy builds yield under contention instead of pinning all

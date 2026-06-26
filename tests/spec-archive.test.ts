@@ -20,7 +20,7 @@ import { sweepStaleWorkerDirs } from '../src/maintenance.ts';
 const REPO = join(tmpdir(), `spec-arch-repo-${process.pid}`);
 let seq = 0;
 
-function createTestJob(fields: { status?: string; spec_file?: string } = {}): string {
+function createTestJob(fields: { status?: string; spec_file?: string; finished?: string } = {}): string {
   const handle = `sarch-${process.pid}-${seq++}`;
   const dir = join(workersDir(), 'test-repo', handle);
   mkdirSync(dir, { recursive: true });
@@ -36,6 +36,7 @@ function createTestJob(fields: { status?: string; spec_file?: string } = {}): st
     task: 'test task',
     status: fields.status ?? 'running',
     started: new Date().toISOString(),
+    finished: fields.finished,
     server_pid: 0,
     server_started: new Date().toISOString(),
     server_sid: 'test-sid',
@@ -151,8 +152,7 @@ describe('spec-archive', () => {
   it('sweepStaleWorkerDirs removes archived spec for done dir', () => {
     const specName = 'sweep-spec.txt';
     createTestSpec(specName);
-
-    const handle = createTestJob({ status: 'done', spec_file: specName });
+    const handle = createTestJob({ status: 'done', spec_file: specName, finished: new Date(Date.now() - 8 * 86_400_000).toISOString() });
     const dir = join(workersDir(), 'test-repo', handle);
 
     // First archive the spec (simulating archiveSpec call from runner.ts)
@@ -218,7 +218,7 @@ describe('spec-archive', () => {
     const sentinel = join(PLANS_DIR, 'escape.txt');
     writeFileSync(sentinel, 'must survive');
 
-    const handle = createTestJob({ status: 'done', spec_file: '../escape.txt' });
+    const handle = createTestJob({ status: 'done', spec_file: '../escape.txt', finished: new Date(Date.now() - 8 * 86_400_000).toISOString() });
     const dir = join(workersDir(), 'test-repo', handle);
 
     // archiveSpec must refuse the traversal name → sentinel untouched
