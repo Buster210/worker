@@ -14,8 +14,11 @@ export type LadderDrivers = {
   runRung: (backend: Backend, seed?: SeedContext) => Promise<RunResult>;
 };
 
-export function handleLadder(args: { mcpSid: string; prompt: string; dir: string; timeout?: number; complex?: boolean }): LadderResult {
+// deps.launch is a test seam — production callers omit it and get the real launch. Lets a test
+// drive handleLadder with a stub launcher (no real backend spawn, no global module mock).
+export function handleLadder(args: { mcpSid: string; prompt: string; dir: string; timeout?: number; complex?: boolean }, deps: { launch?: typeof launch } = {}): LadderResult {
   const { mcpSid, prompt, dir, complex } = args;
+  const launchFn = deps.launch ?? launch;
   const chainId = randomUUID();
   const chainDeadlineAt = Date.now() + (args.timeout ? args.timeout * 1000 : defaultTimeoutMs());
 
@@ -23,12 +26,16 @@ export function handleLadder(args: { mcpSid: string; prompt: string; dir: string
 
   createChainLock(chainId, process.pid, SERVER_STARTED);
   saveChainMeta(chainId, { deadlineAt: chainDeadlineAt });
-  const first = launch(LADDER[0], prompt, dir, { mcpSid, complex, deadlineAt: chainDeadlineAt, completionLock: chainLockPath(chainId) });
+  const chainHandle = randomUUID(); // full UUID — safe for all backends including claude --session-id
+  const first = launchFn(LADDER[0], prompt, dir, { mcpSid, complex, deadlineAt: chainDeadlineAt, completionLock: chainLockPath(chainId), handle: chainHandle });
   const drivers: LadderDrivers = {
-    // Every rung after the first reuses the first rung's worktree + base_sha: the prior rung's work
-    // already lives in that tree, so the report (anchored to the first handle) surfaces whatever the
-    // winning rung leaves — no seed copy, no reparent. The chain completion_lock rides on each rung
-    // so worker_extend can detect it; the deadline is re-read fresh so those bumps reach later rungs.
+    // Every rung after the first reuses the shared chain handle (one job.json) and the first rung's
+    // worktree + base_sha: the prior rung's work already lives in that tree, so the report
+    // (anchored to the chain handle) surfaces whatever the winning rung leaves — no seed copy, no
+    // reparent. insertJob overwrites the shared job.json on each rung start (failed→running),
+    // so getJobFresh(handle) always reflects the active or terminal rung. The chain completion_lock
+    // rides on each rung so worker_extend can detect it; the deadline is re-read fresh so those
+    // bumps reach later rungs.
     runRung: (backend, seed) => {
       const firstJob = getJob(first.handle);
       if (!firstJob || !firstJob.worktree_path) {
@@ -36,9 +43,10 @@ export function handleLadder(args: { mcpSid: string; prompt: string; dir: string
       } else if (!firstJob.base_sha) {
         console.error(`[ladder] reuse base_sha missing for chain ${chainId}; report diff for rung ${backend} anchored to current HEAD, may omit committed work`);
       }
-      return launch(backend, prompt, dir, {
+      return launchFn(backend, prompt, dir, {
         mcpSid,
         complex,
+        handle: chainHandle,
         deadlineAt: effectiveChainDeadline(chainId, chainDeadlineAt),
         completionLock: chainLockPath(chainId),
         reuseWorktree: firstJob?.worktree_path,
@@ -50,13 +58,13 @@ export function handleLadder(args: { mcpSid: string; prompt: string; dir: string
 
   const chainPromise = runLadderChain(chainId, first.promise, drivers, chainDeadlineAt)
     .catch((): RunResult => ({
-      status: 'failed', exit_code: 1, backend: LADDER[0], handle: first.handle,
-      resume_token: first.handle, repo: dir, log: '',
+      status: 'failed', exit_code: 1, backend: LADDER[0], handle: chainHandle,
+      resume_token: chainHandle, repo: dir, log: '',
     }))
     .finally(() => { removeChainLock(chainId); removeChainMeta(chainId); });
 
   void chainPromise;
-  return { handle: first.handle, status: 'running', workdir: first.workdir };
+  return { handle: chainHandle, status: 'running', workdir: first.workdir };
 }
 
 export async function runLadderChain(

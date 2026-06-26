@@ -9,12 +9,10 @@ import { FILE_CONFIG } from './config.ts';
 
 export function terminalStatus(handle: string, lockPath: string): string {
   if (lockPath.endsWith('.chain.lock')) {
-    const sid = basename(lockPath).replace(/\.chain\.lock$/, '');
-    const rows = getLadderHistory(sid);
-    const last = rows.length ? rows[rows.length - 1].result : 'failed';
-    if (last === 'done') return 'done';
-    if (last === 'killed') return 'killed';
-    if (last === 'timeout') return 'timeout'; // terminal in the chain — surface it, don't collapse to exhausted
+    // With the shared chain handle, getJobFresh reflects the active/terminal rung's live status.
+    // Terminal winning rung (done/killed/timeout) → trust the live job; all-rungs-failed → exhausted.
+    const status = getJobFresh(handle)?.status;
+    if (status === 'done' || status === 'killed' || status === 'timeout') return status;
     return 'exhausted';
   }
   return getJobFresh(handle)?.status ?? 'failed';

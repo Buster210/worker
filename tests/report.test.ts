@@ -28,6 +28,8 @@ function seedLadder(lastResult: string): { handle: string; lockPath: string; sid
   const sid = uniq('sid');
   const handle = uniq('h');
   insertJob({ handle, backend: 'omp', sid, repo: '/repo/y', log_path: '/tmp/y.log' });
+  // With the shared chain handle, the job's status reflects the winning rung's terminal status
+  updateJob(handle, { status: lastResult });
   appendLadder(sid, 1, 'omp', 'failed');
   appendLadder(sid, 2, 'opencode', lastResult);
   return { handle, lockPath: chainLockPath(sid), sid };

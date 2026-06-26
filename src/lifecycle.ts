@@ -112,9 +112,9 @@ export function launch(
   backend: Backend,
   prompt: string,
   dir: string,
-  opts: { mcpSid: string; model?: string; complex?: boolean; extraArgs?: string[]; timeoutMs?: number; deadlineAt?: number; completionLock?: string; seed?: SeedContext; reuseWorktree?: string; reuseBaseSha?: string },
+  opts: { mcpSid: string; model?: string; complex?: boolean; extraArgs?: string[]; timeoutMs?: number; deadlineAt?: number; completionLock?: string; seed?: SeedContext; reuseWorktree?: string; reuseBaseSha?: string; handle?: string },
 ): LaunchResult {
-  const handle = newHandle(backend);
+  const handle = opts.handle ?? newHandle(backend);
   trackLaunched(handle);
   const reuse = opts.reuseWorktree;
   const lp = workerLogPath(handle, dir);

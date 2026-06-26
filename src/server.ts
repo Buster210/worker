@@ -76,9 +76,9 @@ export function handleStatus(args: { handle: string }): Record<string, unknown> 
   const { handle } = args;
   const job = getJob(handle);
   if (!job) throw new Error(`No job found: ${handle}`);
-  // A chain handle is just the FIRST rung — its own status goes stale once the chain climbs on.
+  // A chain handle is shared across all rungs — its job.json reflects the active or terminal rung.
   // Mirror worker-report: while the chain lock exists the chain is running; once it is gone, report the
-  // chain's terminal status from ladder history so worker_status and worker-report agree.
+  // chain's terminal status so worker_status and worker-report agree.
   const cl = job.completion_lock ?? '';
   if (cl.endsWith('.chain.lock')) {
     const running = existsSync(cl);

@@ -160,17 +160,18 @@ describe('handleDoctor — success path', () => {
 });
 describe('handleStatus — chain handle', () => {
   const chainHandles: string[] = [];
-  function seedChain(sid: string): string {
+  function seedChain(sid: string, termStatus?: string): string {
     const handle = `srv-${process.pid}-${seq++}`;
     chainHandles.push(handle);
     insertJob({ handle, backend: 'codex', sid: 'test', repo: REPO, log_path: stateLogPath(handle, REPO), completion_lock: chainLockPath(sid) });
-    updateJob(handle, { status: 'failed' }); 
+    // With the shared chain handle, job status reflects the winning rung's terminal status
+    if (termStatus) updateJob(handle, { status: termStatus });
     return handle;
   }
 
   it('reports chain-terminal status when chain lock is absent (climbed chain)', () => {
     const sid = `chain-${process.pid}-${seq++}`;
-    const handle = seedChain(sid);
+    const handle = seedChain(sid, 'done');
     appendLadder(sid, 1, 'codex', 'failed');
     appendLadder(sid, 2, 'cmd', 'done');
     try { rmSync(chainLockPath(sid), { force: true }); } catch {} 
