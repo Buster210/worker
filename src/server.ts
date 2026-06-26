@@ -17,12 +17,13 @@ import { backendShellArgv } from './runner.ts';
 import { workerEnv } from './env.ts';
 import { resolveStatus } from './runner.ts';
 import { isProcessAlive } from './process.ts';
-import { sweepStaleJobs, reapStoppedJobs, sweepChainLocks } from './maintenance.ts';
+import { sweepStaleJobs, reapStoppedJobs, sweepChainLocks, sweepStaleWorkerDirs } from './maintenance.ts';
 import { launch, forceKillJob, assertRepo, resumeLaunch as lifecycleResumeLaunch, shutdown, spawnReaper } from './lifecycle.ts';
 import { handleLadder } from './chain.ts';
 import { terminalStatus } from './report.ts';
 import {
   acquireLock, readLock, removeLock, isDaemonAlive, SessionTracker, hardShutdown, reapCrashedWorkers,
+  writeServerPid, removeServerPid, startClientLivenessCheck,
 } from './daemon.ts';
 
 // --- MCP tool handlers (keep in server.ts) ---
@@ -36,14 +37,14 @@ export function handleRun(args: { backend: Backend; specFile: string; model?: st
   assertRepo(args.dir);
   const prompt = readSpec(args.specFile);
   const { handle, promise, workdir } = launch(args.backend, prompt, args.dir,
-    { mcpSid, model: args.model, extraArgs: args.extraArgs, timeoutMs: args.timeout ? args.timeout * 1000 : undefined });
+    { mcpSid, model: args.model, extraArgs: args.extraArgs, timeoutMs: args.timeout ? args.timeout * 1000 : undefined, specFile: args.specFile });
   void promise.catch(() => {});
   return { handle, status: 'running', workdir };
 }
 
 export function handleResume(args: { handle: string; specFile: string; dir: string; timeout?: number; extraArgs?: string[] }): { handle: string; status: string; workdir: string } {
   const prompt = readSpec(args.specFile);
-  const { handle, promise, workdir } = lifecycleResumeLaunch({ handle: args.handle, prompt, dir: args.dir, timeout: args.timeout, extraArgs: args.extraArgs });
+  const { handle, promise, workdir } = lifecycleResumeLaunch({ handle: args.handle, prompt, dir: args.dir, timeout: args.timeout, extraArgs: args.extraArgs, specFile: args.specFile });
   void promise.catch(() => {});
   return { handle, status: 'running', workdir };
 }
@@ -184,11 +185,17 @@ export function createWorkerServer(tracker?: SessionTracker): McpServer {
   );
 
   const bareFilename = (v: string) => !v.includes('/') && !v.includes('\\') && v !== '.' && v !== '..' && !v.includes('..');
+  // Trim at the entry boundary so the SAME normalized name flows through the whole lifecycle:
+  // readSpec reads it, the job stores it, archiveSpec moves it — all agree. Without this, a padded
+  // 'plan.md ' reads fine (readSpec trims) but archives as a no-op (rename of the un-trimmed name misses).
+  const specFileSchema = z.string().min(1).transform(v => v.trim())
+    .refine(v => v.length > 0 && bareFilename(v), 'bare filename only (no path separators or ..)')
+    .describe('Spec filename (bare, no slashes) from ~/.claude/plans/');
 
   s.registerTool('worker_ladder', {
     description: `Default lane. Run task on bg agent, climbs backend ladder. → {handle, status:'running'} on worker/<handle> or current branch. Spec + report loop → server instructions.`,
     inputSchema: {
-      specFile: z.string().min(1).refine(bareFilename, 'bare filename only (no path separators or ..)').describe('Spec filename (bare, no slashes) from ~/.claude/plans/'),
+      specFile: specFileSchema,
       dir: z.string().min(1).refine(v => v.startsWith('/'), 'absolute path required').describe('Repo directory (absolute path, required)'),
       timeout: z.number().int().min(1).max(3600).optional().describe('Hard timeout seconds (1..3600, default 600)'),
       complex: z.boolean().optional().describe('true=hard; server picks model. Never pass model yourself.'),
@@ -196,7 +203,7 @@ export function createWorkerServer(tracker?: SessionTracker): McpServer {
   }, async ({ specFile, dir, timeout, complex }, extra) => {
       const mcpSid = (extra.sessionId as string | undefined) || process.env.CLAUDE_CODE_SESSION_ID || randomUUID();
       const prompt = readSpec(specFile);
-      return reply(handleLadder({ mcpSid, prompt, dir, timeout, complex }));
+      return reply(handleLadder({ mcpSid, prompt, dir, timeout, complex, specFile }));
     }
   );
 
@@ -204,7 +211,7 @@ export function createWorkerServer(tracker?: SessionTracker): McpServer {
     description: `Run task on a named backend — use only when user names one, else worker_ladder. → {handle, status:'running'}. Report loop → server instructions.`,
     inputSchema: {
       backend: z.string().describe('Named backend to run.'),
-      specFile: z.string().min(1).refine(bareFilename, 'bare filename only (no path separators or ..)').describe('Spec filename (bare, no slashes) from ~/.claude/plans/'),
+      specFile: specFileSchema,
       model: z.string().regex(/^[A-Za-z9._:-]+$/).optional().describe('Model override. Ignored by workers that pin their own model.'),
       dir: z.string().min(1).refine(v => v.startsWith('/'), 'absolute path required').describe('Repo directory (absolute path, required)'),
       timeout: z.number().int().min(1).max(3600).optional().describe('Hard timeout seconds (1..3600, default 600)'),
@@ -221,7 +228,7 @@ export function createWorkerServer(tracker?: SessionTracker): McpServer {
     description: 'Resume stopped worker / retry failed|timeout. Pass original specFile + dir.',
     inputSchema: {
       handle: z.string(),
-      specFile: z.string().min(1).refine(bareFilename, 'bare filename only (no path separators or ..)').describe('Spec filename (bare, no slashes) from ~/.claude/plans/'),
+      specFile: specFileSchema,
       dir: z.string().min(1).refine(v => v.startsWith('/'), 'absolute path required').describe('Repo directory (absolute path, required)'),
       timeout: z.number().int().min(1).max(3600).optional(),
       extraArgs: z.array(z.string().max(4096)).optional().describe('Raw worker CLI args.'),
@@ -298,6 +305,8 @@ function initDaemon(): void {
   sweepChainLocks();
   pruneOldJobs();
   reapCrashedWorkers();
+  sweepStaleWorkerDirs();
+  startClientLivenessCheck();
   setInterval(() => {
     reapStoppedJobs(); sweepStaleJobs(); sweepChainLocks(); pruneOldJobs(); reapCrashedWorkers();
     // Reaper backstop: it is spawned lazily on launch (see lifecycle.launch) and self-exits when
@@ -320,6 +329,7 @@ if (import.meta.main) {
   };
   process.on('uncaughtException', (err) => {
     recordCrash('uncaught exception', err);
+    removeServerPid(); // every exit path clears the .active/worker/ pid, including this crash route
     process.exit(1);
   });
   process.on('unhandledRejection', (reason) => {
@@ -445,6 +455,7 @@ if (import.meta.main) {
       process.exit(1);
     }
     console.error(`[worker] daemon listening on http://127.0.0.1:${actualPort}/mcp`);
+    writeServerPid();
   });
 
   // Idle-session GC: drop tracker entries unused for a long while. Memory

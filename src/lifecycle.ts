@@ -112,7 +112,7 @@ export function launch(
   backend: Backend,
   prompt: string,
   dir: string,
-  opts: { mcpSid: string; model?: string; complex?: boolean; extraArgs?: string[]; timeoutMs?: number; deadlineAt?: number; completionLock?: string; seed?: SeedContext; reuseWorktree?: string; reuseBaseSha?: string; handle?: string },
+  opts: { mcpSid: string; model?: string; complex?: boolean; extraArgs?: string[]; timeoutMs?: number; deadlineAt?: number; completionLock?: string; seed?: SeedContext; reuseWorktree?: string; reuseBaseSha?: string; handle?: string; specFile?: string },
 ): LaunchResult {
   const handle = opts.handle ?? newHandle(backend);
   trackLaunched(handle);
@@ -127,7 +127,7 @@ export function launch(
   const treePath = join(handleDirUncached(handle, dir), 'tree');
   const claudeModel = opts.complex ? 'sonnet' : 'haiku';
   const modelToUse = backend === 'claude' ? (opts.model ?? claudeModel) : undefined;
-  insertJob({ handle, backend, sid: opts.mcpSid, repo: dir, worktree_path: reuse ?? treePath, base_sha: opts.reuseBaseSha, model: modelToUse, task: prompt, log_path: lp, completion_lock: opts.completionLock, server_pid: process.pid, server_started: SERVER_STARTED, server_sid: SERVER_SID, deadline_at: opts.deadlineAt });
+  insertJob({ handle, backend, sid: opts.mcpSid, repo: dir, worktree_path: reuse ?? treePath, base_sha: opts.reuseBaseSha, model: modelToUse, task: prompt, log_path: lp, completion_lock: opts.completionLock, server_pid: process.pid, server_started: SERVER_STARTED, server_sid: SERVER_SID, deadline_at: opts.deadlineAt, spec_file: opts.specFile });
 
   // The job is now 'running' on disk; spawn the orphan reaper (idempotent) so a SIGKILL of
   // this server still cleans up the worker. It self-exits once no running jobs remain, so an
@@ -229,8 +229,8 @@ export async function shutdown(): Promise<void> {
 let _shuttingDown = false;
 export function resetShutdownState(): void { _shuttingDown = false; launchedHandles.clear(); _reaperPid = undefined; _reaperOwned = false; }
 
-export function resumeLaunch(args: { handle: string; prompt: string; dir: string; timeout?: number; extraArgs?: string[] }): { handle: string; promise: Promise<RunResult>; workdir: string } {
-  const { handle, prompt, dir, timeout, extraArgs } = args;
+export function resumeLaunch(args: { handle: string; prompt: string; dir: string; timeout?: number; extraArgs?: string[]; specFile?: string }): { handle: string; promise: Promise<RunResult>; workdir: string } {
+  const { handle, prompt, dir, timeout, extraArgs, specFile } = args;
   const job = getJob(handle);
   if (!job) throw new Error(`No job found for handle: ${handle}`);
   updateJob(handle, { kill_requested: false });
@@ -244,6 +244,7 @@ export function resumeLaunch(args: { handle: string; prompt: string; dir: string
     spec = `A prior attempt already ran in this repo — inspect the working tree, determine what is already done, and complete only the remainder.\n\n` + spec;
   }
   const argv = buildResumeArgv(be, spec, wtDir, job.resume_token, job.model, extraArgs);
+  if (specFile) updateJob(handle, { spec_file: specFile });
   const p = runWorker(argv, wtDir, handle, be, lp,
     job.resume_token, timeout ? timeout * 1000 : undefined);
   return { handle, promise: failOnError(handle, p), workdir: wtDir };

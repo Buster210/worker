@@ -1,10 +1,11 @@
 import { reapAgeMs } from './env.ts';
-import { getAllRunningJobs, getAllRunningJobsFresh, getAllStoppedJobs, finalizeJob, workersDir, ownsWorktree } from './state.ts';
+import { FILE_CONFIG } from './config.ts';
+import { getAllRunningJobs, getAllRunningJobsFresh, getAllStoppedJobs, finalizeJob, workersDir, ownsWorktree, plansWorkerDir, isBareSpecName } from './state.ts';
 import { isProcessAlive, killProcessTree } from './process.ts'
 import { resolveStatus } from './runner.ts'
 import { removeWorktree } from './worktree.ts';
 import { SERVER_STARTED } from './lifecycle.ts';
-import { readFileSync, readdirSync, unlinkSync, statSync } from 'fs';
+import { readFileSync, readdirSync, unlinkSync, statSync, rmSync } from 'fs';
 import { join } from 'path';
 
 const SELF_PID = process.pid;
@@ -105,3 +106,74 @@ export function sweepChainLocks(): void {
     }
   }
 }
+
+const TERMINAL_SWEEP_RE = /^(done|failed|timeout|killed|stalled)/;
+
+/**
+ * Server-start sweep: remove stale terminal worker dirs EXCEPT:
+ *   (a) killed:* dirs (preserve killed:no-client for inspection)
+ *   (b) config skip-list entries
+ *   (c) dirs owned by another still-running server (multi-server safety)
+ */
+export function sweepStaleWorkerDirs(): void {
+  const root = workersDir();
+  const skipSet = new Set(FILE_CONFIG.skip ?? []);
+  let cleaned = 0;
+
+  let projectDirs: string[] | undefined;
+  try {
+    projectDirs = readdirSync(root, { withFileTypes: true })
+      .filter(d => d.isDirectory() && d.name !== 'ladder' && d.name !== 'tmux')
+      .map(d => d.name);
+  } catch { return; }
+
+  for (const proj of projectDirs) {
+    let handleDirs: string[] | undefined;
+    try {
+      handleDirs = readdirSync(join(root, proj), { withFileTypes: true })
+        .filter(d => d.isDirectory())
+        .map(d => d.name);
+    } catch { continue; }
+
+    for (const handle of handleDirs) {
+      const dirPath = join(root, proj, handle);
+      let jobJson: Record<string, unknown> | null = null;
+      try {
+        jobJson = JSON.parse(readFileSync(join(dirPath, 'job.json'), 'utf8'));
+      } catch { /* no job.json → truly stale, clean below */ }
+
+      const status = (jobJson?.status as string) ?? '';
+
+      if (status && TERMINAL_SWEEP_RE.test(status)) {
+        // Preserve killed:* dirs (req 7a: user-inspectable mid-flight kills)
+        if (status.startsWith('killed:')) continue;
+        // Preserve config skip-list entries (req 7b)
+        const backend = (jobJson?.backend as string) ?? '';
+        if (skipSet.has(handle) || skipSet.has(backend)) continue;
+        // Multi-server safety: never delete a dir owned by another live server
+        const ownerPid = (jobJson?.server_pid as number) ?? 0;
+        const ownerStarted = (jobJson?.server_started as string) ?? '';
+        if (ownerPid > 0 && ownerPid !== SELF_PID && isProcessAlive(ownerPid, ownerStarted)) continue;
+        // Remove archived spec for this completed-properly dir
+        const specFile = (jobJson?.spec_file as string) ?? '';
+        if (specFile && isBareSpecName(specFile)) {
+          try { unlinkSync(join(plansWorkerDir(), specFile)); } catch {}
+        }
+      } else if (!jobJson) {
+        // No job.json: only clean if no .lock file present (a running worker holds one)
+        try {
+          if (statSync(join(dirPath, '.lock')).isFile()) continue;
+        } catch { /* no lock → proceed to clean */ }
+      } else {
+        continue; // non-terminal job, leave alone
+      }
+
+      try { rmSync(dirPath, { recursive: true, force: true }); } catch {}
+      cleaned++;
+    }
+  }
+
+  if (cleaned > 0) console.error(`[worker] sweepStaleWorkerDirs: cleaned ${cleaned} stale dir(s)`);
+}
+// ponytail: killed:no-client dirs accumulate until the user runs explicit cleanup.
+// Acceptable tradeoff: bounded by total jobs killed during no-client shutdowns.

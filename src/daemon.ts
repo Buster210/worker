@@ -20,6 +20,7 @@ import { getAllRunningJobsFresh, finalizeJob, type Job } from './state.ts';
 import type { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { killProcessTrees } from './process.ts';
+import { selfTermCheckMs } from './env.ts';
 
 // --- Lockfile ---
 
@@ -206,5 +207,121 @@ export function reapCrashedWorkers(): void {
 export function hardShutdown(): void {
   reapAllWorkers();
   removeLock();
+  removeServerPid();
   process.exit(0);
+}
+
+// --- .active/worker/ server.pid management ---
+
+function activeDir(): string {
+  return join(process.env.HOME ?? homedir(), '.claude', '.active', 'worker');
+}
+
+export function writeServerPid(): void {
+  const dir = activeDir();
+  try { mkdirSync(dir, { recursive: true }); } catch {}
+  try { writeFileSync(join(dir, 'server.pid'), String(process.pid)); } catch {}
+}
+
+export function removeServerPid(): void {
+  try { unlinkSync(join(activeDir(), 'server.pid')); } catch {}
+}
+
+// --- Client liveness (self-termination backstop) ---
+
+const SELF_TERM_EMPTY_THRESHOLD = 2; // two consecutive empty ticks (~60s) before firing
+let _clientPidCache: Set<string> | null = null;
+let _emptyTickCount = 0;
+let _everSeenClient = false;
+let _selfTermTimer: ReturnType<typeof setInterval> | null = null;
+
+/** Read numeric PID filenames from .active/worker/, excluding server.pid. */
+function readClientPids(): Set<string> {
+  const dir = activeDir();
+  const result = new Set<string>();
+  try {
+    for (const entry of readdirSync(dir)) {
+      if (entry === 'server.pid') continue;
+      if (/^\d+$/.test(entry)) result.add(entry);
+    }
+  } catch { /* dir may not exist */ }
+  return result;
+}
+
+/** Kill all running workers with killed:no-client, then hardShutdown. */
+function selfTerminate(): void {
+  console.error('[worker] self-terminating: no live client');
+  const jobs = getAllRunningJobsFresh();
+  if (jobs.length > 0) {
+    const pids = jobs.filter(j => j.worker_pid > 0).map(j => j.worker_pid);
+    if (pids.length > 0) killProcessTrees(pids, 'SIGKILL');
+    for (const job of jobs) {
+      finalizeJob(job.handle, 'killed:no-client', { resume_token: job.resume_token });
+    }
+  }
+  hardShutdown(); // removeLock + removeServerPid + exit
+}
+
+function checkClientLiveness(): void {
+  // Safety gate: arm only after observing ≥1 live client at least once.
+  if (!_everSeenClient) {
+    _clientPidCache = readClientPids();
+    if (_clientPidCache.size > 0) {
+      _everSeenClient = true;
+      // Check immediately — a client might already be dead
+    } else {
+      return; // never seen a client → never self-terminate
+    }
+  }
+
+  // Fast path: check cached PIDs with isProcessAlive
+  if (_clientPidCache && _clientPidCache.size > 0) {
+    let anyAlive = false;
+    for (const pidStr of _clientPidCache) {
+      if (isProcessAlive(Number(pidStr))) { anyAlive = true; break; }
+    }
+    if (anyAlive) { _emptyTickCount = 0; return; }
+    // All cached PIDs dead → re-read directory (a new client may have appeared)
+    _clientPidCache = readClientPids();
+    if (_clientPidCache.size > 0) { _emptyTickCount = 0; return; }
+  }
+
+  // No live clients after having seen ≥1
+  _emptyTickCount++;
+  if (_emptyTickCount >= SELF_TERM_EMPTY_THRESHOLD) {
+    // Fresh re-read before firing (req 3)
+    const freshPids = readClientPids();
+    for (const pidStr of freshPids) {
+      if (isProcessAlive(Number(pidStr))) {
+        // Client reappeared — reset state so next tick uses the cache path.
+        _clientPidCache = freshPids;
+        _emptyTickCount = 0;
+        return;
+      }
+    }
+    selfTerminate();
+  }
+}
+
+/** Start the periodic client-liveness check. Safe to call once; idempotent. */
+export function startClientLivenessCheck(): void {
+  if (_selfTermTimer) return; // already running
+  const ms = selfTermCheckMs();
+  _selfTermTimer = setInterval(() => { try { checkClientLiveness(); } catch {} }, ms);
+  _selfTermTimer.unref?.();
+}
+
+/** Stop the liveness check timer (test cleanup / controlled shutdown). */
+export function stopClientLivenessCheck(): void {
+  if (_selfTermTimer) { clearInterval(_selfTermTimer); _selfTermTimer = null; }
+}
+/** Test-only: expose the liveness tick for direct invocation. */
+export function __checkClientLivenessForTest(): void { checkClientLiveness(); }
+
+/** Test-only: reset module-level liveness state. */
+export function __resetLivenessStateForTest(): void {
+  _clientPidCache = null;
+  _emptyTickCount = 0;
+  _everSeenClient = false;
+  stopClientLivenessCheck();
 }

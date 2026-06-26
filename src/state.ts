@@ -19,6 +19,10 @@ export function plansDir(): string {
   return process.env.WORKER_PLANS_DIR ?? FILE_CONFIG.plansDir ?? `${process.env.HOME}/.claude/plans`;
 }
 
+export function plansWorkerDir(): string {
+  return join(plansDir(), 'worker');
+}
+
 export function reaperPidPath(): string {
   return join(workersDir(), '.reaper.pid');
 }
@@ -35,6 +39,28 @@ export function readSpec(specFile: string): string {
   } catch {
     throw new Error(`spec not found: ${resolved}`);
   }
+}
+
+// Guard the trust boundary when a spec filename is read BACK from on-disk job.json (which an external
+// process could tamper with): only a bare filename may be joined under plansDir/plansWorkerDir, else a
+// crafted `../../x` would let a rename/unlink escape the plans tree. readSpec validates at write time;
+// this re-validates every disk read.
+export function isBareSpecName(name: string): boolean {
+  const t = name.trim();
+  return t.length > 0 && !t.includes('/') && !t.includes('\\') && !t.includes('..') && basename(t) === t;
+}
+
+// On a clean 'done', move the originating spec out of the plans root into plans/worker/ so the
+// active plans dir only lists specs not yet completed. Idempotent: missing src (inline-only spec,
+// or already archived by a sibling) is a no-op.
+export function archiveSpec(handle: string): void {
+  const job = getJob(handle);
+  const spec = job?.spec_file;
+  if (!spec || !isBareSpecName(spec)) return;
+  try {
+    mkdirSync(plansWorkerDir(), { recursive: true });
+    renameSync(join(plansDir(), spec), join(plansWorkerDir(), spec));
+  } catch { /* missing or already moved — idempotent */ }
 }
 
 const _jobs = new Map<string, Job>();
@@ -143,6 +169,7 @@ export type Job = {
   base_sha?: string;
   created_at?: number;
   branch?: string;
+  spec_file?: string;
 };
 
 export function insertJob(j: {
@@ -151,6 +178,7 @@ export function insertJob(j: {
   task?: string; log_path: string; completion_lock?: string;
   server_pid?: number; server_started?: string; server_sid?: string; deadline_at?: number;
   worktree_path?: string; base_sha?: string; created_at?: number; branch?: string;
+  spec_file?: string;
 }) {
   const job: Job = {
     handle: j.handle, backend: j.backend,
@@ -167,6 +195,7 @@ export function insertJob(j: {
     base_sha: j.base_sha,
     created_at: j.created_at ?? Date.now(),
     branch: j.branch,
+    spec_file: j.spec_file,
   };
   mkdirSync(handleDir(j.handle, j.repo), { recursive: true });
   _jobs.set(job.handle, job);

@@ -16,8 +16,8 @@ export type LadderDrivers = {
 
 // deps.launch is a test seam — production callers omit it and get the real launch. Lets a test
 // drive handleLadder with a stub launcher (no real backend spawn, no global module mock).
-export function handleLadder(args: { mcpSid: string; prompt: string; dir: string; timeout?: number; complex?: boolean }, deps: { launch?: typeof launch } = {}): LadderResult {
-  const { mcpSid, prompt, dir, complex } = args;
+export function handleLadder(args: { mcpSid: string; prompt: string; dir: string; timeout?: number; complex?: boolean; specFile?: string }, deps: { launch?: typeof launch } = {}): LadderResult {
+  const { mcpSid, prompt, dir, complex, specFile } = args;
   const launchFn = deps.launch ?? launch;
   const chainId = randomUUID();
   const chainDeadlineAt = Date.now() + (args.timeout ? args.timeout * 1000 : defaultTimeoutMs());
@@ -27,7 +27,7 @@ export function handleLadder(args: { mcpSid: string; prompt: string; dir: string
   createChainLock(chainId, process.pid, SERVER_STARTED);
   saveChainMeta(chainId, { deadlineAt: chainDeadlineAt });
   const chainHandle = randomUUID(); // full UUID — safe for all backends including claude --session-id
-  const first = launchFn(LADDER[0], prompt, dir, { mcpSid, complex, deadlineAt: chainDeadlineAt, completionLock: chainLockPath(chainId), handle: chainHandle });
+  const first = launchFn(LADDER[0], prompt, dir, { mcpSid, complex, deadlineAt: chainDeadlineAt, completionLock: chainLockPath(chainId), handle: chainHandle, specFile });
   const drivers: LadderDrivers = {
     // Every rung after the first reuses the shared chain handle (one job.json) and the first rung's
     // worktree + base_sha: the prior rung's work already lives in that tree, so the report
@@ -52,6 +52,7 @@ export function handleLadder(args: { mcpSid: string; prompt: string; dir: string
         reuseWorktree: firstJob?.worktree_path,
         reuseBaseSha: firstJob?.base_sha,
         seed,
+        specFile,
       }).promise;
     },
   };

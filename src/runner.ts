@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from 'child_process';
 import { openSync, closeSync, writeSync, statSync } from 'fs';
-import { updateJob, getJob, finalizeJob } from './state.ts';
+import { updateJob, getJob, finalizeJob, archiveSpec } from './state.ts';
 import { emitsJsonLog, QUIET_BACKENDS, type Backend } from './backends.ts';
 import { readSentinel } from './logParse.ts';
 import { killProcessTree } from './process.ts';
@@ -140,6 +140,7 @@ export async function runWorker(
     const natural = resolveStatus(backend, rc, logPath, timedOut);
     const gated = maybeVerifyAndCommit(handle, repo, natural);
     status = finalizeJob(handle, gated, { resume_token: resumeToken });
+    if (status === 'done') archiveSpec(handle);
   }
   return {
     status, exit_code: rc, backend, handle,
