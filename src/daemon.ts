@@ -12,19 +12,18 @@
  * Workers are reaped on shutdown. Orphaned workers (crashed but not cleaned up)
  * are reaped after 60s grace period.
  */
-import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, openSync, closeSync, renameSync, readdirSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, openSync, closeSync, readdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { homedir } from 'os';
 import { isProcessAlive } from './process.ts';
-import { getAllRunningJobsFresh, finalizeJob, type Job } from './state.ts';
+import { getAllRunningJobsFresh, finalizeJob, workersDir, type Job } from './state.ts';
 import type { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { killProcessTrees } from './process.ts';
 
 // --- Lockfile ---
 
-const lockDir = () => process.env.WORKER_STATE_DIR || join(homedir(), '.claude', 'workers');
-const lockPath = () => join(lockDir(), 'server.json');
+const lockPath = () => join(workersDir(), 'server.json');
 
 export interface DaemonLock {
   pid: number;
@@ -33,14 +32,13 @@ export interface DaemonLock {
 }
 
 function ensureLockDir(): void {
-  mkdirSync(lockDir(), { recursive: true });
+  mkdirSync(workersDir(), { recursive: true });
 }
 
 /** Atomic create — returns true if we won the race, false if lockfile already exists. */
 export function acquireLock(pid: number, port: number): boolean {
   ensureLockDir();
   const lock: DaemonLock = { pid, port, started_at: new Date().toISOString() };
-  const tmpPath = `${lockPath()}.${pid}.tmp`;
   try {
     const fd = openSync(lockPath(), 'wx'); // exclusive create — fails if exists
     writeFileSync(fd, JSON.stringify(lock));
@@ -67,29 +65,16 @@ export function acquireLock(pid: number, port: number): boolean {
         return false;
       }
     }
-    // Unexpected error — try atomic write fallback
-    writeFileSync(tmpPath, JSON.stringify(lock));
-    try {
-      renameSync(tmpPath, lockPath());
-      return true;
-    } catch (err) {
-      console.error('[worker] lock atomic fallback failed:', err instanceof Error ? err.message : err);
-      try { unlinkSync(tmpPath); } catch { /* ignore */ }
-      return false;
-    }
+    console.error('[worker] acquireLock failed:', err instanceof Error ? err.message : err);
+    return false;
   }
 }
 
 export function readLock(): DaemonLock | null {
   try {
-    const raw = readFileSync(lockPath(), 'utf-8');
-    const parsed: unknown = JSON.parse(raw);
-    if (
-      parsed && typeof parsed === 'object' &&
-      'pid' in parsed && typeof (parsed as { pid: unknown }).pid === 'number' &&
-      'port' in parsed && typeof (parsed as { port: unknown }).port === 'number'
-    ) {
-      return parsed as DaemonLock;
+    const parsed = JSON.parse(readFileSync(lockPath(), 'utf-8')) as Record<string, unknown>;
+    if (typeof parsed?.pid === 'number' && typeof parsed?.port === 'number' && typeof parsed?.started_at === 'string') {
+      return { pid: parsed.pid, port: parsed.port, started_at: parsed.started_at };
     }
     return null;
   } catch {
@@ -168,35 +153,17 @@ export class SessionTracker {
 }
 
 // --- Shutdown (on signal) ---
-
-/** Kill every running worker. Only when no client remains (last instance out). */
-function reapAllWorkers(): void {
-  const jobs = getAllRunningJobsFresh();
-  if (jobs.length === 0) return;
+export function killAndFinalizeJobs(jobs: ReturnType<typeof getAllRunningJobsFresh>, status: string): void {
   const pids = jobs.filter(j => j.worker_pid > 0).map(j => j.worker_pid);
   if (pids.length > 0) killProcessTrees(pids, 'SIGKILL');
   for (const job of jobs) {
-    finalizeJob(job.handle, 'failed:daemon-shutdown', { resume_token: job.resume_token });
+    finalizeJob(job.handle, status, { resume_token: job.resume_token });
   }
 }
-
-/** Reap workers that crashed >60s ago (grace period for reconnection). */
-export function reapCrashedWorkers(): void {
+function reapAllWorkers(): void {
   const jobs = getAllRunningJobsFresh();
-  const now = Date.now();
-  const GRACE_MS = 60_000;
-
-  for (const job of jobs) {
-    if (job.status !== 'running' || job.worker_pid <= 0) continue;
-    if (isProcessAlive(job.worker_pid)) continue;
-
-    const elapsed = now - new Date(job.started).getTime();
-    if (elapsed > GRACE_MS) {
-      try { killProcessTrees([job.worker_pid], 'SIGKILL'); } catch {}
-      finalizeJob(job.handle, 'failed:orphaned', { resume_token: job.resume_token });
-      console.error(`[worker] reaped orphaned worker after ${Math.round(elapsed / 1000)}s: ${job.handle}`);
-    }
-  }
+  if (jobs.length === 0) return;
+  killAndFinalizeJobs(jobs, 'failed:daemon-shutdown');
 }
 
 /**
@@ -250,14 +217,8 @@ function readClientPids(): Set<string> {
 function selfTerminate(): void {
   console.error('[worker] self-terminating: no live client');
   const jobs = getAllRunningJobsFresh();
-  if (jobs.length > 0) {
-    const pids = jobs.filter(j => j.worker_pid > 0).map(j => j.worker_pid);
-    if (pids.length > 0) killProcessTrees(pids, 'SIGKILL');
-    for (const job of jobs) {
-      finalizeJob(job.handle, 'killed:no-client', { resume_token: job.resume_token });
-    }
-  }
-  hardShutdown(); // removeLock + removeServerPid + exit
+  if (jobs.length > 0) killAndFinalizeJobs(jobs, 'killed:no-client');
+  hardShutdown();
 }
 
 export function checkClientLiveness(): void {

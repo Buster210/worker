@@ -1,5 +1,4 @@
 import { basename, join } from 'path';
-import { homedir } from 'os';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
@@ -10,7 +9,7 @@ import http from 'http';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import {
   getJob, updateJob, finalizeJob, getAllJobs, getAllRunningJobs, readSpec, loadChainMeta, saveChainMeta,
-  pruneTranscript, getLadderHistory,
+  pruneTranscript, getLadderHistory, workersDir,
 } from './state.ts';
 import { LADDER, ALL_BACKENDS, type Backend } from './backends.ts';
 import { backendShellArgv } from './runner.ts';
@@ -22,7 +21,7 @@ import { launch, forceKillJob, assertRepo, resumeLaunch as lifecycleResumeLaunch
 import { handleLadder } from './chain.ts';
 import { terminalStatus } from './report.ts';
 import {
-  acquireLock, readLock, removeLock, isDaemonAlive, SessionTracker, hardShutdown, reapCrashedWorkers,
+  acquireLock, readLock, removeLock, isDaemonAlive, SessionTracker, hardShutdown,
   writeServerPid, removeServerPid, checkClientLiveness,
 } from './daemon.ts';
 
@@ -155,9 +154,6 @@ export function handleExtend(args: { handle: string; seconds: number }): { handl
   return { handle, deadline_at: newDeadline };
 }
 
-export function handleCleanup(args: { handle: string }): string {
-  return pruneTranscript(args.handle);
-}
 
 const WORKER_INSTRUCTIONS = `# worker — delegate coding task to bg agent
 
@@ -275,19 +271,18 @@ export function createWorkerServer(tracker?: SessionTracker): McpServer {
   s.registerTool('worker_cleanup', {
     description: 'Drop transcript (run.log) after diff reviewed. Keeps job.json + worktree + branch. No-op unless worker done.',
     inputSchema: { handle: z.string() },
-  }, async (args) => reply(handleCleanup(args))
+  }, async (args) => reply(pruneTranscript(args.handle))
   );
   return s;
 }
 
-const stateDir = () => process.env.WORKER_STATE_DIR || join(homedir(), '.claude', 'workers');
 
 // Tee every [worker] console.error into one timestamped log in the state dir
 // (alongside config.json), so there's a single place to find why/when the daemon
 // died even when its launcher discards stderr.
 // ponytail: never rotated — add size-based rotation if this log ever gets large.
 function teeStderrToLog(): void {
-  const logFile = join(stateDir(), 'mcp-server.log');
+  const logFile = join(workersDir(), 'mcp-server.log');
   const orig = console.error.bind(console);
   console.error = (...args: unknown[]) => {
     orig(...args);
@@ -303,7 +298,6 @@ function initDaemon(): void {
   sweepStaleJobs();
   reapStoppedJobs();
   sweepChainLocks();
-  reapCrashedWorkers();
   sweepStaleWorkerDirs();
 }
 
@@ -334,7 +328,7 @@ if (import.meta.main) {
     try { checkClientLiveness(); } catch {}
     if (tick % 2 === 0) {
       reapStoppedJobs(); sweepStaleJobs(); sweepChainLocks();
-      reapCrashedWorkers(); sweepStaleWorkerDirs();
+      sweepStaleWorkerDirs();
       // Respawn reaper if it died while workers are running.
       if (getAllRunningJobs().length) spawnReaper();
     }

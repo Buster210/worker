@@ -120,7 +120,7 @@ export function sweepStaleWorkerDirs(): void {
   const skipSet = new Set(FILE_CONFIG.skip ?? []);
   let cleaned = 0;
 
-  let projectDirs: string[] | undefined;
+  let projectDirs: string[];
   try {
     projectDirs = readdirSync(root, { withFileTypes: true })
       .filter(d => d.isDirectory() && d.name !== 'ladder' && d.name !== 'tmux')
@@ -128,7 +128,7 @@ export function sweepStaleWorkerDirs(): void {
   } catch { return; }
 
   for (const proj of projectDirs) {
-    let handleDirs: string[] | undefined;
+    let handleDirs: string[];
     try {
       handleDirs = readdirSync(join(root, proj), { withFileTypes: true })
         .filter(d => d.isDirectory())

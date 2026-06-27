@@ -303,9 +303,10 @@ export function isInPlaceOwner(handle: string, repo: string): boolean {
 export function retainMs(): number {
   const v = Number(process.env.WORKER_RETAIN_MS);
   if (Number.isFinite(v) && v > 0) return v;
-  return FILE_CONFIG.retainMs ?? 86_400_000;
+  // Config value is in hours; convert to ms. 0 = use default (24h).
+  const hours = FILE_CONFIG.retainMs;
+  return hours && hours > 0 ? hours * 3_600_000 : 86_400_000;
 }
-const TERMINAL_RE = /^(done|failed|timeout|killed|stalled)/;
 
 // A worktree is owned by the handle that CREATED it — its path is that handle's own tree dir. Ladder
 // reuse points retry/climb handles at the FIRST handle's worktree, so they share the path but must

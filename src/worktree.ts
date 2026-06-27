@@ -2,7 +2,6 @@ import { spawn, spawnSync } from 'child_process';
 import { rmSync } from 'fs';
 import { isAbsolute, join } from 'path';
 import { handleDirUncached } from './state.ts';
-
 export function addWorktree(repo: string, handle: string): string {
   const path = join(handleDirUncached(handle, repo), 'tree');
   const branch = `worker/${handle}`;
@@ -11,6 +10,7 @@ export function addWorktree(repo: string, handle: string): string {
   if (r.status !== 0) throw new Error(`worktree add failed for ${handle}: ${r.stderr ?? ''}`);
   return path;
 }
+
 
 // Concurrent `git worktree add` on one repo races two ways: the .git/config.lock / worktrees lock,
 // and — because every worktree leaf is named `tree`, so git auto-numbers the admin ids tree/tree1/…

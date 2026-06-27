@@ -16,8 +16,8 @@
   // Spec-file dir read by worker_ladder. Absolute path. "" = default ~/.claude/plans
   "plansDir": "",
 
-  // Finished-job retention before cleanup, milliseconds. Must be > 0 to apply; 0 = default.
-  "retainMs": 0,
+  // Finished-job retention before cleanup, hours. 0 = use default (24).
+  "retainMs": 24,
 
   // worker-report poll interval, milliseconds. Must be > 0 to apply; 0 = default.
   "reportPollMs": 0,
@@ -26,5 +26,13 @@
   "rc": "",
 
   // Source login shell to capture env for spawns. true | false
-  "loginShell": true
+  "loginShell": true,
+  // CPU QoS for worker processes. "" = none.
+  "cpuQos": "",
+
+  // GPG signing mode for git commits: "loopback" | "agent" | "cache" | "".
+  "gpgMode": "",
+
+  // GPG keygrip for signing. "" = default.
+  "gpgKeygrip": ""
 }

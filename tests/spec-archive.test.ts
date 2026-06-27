@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, afterAll } from 'bun:test';
 import { mkdirSync, writeFileSync, existsSync, rmSync, readFileSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -7,7 +7,9 @@ const STATE_DIR = join(tmpdir(), `spec-arch-state-${process.pid}`);
 process.env.WORKER_STATE_DIR = STATE_DIR;
 
 const TEST_HOME = join(tmpdir(), `spec-arch-home-${process.pid}`);
+const ORIG_HOME = process.env.HOME;
 process.env.HOME = TEST_HOME;
+afterAll(() => { process.env.HOME = ORIG_HOME; });
 const PLANS_DIR = join(TEST_HOME, '.claude', 'plans');
 process.env.WORKER_PLANS_DIR = PLANS_DIR;
 

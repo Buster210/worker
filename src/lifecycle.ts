@@ -2,7 +2,7 @@ import { randomUUID } from 'crypto';
 import { spawn, spawnSync } from 'child_process';
 import { readFileSync, unlinkSync, writeFileSync } from 'fs';
 import { join } from 'path';
-import { killProcessTree, killProcessTrees, getProcessStartTime } from './process.ts';
+import { killProcessTree, getProcessStartTime } from './process.ts';
 import {
   handleDirUncached, insertJob, getJob, updateJob, logPath as workerLogPath, finalizeJob, reaperPidPath,
   isInPlaceOwner,
@@ -13,6 +13,7 @@ import { runWorker, type RunResult } from './runner.ts';
 import { loginShellEnvAsync } from './env.ts';
 import { isProcessAlive } from './process.ts';
 import { buildContinuationPreamble, type SeedContext } from './backends.ts';
+import { killAndFinalizeJobs } from './daemon.ts';
 
 // --- Server lifecycle state ---
 // Use the OS-reported process start (ps etime), not module-import time. server_started is the
@@ -108,6 +109,16 @@ function failOnError(handle: string, p: Promise<RunResult>): Promise<RunResult> 
   });
 }
 
+function gitRevParse(dir: string, ...args: string[]): Promise<string | undefined> {
+  return new Promise(resolve => {
+    const chunks: Buffer[] = [];
+    const p = spawn('git', ['-C', dir, 'rev-parse', ...args], { stdio: ['ignore', 'pipe', 'ignore'] });
+    p.stdout?.on('data', (d: Buffer) => chunks.push(d));
+    p.on('close', () => resolve(Buffer.concat(chunks).toString().trim() || undefined));
+    p.on('error', () => resolve(undefined));
+  });
+}
+
 export function launch(
   backend: Backend,
   prompt: string,
@@ -146,34 +157,17 @@ export function launch(
       } else if (inPlace) {
         const [, base_sha, branch] = await Promise.all([
           loginShellEnvAsync(),
-          new Promise<string | undefined>(resolve => {
-            const chunks: Buffer[] = [];
-            const p = spawn('git', ['-C', dir, 'rev-parse', 'HEAD'], { stdio: ['ignore', 'pipe', 'ignore'] });
-            p.stdout?.on('data', (d: Buffer) => chunks.push(d));
-            p.on('close', () => resolve(Buffer.concat(chunks).toString().trim() || undefined));
-            p.on('error', () => resolve(undefined));
-          }),
-          new Promise<string>(resolve => {
-            const chunks: Buffer[] = [];
-            const p = spawn('git', ['-C', dir, 'rev-parse', '--abbrev-ref', 'HEAD'], { stdio: ['ignore', 'pipe', 'ignore'] });
-            p.stdout?.on('data', (d: Buffer) => chunks.push(d));
-            p.on('close', () => resolve(Buffer.concat(chunks).toString().trim() || 'HEAD'));
-            p.on('error', () => resolve('HEAD'));
-          }),
+          gitRevParse(dir, 'HEAD'),
+          (await gitRevParse(dir, '--abbrev-ref', 'HEAD')) ?? 'HEAD',
         ]);
+
         if (base_sha) updateJob(handle, { base_sha });
         updateJob(handle, { branch });
       } else {
         const [createdWt, , base_sha] = await Promise.all([
           addWorktreeAsync(dir, handle),
           loginShellEnvAsync(),
-          new Promise<string | undefined>(resolve => {
-            const chunks: Buffer[] = [];
-            const p = spawn('git', ['-C', dir, 'rev-parse', 'HEAD'], { stdio: ['ignore', 'pipe', 'ignore'] });
-            p.stdout?.on('data', (d: Buffer) => chunks.push(d));
-            p.on('close', () => resolve(Buffer.concat(chunks).toString().trim() || undefined));
-            p.on('error', () => resolve(undefined));
-          }),
+          gitRevParse(dir, 'HEAD'),
         ]);
         if (createdWt !== wt) throw new Error(`worktree path mismatch for ${handle}`);
         if (base_sha) updateJob(handle, { base_sha });
@@ -196,13 +190,10 @@ export function launch(
 
   return { handle, promise, workdir: wt };
 }
-
 export async function shutdown(): Promise<void> {
   if (_shuttingDown) return;
   _shuttingDown = true;
 
-  // Reaper kill is independent of worker teardown — fire it first (instant), don't gate
-  // it behind the kills.
   if (_reaperOwned && _reaperPid) {
     try { process.kill(_reaperPid, 'SIGTERM'); } catch (err) {
       console.error('[worker] failed to kill reaper:', err instanceof Error ? err.message : err);
@@ -217,13 +208,7 @@ export async function shutdown(): Promise<void> {
   }
   launchedHandles.clear();
 
-  // Batch-kill every pid-backed worker tree from ONE process-table snapshot (2 `ps`
-  // Batch-kill every pid-backed worker tree from ONE process-table snapshot.
-  // Jobs stay resumable (finalized 'failed', not kill_requested).
-  killProcessTrees(jobs.filter(j => j.worker_pid > 0).map(j => j.worker_pid), 'SIGKILL');
-  for (const job of jobs) {
-    finalizeJob(job.handle, 'failed', { resume_token: job.resume_token });
-  }
+  killAndFinalizeJobs(jobs, 'failed');
   process.exit(0);
 }
 let _shuttingDown = false;

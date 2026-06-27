@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'bun:test';
 import { spawn } from 'child_process';
 import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync } from 'fs';
 import { join } from 'path';
@@ -8,7 +8,9 @@ const STATE_DIR = join(tmpdir(), `sterm-state-${process.pid}`);
 process.env.WORKER_STATE_DIR = STATE_DIR;
 
 const TEST_HOME = join(tmpdir(), `sterm-home-${process.pid}`);
+const ORIG_HOME = process.env.HOME;
 process.env.HOME = TEST_HOME;
+afterAll(() => { process.env.HOME = ORIG_HOME; });
 const ACTIVE_DIR = join(TEST_HOME, '.claude', '.active', 'worker');
 
 import {

@@ -66,7 +66,6 @@ describe('addWorktreeAsync', () => {
     await expect(addWorktreeAsync(REPO, handle)).rejects.toThrow(/worktree add failed/);
   });
 });
-
 describe('listWorktrees', () => {
   it('returns at least the main worktree path', () => {
     const paths = listWorktrees(REPO);
