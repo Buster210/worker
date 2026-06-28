@@ -1,6 +1,23 @@
 import { spawn, spawnSync } from "child_process";
-import { openSync, closeSync, writeSync, statSync } from "fs";
-import { updateJob, getJob, finalizeJob, archiveSpec } from "./state.ts";
+import {
+  openSync,
+  closeSync,
+  writeSync,
+  statSync,
+  writeFileSync,
+  readFileSync,
+  chmodSync,
+  existsSync,
+  mkdirSync,
+} from "fs";
+import { join, dirname } from "path";
+import {
+  updateJob,
+  getJob,
+  finalizeJob,
+  archiveSpec,
+  workersDir,
+} from "./state.ts";
 import { emitsJsonLog, QUIET_BACKENDS, type Backend } from "./backends.ts";
 import { readSentinel } from "./logParse.ts";
 import { killProcessTree } from "./process.ts";
@@ -288,15 +305,150 @@ function commitMessage(handle: string): string {
     : "worker: automated change";
 }
 
+type GpgMode = "loopback" | "agent" | "cache";
+
+export function resolveGpgMode(): GpgMode {
+  const raw = (
+    process.env.WORKER_GPG_MODE ??
+    FILE_CONFIG.gpgMode ??
+    "loopback"
+  ).toLowerCase();
+  return raw === "agent" || raw === "cache" ? raw : "loopback";
+}
+
+export function loopbackWrapperBody(): string {
+  return `#!/bin/sh
+exec gpg --pinentry-mode loopback --passphrase-fd 3 --batch --no-tty "$@" 3<<GPGPW
+$WORKER_GPG_PASSPHRASE
+GPGPW
+`;
+}
+
+function ensureLoopbackWrapper(): string {
+  const path = join(workersDir(), "gpg-loopback-sign.sh");
+  const body = loopbackWrapperBody();
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    let current: string | null = null;
+    try {
+      current = readFileSync(path, "utf8");
+    } catch {}
+    if (current !== body) writeFileSync(path, body, { mode: 0o700 });
+    chmodSync(path, 0o700);
+  } catch (e) {
+    console.error(
+      `[commit] failed to write gpg loopback wrapper: ${(e as Error).message}`,
+    );
+  }
+  return path;
+}
+
+function presetBinPath(): string | null {
+  const r = spawnSync("gpgconf", ["--list-dirs", "libexecdir"], {
+    encoding: "utf8",
+    timeout: 10_000,
+  });
+  if (r.status !== 0 || !r.stdout) return null;
+  const path = join(r.stdout.trim(), "gpg-preset-passphrase");
+  return existsSync(path) ? path : null;
+}
+
+// ponytail: a distinct signing subkey would need its own grp line; set WORKER_GPG_KEYGRIP for that.
+function discoverPrimaryKeygrip(worktree: string): string | null {
+  const idRes = spawnSync(
+    "git",
+    ["-C", worktree, "config", "--get", "user.signingkey"],
+    { encoding: "utf8", timeout: 10_000 },
+  );
+  const keyId = idRes.status === 0 ? idRes.stdout.trim() : "";
+  const args = [
+    "--batch",
+    "--with-colons",
+    "--with-keygrip",
+    "--list-secret-keys",
+  ];
+  if (keyId) args.push(keyId);
+  const r = spawnSync("gpg", args, { encoding: "utf8", timeout: 10_000 });
+  if (r.status !== 0 || !r.stdout) return null;
+  for (const line of r.stdout.split("\n")) {
+    if (line.startsWith("grp:")) return line.split(":")[9] || null;
+  }
+  return null;
+}
+
+function presetAgentPassphrase(worktree: string): string | null {
+  const passphrase = process.env.WORKER_GPG_PASSPHRASE;
+  if (!passphrase) return "WORKER_GPG_PASSPHRASE not set";
+  const keygrip =
+    process.env.WORKER_GPG_KEYGRIP ??
+    FILE_CONFIG.gpgKeygrip ??
+    discoverPrimaryKeygrip(worktree);
+  if (!keygrip) return "could not resolve keygrip (set WORKER_GPG_KEYGRIP)";
+  const preset = presetBinPath();
+  if (!preset) return "gpg-preset-passphrase not found (is gnupg installed?)";
+  const r = spawnSync(preset, ["--preset", keygrip], {
+    input: passphrase,
+    encoding: "utf8",
+    timeout: 15_000,
+  });
+  if (r.error) return r.error.message;
+  if (r.status !== 0)
+    return (
+      r.stderr?.trim() ||
+      `gpg-preset-passphrase exit ${r.status} (need allow-preset-passphrase in gpg-agent.conf)`
+    );
+  return null;
+}
+
+export function dirtyPaths(worktree: string): string[] {
+  const r = spawnSync(
+    "git",
+    ["-C", worktree, "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    { encoding: "utf8", timeout: 30_000 },
+  );
+  if (r.status !== 0 || !r.stdout) return [];
+  const parts = r.stdout.split("\0");
+  const paths: string[] = [];
+  for (let i = 0; i < parts.length; i++) {
+    const entry = parts[i];
+    if (!entry) continue;
+    const status = entry.slice(0, 2);
+    const path = entry.slice(3);
+    if (!path) continue;
+    paths.push(path);
+    // Rename entries carry the original path as the next NUL token — skip it.
+    if (status[0] === "R" || status[1] === "R") i++;
+  }
+  return paths;
+}
+
+function isCodegraph(path: string): boolean {
+  return path === ".codegraph" || path.startsWith(".codegraph/");
+}
+
 function stageWorktree(
   worktree: string,
   handle: string,
 ): "ok" | "failed:commit" {
-  const add = spawnSync(
-    "git",
-    ["-C", worktree, "add", "-A", "--", ":!.codegraph"],
-    { encoding: "utf8", timeout: 30_000 },
-  );
+  const job = getJob(handle);
+  // In-place workers share the user's real tree, so `git add -A` would sweep up
+  // pre-existing dirt. Stage only paths that appeared since launch. Isolated
+  // worktree workers start clean at HEAD, so -A is correct (and the fallback when
+  // no snapshot exists preserves the old behavior).
+  const inPlace = !!job && job.worktree_path === job.repo;
+  let addArgs: string[];
+  if (inPlace) {
+    const preexisting = new Set(job?.preexisting_paths ?? []);
+    const fresh = dirtyPaths(worktree).filter(
+      (p) => !isCodegraph(p) && !preexisting.has(p),
+    );
+    if (fresh.length === 0) return "ok";
+    addArgs = ["-C", worktree, "add", "--", ...fresh];
+  } else {
+    addArgs = ["-C", worktree, "add", "-A", "--", ":!.codegraph"];
+  }
+
+  const add = spawnSync("git", addArgs, { encoding: "utf8", timeout: 30_000 });
   if (add.error) {
     console.error(
       `[commit] git add failed for ${handle}: ${add.error.message}`,
@@ -337,11 +489,20 @@ function commitWork(
   if (stagedChanges === "failed:commit") return "failed:commit";
   if (stagedChanges === "no") return "failed:no-changes";
 
-  const commit = spawnSync(
-    "git",
-    ["-C", worktree, "commit", "-m", commitMessage(handle)],
-    { encoding: "utf8", timeout: 60_000 },
-  );
+  const mode = resolveGpgMode();
+  const args = ["-C", worktree];
+  if (mode === "loopback") {
+    args.push("-c", `gpg.program=${ensureLoopbackWrapper()}`);
+  } else if (mode === "agent") {
+    const err = presetAgentPassphrase(worktree);
+    if (err) {
+      console.error(`[commit] gpg agent preset failed for ${handle}: ${err}`);
+      return "failed:commit";
+    }
+  }
+  args.push("commit", "-m", commitMessage(handle));
+
+  const commit = spawnSync("git", args, { encoding: "utf8", timeout: 60_000 });
   if (commit.error) {
     console.error(
       `[commit] git commit failed for ${handle}: ${commit.error.message}`,
@@ -349,8 +510,9 @@ function commitWork(
     return "failed:commit";
   }
   if (commit.status !== 0) {
+    const hasPass = process.env.WORKER_GPG_PASSPHRASE ? "set" : "unset";
     console.error(
-      `[commit] git commit failed for ${handle}: ${commit.stderr?.trim() ?? ""}`,
+      `[commit] git commit failed for ${handle} (gpg mode=${mode}, passphrase=${hasPass}): ${commit.stderr?.trim() ?? ""}`,
     );
     return "failed:commit";
   }

@@ -21,7 +21,7 @@ import {
   getResumeToken,
   type Backend,
 } from "./backends.ts";
-import { runWorker, type RunResult } from "./runner.ts";
+import { runWorker, dirtyPaths, type RunResult } from "./runner.ts";
 import { loginShellEnvAsync } from "./env.ts";
 import { isProcessAlive } from "./process.ts";
 import { buildContinuationPreamble, type SeedContext } from "./backends.ts";
@@ -231,6 +231,9 @@ export function launch(
           clearStaleIndexLock(reuse);
           await loginShellEnvAsync();
         } else if (inPlace) {
+          // Snapshot the user's pre-existing dirt before the worker touches anything,
+          // so the commit stages only what the worker adds (not stray untracked files).
+          const preexisting_paths = dirtyPaths(dir);
           const [, base_sha, branch] = await Promise.all([
             loginShellEnvAsync(),
             gitRevParse(dir, "HEAD"),
@@ -238,7 +241,7 @@ export function launch(
           ]);
 
           if (base_sha) updateJob(handle, { base_sha });
-          updateJob(handle, { branch });
+          updateJob(handle, { branch, preexisting_paths });
         } else {
           const [createdWt, , base_sha] = await Promise.all([
             addWorktreeAsync(dir, handle),

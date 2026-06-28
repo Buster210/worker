@@ -13,6 +13,8 @@ export type FileConfig = {
   rc?: string,
   loginShell?: boolean;
   cpuQos?: string;
+  gpgMode?: string;
+  gpgKeygrip?: string;
 };
 
 const stringArrayCoerce = z
@@ -30,6 +32,8 @@ const FileConfigSchema = z.object({
   rc: z.string().optional(),
   loginShell: z.boolean().optional(),
   cpuQos: z.string().optional(),
+  gpgMode: z.string().optional(),
+  gpgKeygrip: z.string().optional(),
 });
 
 function loadFileConfig(pathOverride?: string): FileConfig {

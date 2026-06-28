@@ -236,6 +236,9 @@ export type Job = {
   created_at?: number;
   branch?: string;
   spec_file?: string;
+  // Paths already dirty/untracked when an in-place worker launched — excluded from
+  // its commit so it stages only what it changed, not the user's pre-existing work.
+  preexisting_paths?: string[];
 };
 
 export function insertJob(j: {
