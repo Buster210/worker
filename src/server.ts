@@ -514,6 +514,8 @@ if (import.meta.main) {
 
   const tracker = new SessionTracker();
   const IDLE_TTL_MS = 30 * 60_000;
+  // JSON-RPC tool calls are tiny (spec travels by filename); anything huge is abuse.
+  const MAX_BODY_BYTES = 4 * 1024 * 1024;
   let tick = 0;
   setInterval(() => {
     try {
@@ -579,9 +581,33 @@ if (import.meta.main) {
         return;
       }
 
+      // Reject oversized bodies on the declared length BEFORE reading — responding
+      // after a mid-body break never reaches the client on Bun's node:http.
+      const declaredLen = Number(req.headers["content-length"]);
+      if (Number.isFinite(declaredLen) && declaredLen > MAX_BODY_BYTES) {
+        res.writeHead(413, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            error: { code: -32000, message: "Request body too large" },
+            id: null,
+          }),
+        );
+        req.destroy();
+        return;
+      }
+
       // POST — pre-read body so we can route on the parsed JSON-RPC message.
+      // Streamed cap backstops chunked/lying clients: no clean 413 is possible
+      // mid-body (see above), so just bound memory and drop the connection.
       let body = "";
-      for await (const chunk of req) body += chunk;
+      for await (const chunk of req) {
+        body += chunk;
+        if (body.length > MAX_BODY_BYTES) {
+          req.destroy();
+          return;
+        }
+      }
 
       let parsed: unknown;
       try {
@@ -671,14 +697,16 @@ if (import.meta.main) {
         `Port ${port} occupied. Removing stale lockfile and retrying...`,
       );
       removeLock();
-      httpServer.listen(port);
+      httpServer.listen(port, "127.0.0.1");
     } else {
       console.error("HTTP server error:", err);
       process.exit(1);
     }
   });
 
-  httpServer.listen(port, () => {
+  // Loopback only — clients always dial 127.0.0.1 (see isDaemonAlive); a wildcard
+  // bind exposes worker spawning to the LAN.
+  httpServer.listen(port, "127.0.0.1", () => {
     const actualPort = (httpServer.address() as { port: number }).port;
     if (!acquireLock(process.pid, actualPort)) {
       console.error(
