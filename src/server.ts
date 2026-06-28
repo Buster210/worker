@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod/v4";
 import { randomUUID } from "crypto";
-import { existsSync, appendFileSync } from "fs";
+import { existsSync, appendFileSync, statSync, renameSync } from "fs";
 import http from "http";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import {
@@ -466,11 +466,24 @@ export function createWorkerServer(): McpServer {
   return s;
 }
 
+// One rotated generation: current log + <log>.1, ≤2MB each. Rotation happens on
+// a whole-entry boundary, so nothing is truncated mid-line; beyond ~4MB the
+// oldest entries age out instead of the file growing forever.
+const MAX_SERVER_LOG_BYTES = 2 * 1024 * 1024;
+
+function rotateIfHuge(logFile: string): void {
+  try {
+    if (statSync(logFile).size >= MAX_SERVER_LOG_BYTES)
+      renameSync(logFile, `${logFile}.1`);
+  } catch {}
+}
+
 function teeStderrToLog(): void {
   const logFile = join(workersDir(), "mcp-server.log");
   const orig = console.error.bind(console);
   console.error = (...args: unknown[]) => {
     orig(...args);
+    rotateIfHuge(logFile);
     const text = args
       .map((a) =>
         a instanceof Error
