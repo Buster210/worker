@@ -58,10 +58,10 @@ afterAll(() => {
 });
 
 describe("handleDoctor", () => {
-  it("names a backend that is not operational, hiding the rest", () => {
-    expect(handleDoctor({ backend: "definitely-not-a-real-backend-xyz" })).toBe(
-      "Not operational: definitely-not-a-real-backend-xyz",
-    );
+  it("names a backend that is not operational, hiding the rest", async () => {
+    expect(
+      await handleDoctor({ backend: "definitely-not-a-real-backend-xyz" }),
+    ).toBe("Not operational: definitely-not-a-real-backend-xyz");
   });
 });
 
@@ -195,7 +195,7 @@ describe("handleList", () => {
 });
 
 describe("handleDoctor — success path", () => {
-  it('reports "All workers operational." when a stub backend is on PATH', () => {
+  it('reports "All workers operational." when a stub backend is on PATH', async () => {
     const stubDir = mkdtempSync(
       join(tmpdir(), `wserver-stub-${process.pid}-${seq++}`),
     );
@@ -204,7 +204,7 @@ describe("handleDoctor — success path", () => {
     const savedPath = workerEnv().PATH;
     workerEnv().PATH = `${stubDir}:${savedPath}`;
     try {
-      expect(handleDoctor({ backend: "test-be" })).toBe(
+      expect(await handleDoctor({ backend: "test-be" })).toBe(
         "All workers operational.",
       );
     } finally {

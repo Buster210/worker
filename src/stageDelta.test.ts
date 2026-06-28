@@ -9,7 +9,7 @@ function git(cwd: string, ...args: string[]): void {
   execFileSync("git", args, { cwd, stdio: "pipe" });
 }
 
-test("dirtyPaths lists untracked + modified, skips rename origin", () => {
+test("dirtyPaths lists untracked + modified, skips rename origin", async () => {
   const d = mkdtempSync(join(tmpdir(), "wt-"));
   try {
     git(d, "init", "-q");
@@ -25,7 +25,7 @@ test("dirtyPaths lists untracked + modified, skips rename origin", () => {
     writeFileSync(join(d, "fresh.txt"), "new\n"); // untracked
     git(d, "mv", "old.txt", "new.txt"); // rename
 
-    const paths = dirtyPaths(d);
+    const paths = await dirtyPaths(d);
     expect(paths).toContain("tracked.txt");
     expect(paths).toContain("fresh.txt");
     expect(paths).toContain("new.txt");

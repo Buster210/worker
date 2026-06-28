@@ -1,4 +1,4 @@
-import { spawn, spawnSync } from "child_process";
+import { spawn } from "child_process";
 import {
   openSync,
   closeSync,
@@ -20,7 +20,7 @@ import {
 } from "./state.ts";
 import { emitsJsonLog, QUIET_BACKENDS, type Backend } from "./backends.ts";
 import { readSentinel } from "./logParse.ts";
-import { killProcessTree } from "./process.ts";
+import { killProcessTree, spawnAsync } from "./process.ts";
 import { FILE_CONFIG } from "./config.ts";
 
 import {
@@ -198,7 +198,7 @@ export async function runWorker(
     status = "stalled";
   } else {
     const natural = resolveStatus(backend, rc, logPath, timedOut);
-    const gated = maybeVerifyAndCommit(handle, repo, natural);
+    const gated = await maybeVerifyAndCommit(handle, repo, natural);
     status = finalizeJob(handle, gated, { resume_token: resumeToken });
     if (status === "done") archiveSpec(handle);
   }
@@ -343,10 +343,9 @@ function ensureLoopbackWrapper(): string {
   return path;
 }
 
-function presetBinPath(): string | null {
-  const r = spawnSync("gpgconf", ["--list-dirs", "libexecdir"], {
-    encoding: "utf8",
-    timeout: 10_000,
+async function presetBinPath(): Promise<string | null> {
+  const r = await spawnAsync("gpgconf", ["--list-dirs", "libexecdir"], {
+    timeoutMs: 10_000,
   });
   if (r.status !== 0 || !r.stdout) return null;
   const path = join(r.stdout.trim(), "gpg-preset-passphrase");
@@ -354,11 +353,11 @@ function presetBinPath(): string | null {
 }
 
 // ponytail: a distinct signing subkey would need its own grp line; set WORKER_GPG_KEYGRIP for that.
-function discoverPrimaryKeygrip(worktree: string): string | null {
-  const idRes = spawnSync(
+async function discoverPrimaryKeygrip(worktree: string): Promise<string | null> {
+  const idRes = await spawnAsync(
     "git",
     ["-C", worktree, "config", "--get", "user.signingkey"],
-    { encoding: "utf8", timeout: 10_000 },
+    { timeoutMs: 10_000 },
   );
   const keyId = idRes.status === 0 ? idRes.stdout.trim() : "";
   const args = [
@@ -368,7 +367,7 @@ function discoverPrimaryKeygrip(worktree: string): string | null {
     "--list-secret-keys",
   ];
   if (keyId) args.push(keyId);
-  const r = spawnSync("gpg", args, { encoding: "utf8", timeout: 10_000 });
+  const r = await spawnAsync("gpg", args, { timeoutMs: 10_000 });
   if (r.status !== 0 || !r.stdout) return null;
   for (const line of r.stdout.split("\n")) {
     if (line.startsWith("grp:")) return line.split(":")[9] || null;
@@ -376,20 +375,19 @@ function discoverPrimaryKeygrip(worktree: string): string | null {
   return null;
 }
 
-function presetAgentPassphrase(worktree: string): string | null {
+async function presetAgentPassphrase(worktree: string): Promise<string | null> {
   const passphrase = process.env.WORKER_GPG_PASSPHRASE;
   if (!passphrase) return "WORKER_GPG_PASSPHRASE not set";
   const keygrip =
     process.env.WORKER_GPG_KEYGRIP ??
     FILE_CONFIG.gpgKeygrip ??
-    discoverPrimaryKeygrip(worktree);
+    (await discoverPrimaryKeygrip(worktree));
   if (!keygrip) return "could not resolve keygrip (set WORKER_GPG_KEYGRIP)";
-  const preset = presetBinPath();
+  const preset = await presetBinPath();
   if (!preset) return "gpg-preset-passphrase not found (is gnupg installed?)";
-  const r = spawnSync(preset, ["--preset", keygrip], {
+  const r = await spawnAsync(preset, ["--preset", keygrip], {
     input: passphrase,
-    encoding: "utf8",
-    timeout: 15_000,
+    timeoutMs: 15_000,
   });
   if (r.error) return r.error.message;
   if (r.status !== 0)
@@ -400,11 +398,11 @@ function presetAgentPassphrase(worktree: string): string | null {
   return null;
 }
 
-export function dirtyPaths(worktree: string): string[] {
-  const r = spawnSync(
+export async function dirtyPaths(worktree: string): Promise<string[]> {
+  const r = await spawnAsync(
     "git",
     ["-C", worktree, "status", "--porcelain=v1", "-z", "--untracked-files=all"],
-    { encoding: "utf8", timeout: 30_000 },
+    { timeoutMs: 30_000 },
   );
   if (r.status !== 0 || !r.stdout) return [];
   const parts = r.stdout.split("\0");
@@ -426,10 +424,10 @@ function isCodegraph(path: string): boolean {
   return path === ".codegraph" || path.startsWith(".codegraph/");
 }
 
-function stageWorktree(
+async function stageWorktree(
   worktree: string,
   handle: string,
-): "ok" | "failed:commit" {
+): Promise<"ok" | "failed:commit"> {
   const job = getJob(handle);
   // In-place workers share the user's real tree, so `git add -A` would sweep up
   // pre-existing dirt. Stage only paths that appeared since launch. Isolated
@@ -439,7 +437,7 @@ function stageWorktree(
   let addArgs: string[];
   if (inPlace) {
     const preexisting = new Set(job?.preexisting_paths ?? []);
-    const fresh = dirtyPaths(worktree).filter(
+    const fresh = (await dirtyPaths(worktree)).filter(
       (p) => !isCodegraph(p) && !preexisting.has(p),
     );
     if (fresh.length === 0) return "ok";
@@ -452,7 +450,7 @@ function stageWorktree(
     addArgs = ["-C", worktree, "add", "-A"];
   }
 
-  const add = spawnSync("git", addArgs, { encoding: "utf8", timeout: 30_000 });
+  const add = await spawnAsync("git", addArgs, { timeoutMs: 30_000 });
   if (add.error) {
     console.error(
       `[commit] git add failed for ${handle}: ${add.error.message}`,
@@ -466,19 +464,20 @@ function stageWorktree(
     return "failed:commit";
   }
   if (!inPlace) {
-    spawnSync("git", ["-C", worktree, "reset", "-q", "--", ".codegraph"], {
-      encoding: "utf8",
-      timeout: 30_000,
+    await spawnAsync("git", ["-C", worktree, "reset", "-q", "--", ".codegraph"], {
+      timeoutMs: 30_000,
     });
   }
   return "ok";
 }
 
-function hasStagedChanges(worktree: string): "yes" | "no" | "failed:commit" {
-  const diff = spawnSync(
+async function hasStagedChanges(
+  worktree: string,
+): Promise<"yes" | "no" | "failed:commit"> {
+  const diff = await spawnAsync(
     "git",
     ["-C", worktree, "diff", "--cached", "--quiet"],
-    { encoding: "utf8", timeout: 30_000 },
+    { timeoutMs: 30_000 },
   );
   if (diff.error) {
     console.error(
@@ -489,13 +488,13 @@ function hasStagedChanges(worktree: string): "yes" | "no" | "failed:commit" {
   return diff.status === 0 ? "no" : "yes";
 }
 
-function commitWork(
+async function commitWork(
   worktree: string,
   handle: string,
-): "done" | "failed:commit" | "failed:no-changes" {
-  const staged = stageWorktree(worktree, handle);
+): Promise<"done" | "failed:commit" | "failed:no-changes"> {
+  const staged = await stageWorktree(worktree, handle);
   if (staged !== "ok") return staged;
-  const stagedChanges = hasStagedChanges(worktree);
+  const stagedChanges = await hasStagedChanges(worktree);
   if (stagedChanges === "failed:commit") return "failed:commit";
   if (stagedChanges === "no") return "failed:no-changes";
 
@@ -504,7 +503,7 @@ function commitWork(
   if (mode === "loopback") {
     args.push("-c", `gpg.program=${ensureLoopbackWrapper()}`);
   } else if (mode === "agent") {
-    const err = presetAgentPassphrase(worktree);
+    const err = await presetAgentPassphrase(worktree);
     if (err) {
       console.error(`[commit] gpg agent preset failed for ${handle}: ${err}`);
       return "failed:commit";
@@ -512,7 +511,7 @@ function commitWork(
   }
   args.push("commit", "-m", commitMessage(handle));
 
-  const commit = spawnSync("git", args, { encoding: "utf8", timeout: 60_000 });
+  const commit = await spawnAsync("git", args, { timeoutMs: 60_000 });
   if (commit.error) {
     console.error(
       `[commit] git commit failed for ${handle}: ${commit.error.message}`,
@@ -529,20 +528,20 @@ function commitWork(
   return "done";
 }
 
-export function maybeVerifyAndCommit(
+export async function maybeVerifyAndCommit(
   handle: string,
   worktree: string,
   natural: string,
-): string {
+): Promise<string> {
   if (natural !== "done") return natural;
 
   const cmd = process.env.WORKER_VERIFY_CMD ?? FILE_CONFIG.verifyCmd;
   if (cmd && cmd.length > 0) {
     const shell = process.env.SHELL ?? "/bin/zsh";
-    const result = spawnSync(shell, ["-c", cmd], {
+    const result = await spawnAsync(shell, ["-c", cmd], {
       cwd: worktree,
-      timeout: 120_000,
-      stdio: "ignore",
+      timeoutMs: 120_000,
+      discardOutput: true,
     });
     if (result.status !== 0 || result.error) {
       console.error(

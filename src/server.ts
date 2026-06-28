@@ -3,7 +3,6 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod/v4";
 import { randomUUID } from "crypto";
-import { spawnSync } from "child_process";
 import { existsSync, appendFileSync } from "fs";
 import http from "http";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
@@ -24,7 +23,7 @@ import { LADDER, ALL_BACKENDS, type Backend } from "./backends.ts";
 import { backendShellArgv } from "./runner.ts";
 import { workerEnv } from "./env.ts";
 import { resolveStatus } from "./runner.ts";
-import { isProcessAlive } from "./process.ts";
+import { isProcessAlive, spawnAsync } from "./process.ts";
 import {
   sweepStaleJobs,
   reapStoppedJobs,
@@ -168,17 +167,22 @@ export function handleStatus(args: {
   return { status: job.status, alive, started: job.started };
 }
 
-export function handleDoctor(args: { backend?: string }): string {
+export async function handleDoctor(args: {
+  backend?: string;
+}): Promise<string> {
   const backends = args.backend ? [args.backend] : [...ALL_BACKENDS];
-  const down = backends.filter((be) => {
-    const [cmd, ...probeArgs] = backendShellArgv([be, "--version"]);
-    const r = spawnSync(cmd, probeArgs, {
-      stdio: "ignore",
-      env: workerEnv(),
-      timeout: 10_000,
-    });
-    return r.status !== 0 || r.error != null;
-  });
+  const probes = await Promise.all(
+    backends.map(async (be) => {
+      const [cmd, ...probeArgs] = backendShellArgv([be, "--version"]);
+      const r = await spawnAsync(cmd, probeArgs, {
+        env: workerEnv(),
+        timeoutMs: 10_000,
+        discardOutput: true,
+      });
+      return { be, down: r.status !== 0 || r.error != null };
+    }),
+  );
+  const down = probes.filter((p) => p.down).map((p) => p.be);
   return down.length === 0
     ? "All workers operational."
     : `Not operational: ${down.join(", ")}`;
@@ -430,7 +434,7 @@ export function createWorkerServer(): McpServer {
       description: "Health check: names broken workers, else all-fine.",
       inputSchema: { backend: z.string().optional() },
     },
-    async (args) => reply(handleDoctor(args)),
+    async (args) => reply(await handleDoctor(args)),
   );
 
   s.registerTool(

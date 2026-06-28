@@ -1,4 +1,69 @@
-import { spawnSync } from "child_process";
+import { spawn, spawnSync } from "child_process";
+
+// spawnSync-shaped async runner for the daemon's hot paths — a spawnSync there
+// blocks the event loop (MCP requests, sibling workers' watchdogs) for the whole
+// child lifetime. discardOutput avoids buffering chatty children (verify gates).
+export function spawnAsync(
+  cmd: string,
+  args: string[],
+  opts: {
+    cwd?: string;
+    env?: NodeJS.ProcessEnv;
+    timeoutMs?: number;
+    input?: string;
+    discardOutput?: boolean;
+  } = {},
+): Promise<{ status: number | null; stdout: string; stderr: string; error?: Error }> {
+  return new Promise((resolve) => {
+    const io = opts.discardOutput ? "ignore" : "pipe";
+    let proc: ReturnType<typeof spawn>;
+    try {
+      proc = spawn(cmd, args, {
+        cwd: opts.cwd,
+        env: opts.env,
+        stdio: [opts.input != null ? "pipe" : "ignore", io, io],
+      });
+    } catch (e) {
+      resolve({ status: null, stdout: "", stderr: "", error: e as Error });
+      return;
+    }
+    const out: Buffer[] = [];
+    const err: Buffer[] = [];
+    let error: Error | undefined;
+    let settled = false;
+    proc.stdout?.on("data", (d: Buffer) => out.push(d));
+    proc.stderr?.on("data", (d: Buffer) => err.push(d));
+    if (opts.input != null) {
+      proc.stdin?.on("error", () => {});
+      proc.stdin?.write(opts.input);
+      proc.stdin?.end();
+    }
+    const killer = opts.timeoutMs
+      ? setTimeout(() => {
+          error ??= new Error(`timed out after ${opts.timeoutMs}ms`);
+          try {
+            proc.kill("SIGTERM");
+          } catch {}
+        }, opts.timeoutMs)
+      : undefined;
+    const finish = (status: number | null) => {
+      if (settled) return;
+      settled = true;
+      if (killer) clearTimeout(killer);
+      resolve({
+        status,
+        stdout: Buffer.concat(out).toString("utf8"),
+        stderr: Buffer.concat(err).toString("utf8"),
+        error,
+      });
+    };
+    proc.on("error", (e) => {
+      error = e;
+      finish(null);
+    });
+    proc.on("close", (code) => finish(code));
+  });
+}
 
 function buildChildMap(): Map<number, number[]> | null {
   const psResult = spawnSync("ps", ["-axo", "pid=,ppid="], {

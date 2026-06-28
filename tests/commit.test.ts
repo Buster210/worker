@@ -92,41 +92,41 @@ function baseSha(dir: string = REPO): string {
 }
 
 describe("maybeVerifyAndCommit — pass-through on non-done", () => {
-  it('returns "failed" unchanged, makes no commit', () => {
+  it('returns "failed" unchanged, makes no commit', async () => {
     const handle = seedJob();
     const before = commitCount();
 
     writeFileSync(join(REPO, `dirty-${seq}.txt`), "x\n");
-    const result = maybeVerifyAndCommit(handle, REPO, "failed");
+    const result = await maybeVerifyAndCommit(handle, REPO, "failed");
     expect(result).toBe("failed");
     expect(commitCount()).toBe(before);
   });
 
-  it('returns "timeout" unchanged, makes no commit', () => {
+  it('returns "timeout" unchanged, makes no commit', async () => {
     const handle = seedJob();
     const before = commitCount();
     writeFileSync(join(REPO, `dirty-${seq}.txt`), "x\n");
-    const result = maybeVerifyAndCommit(handle, REPO, "timeout");
+    const result = await maybeVerifyAndCommit(handle, REPO, "timeout");
     expect(result).toBe("timeout");
     expect(commitCount()).toBe(before);
   });
 });
 
 describe("maybeVerifyAndCommit — commits on done", () => {
-  it('with a dirty tree: makes exactly ONE commit, returns "done", working tree is clean', () => {
+  it('with a dirty tree: makes exactly ONE commit, returns "done", working tree is clean', async () => {
     const handle = seedJob();
     const before = commitCount();
     writeFileSync(join(REPO, `change-${seq}.txt`), "hello\n");
-    const result = maybeVerifyAndCommit(handle, REPO, "done");
+    const result = await maybeVerifyAndCommit(handle, REPO, "done");
     expect(result).toBe("done");
     expect(commitCount()).toBe(before + 1);
     expect(isClean()).toBe(true);
   });
 
-  it('with nothing to commit (already clean): returns "failed:no-changes" and makes no commit', () => {
+  it('with nothing to commit (already clean): returns "failed:no-changes" and makes no commit', async () => {
     const before = commitCount();
     const handle = seedJob();
-    const result = maybeVerifyAndCommit(handle, REPO, "done");
+    const result = await maybeVerifyAndCommit(handle, REPO, "done");
     expect(result).toBe("failed:no-changes");
     expect(commitCount()).toBe(before);
   });
@@ -143,46 +143,46 @@ describe("maybeVerifyAndCommit — WORKER_VERIFY_CMD gate", () => {
     else process.env.WORKER_VERIFY_CMD = origVerifyCmd;
   });
 
-  it('WORKER_VERIFY_CMD="exit 1" on done → returns "failed:verify", NO commit', () => {
+  it('WORKER_VERIFY_CMD="exit 1" on done → returns "failed:verify", NO commit', async () => {
     process.env.WORKER_VERIFY_CMD = "exit 1";
     const handle = seedJob();
     const before = commitCount();
     writeFileSync(join(REPO, `verify-fail-${seq}.txt`), "x\n");
-    const result = maybeVerifyAndCommit(handle, REPO, "done");
+    const result = await maybeVerifyAndCommit(handle, REPO, "done");
     expect(result).toBe("failed:verify");
     expect(commitCount()).toBe(before);
   });
 
-  it('WORKER_VERIFY_CMD="true" on done → commits, returns "done"', () => {
+  it('WORKER_VERIFY_CMD="true" on done → commits, returns "done"', async () => {
     process.env.WORKER_VERIFY_CMD = "true";
     const handle = seedJob();
     const before = commitCount();
     writeFileSync(join(REPO, `verify-pass-${seq}.txt`), "y\n");
-    const result = maybeVerifyAndCommit(handle, REPO, "done");
+    const result = await maybeVerifyAndCommit(handle, REPO, "done");
     expect(result).toBe("done");
     expect(commitCount()).toBe(before + 1);
   });
 
-  it('unset WORKER_VERIFY_CMD on done → skips verify, commits, returns "done"', () => {
+  it('unset WORKER_VERIFY_CMD on done → skips verify, commits, returns "done"', async () => {
     delete process.env.WORKER_VERIFY_CMD;
     const handle = seedJob();
     const before = commitCount();
     writeFileSync(join(REPO, `verify-unset-${seq}.txt`), "z\n");
-    const result = maybeVerifyAndCommit(handle, REPO, "done");
+    const result = await maybeVerifyAndCommit(handle, REPO, "done");
     expect(result).toBe("done");
     expect(commitCount()).toBe(before + 1);
   });
 });
 
 describe("maybeVerifyAndCommit — excludes .codegraph", () => {
-  it("does not commit the .codegraph symlink when real changes exist", () => {
+  it("does not commit the .codegraph symlink when real changes exist", async () => {
     const handle = seedJob("codegraph exclusion test");
     const before = commitCount();
     const fileName = `codegraph-${seq}.txt`;
     writeFileSync(join(REPO, fileName), "real change\n");
     symlinkSync(REPO, join(REPO, ".codegraph"));
 
-    const result = maybeVerifyAndCommit(handle, REPO, "done");
+    const result = await maybeVerifyAndCommit(handle, REPO, "done");
     expect(result).toBe("done");
     expect(commitCount()).toBe(before + 1);
 
@@ -197,7 +197,7 @@ describe("maybeVerifyAndCommit — excludes .codegraph", () => {
     unlinkSync(join(REPO, ".codegraph"));
   });
 
-  it("commits when .codegraph is ignored and present (worktree add regression)", () => {
+  it("commits when .codegraph is ignored and present (worktree add regression)", async () => {
     const handle = seedJob("codegraph ignored test");
     const before = commitCount();
     const fileName = `codegraph-ignored-${seq}.txt`;
@@ -208,7 +208,7 @@ describe("maybeVerifyAndCommit — excludes .codegraph", () => {
     writeFileSync(join(REPO, ".git/info/exclude"), ".codegraph\n");
     symlinkSync(REPO, join(REPO, ".codegraph"));
 
-    const result = maybeVerifyAndCommit(handle, REPO, "done");
+    const result = await maybeVerifyAndCommit(handle, REPO, "done");
     expect(result).toBe("done");
     expect(commitCount()).toBe(before + 1);
 
@@ -226,13 +226,13 @@ describe("maybeVerifyAndCommit — excludes .codegraph", () => {
 });
 
 describe("base-ref diff — committed work still surfaces", () => {
-  it("plain git diff is empty after commit but base-ref diff shows the change", () => {
+  it("plain git diff is empty after commit but base-ref diff shows the change", async () => {
     const base = baseSha();
     const handle = seedJob("base-ref test");
 
     const fileName = `base-ref-${seq}.txt`;
     writeFileSync(join(REPO, fileName), "committed content\n");
-    const result = maybeVerifyAndCommit(handle, REPO, "done");
+    const result = await maybeVerifyAndCommit(handle, REPO, "done");
     expect(result).toBe("done");
     expect(isClean()).toBe(true);
 
@@ -248,7 +248,7 @@ describe("base-ref diff — committed work still surfaces", () => {
     expect(baseDiff.stdout).toContain("committed content");
   });
 
-  it("renderReport with base_sha on a done job passes base_sha to the diff fn", () => {
+  it("renderReport with base_sha on a done job passes base_sha to the diff fn", async () => {
     const base = baseSha();
 
     const handle = `commit-render-${process.pid}-${seq++}`;
@@ -278,7 +278,7 @@ describe("base-ref diff — committed work still surfaces", () => {
 });
 
 describe("integration — wired completion sequence commits on a real worktree", () => {
-  it("resolveStatus done → maybeVerifyAndCommit → finalizeJob lands one commit, base-ref diff shows it", () => {
+  it("resolveStatus done → maybeVerifyAndCommit → finalizeJob lands one commit, base-ref diff shows it", async () => {
     const WT = realpathSync(mkdtempSync(join(tmpdir(), "wcommit-wt-")));
     tmpDirs.push(WT);
     const g = (...a: string[]) =>
@@ -313,7 +313,7 @@ describe("integration — wired completion sequence commits on a real worktree",
 
     const natural = resolveStatus("cmd", 0, emptyLog, false);
     expect(natural).toBe("done");
-    const gated = maybeVerifyAndCommit(handle, WT, natural);
+    const gated = await maybeVerifyAndCommit(handle, WT, natural);
     const status = finalizeJob(handle, gated, { resume_token: "" });
 
     expect(status).toBe("done");

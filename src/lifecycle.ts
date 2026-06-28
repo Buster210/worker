@@ -233,7 +233,7 @@ export function launch(
         } else if (inPlace) {
           // Snapshot the user's pre-existing dirt before the worker touches anything,
           // so the commit stages only what the worker adds (not stray untracked files).
-          const preexisting_paths = dirtyPaths(dir);
+          const preexisting_paths = await dirtyPaths(dir);
           const [, base_sha, branch] = await Promise.all([
             loginShellEnvAsync(),
             gitRevParse(dir, "HEAD"),
