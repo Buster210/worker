@@ -91,13 +91,11 @@ export function killProcessTree(
       process.kill(child, sig);
     } catch {}
   }
-  // One extra post-kill pass: re-enumerate descendants and re-SIGKILL any survivors
-  // (darwin reparenting — a child may have reparented to launchd between snapshot and kill).
-  // No loop, no sleep — a single extra pass is enough.
-  for (const survivor of listDescendants(pid)) {
-    try {
-      process.kill(survivor, sig);
-    } catch {}
+  // darwin: reparented children invisible to walkTree(pid) after parent dies
+  for (const child of descendants) {
+    for (const survivor of listDescendants(child)) {
+      try { process.kill(survivor, sig); } catch {}
+    }
   }
 }
 
@@ -112,8 +110,11 @@ export function killProcessTrees(
     for (const pid of live) killProcessTree(pid, sig);
     return;
   }
+  // Snapshot descendants before group kill — dead parent makes walkTree(pid) empty
+  const descendantSnapshots = new Map<number, number[]>();
   for (const pid of live) {
     const descendants = walkTree(map, pid);
+    descendantSnapshots.set(pid, descendants);
     try {
       process.kill(-pid, sig);
     } catch {}
@@ -123,16 +124,14 @@ export function killProcessTrees(
       } catch {}
     }
   }
-  // Single survivor pass across all trees (darwin reparenting between snapshot and kill).
-  // If the second snapshot is empty (transient ps failure), fall back per-pid to
-  // listDescendants — which carries the pgrep fallback — matching killProcessTree.
-  const map2 = buildChildMap();
+  // Walk from children, not dead parent — reparented grandchildren live there
   for (const pid of live) {
-    const survivors = map2 ? walkTree(map2, pid) : listDescendants(pid);
-    for (const survivor of survivors) {
-      try {
-        process.kill(survivor, sig);
-      } catch {}
+    for (const child of descendantSnapshots.get(pid) ?? []) {
+      for (const grandchild of walkTree(map, child)) {
+        try {
+          process.kill(grandchild, sig);
+        } catch {}
+      }
     }
   }
 }

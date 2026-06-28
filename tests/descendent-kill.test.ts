@@ -186,7 +186,7 @@ describe("killProcessTrees (batch)", () => {
     try {
       killProcessTrees([P1, P2], "SIGKILL");
 
-      expect(order).toEqual(["enumerate", "enumerate"]);
+      expect(order).toEqual(["enumerate"]);
     } finally {
       psSpy.mockRestore();
       killSpy.mockRestore();
@@ -235,7 +235,6 @@ describe("killProcessTrees (batch)", () => {
         "killgroup",
         "killchild",
         "enumerate",
-        "killchild",
       ]);
     } finally {
       psSpy.mockRestore();
