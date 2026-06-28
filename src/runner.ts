@@ -445,7 +445,11 @@ function stageWorktree(
     if (fresh.length === 0) return "ok";
     addArgs = ["-C", worktree, "add", "--", ...fresh];
   } else {
-    addArgs = ["-C", worktree, "add", "-A", "--", ":!.codegraph"];
+    // A `:!.codegraph` exclude pathspec makes `git add` exit 1 whenever
+    // .codegraph exists and is ignored — git errors on an ignored path named by
+    // a pathspec. Stage everything (git silently skips ignored paths), then
+    // unstage .codegraph below to also drop it in the untracked-not-ignored case.
+    addArgs = ["-C", worktree, "add", "-A"];
   }
 
   const add = spawnSync("git", addArgs, { encoding: "utf8", timeout: 30_000 });
@@ -460,6 +464,12 @@ function stageWorktree(
       `[commit] git add failed for ${handle}: ${add.stderr?.trim() ?? ""}`,
     );
     return "failed:commit";
+  }
+  if (!inPlace) {
+    spawnSync("git", ["-C", worktree, "reset", "-q", "--", ".codegraph"], {
+      encoding: "utf8",
+      timeout: 30_000,
+    });
   }
   return "ok";
 }

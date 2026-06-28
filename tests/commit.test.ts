@@ -196,6 +196,33 @@ describe("maybeVerifyAndCommit — excludes .codegraph", () => {
 
     unlinkSync(join(REPO, ".codegraph"));
   });
+
+  it("commits when .codegraph is ignored and present (worktree add regression)", () => {
+    const handle = seedJob("codegraph ignored test");
+    const before = commitCount();
+    const fileName = `codegraph-ignored-${seq}.txt`;
+    writeFileSync(join(REPO, fileName), "real change\n");
+    // Production ignores .codegraph via .git/info/exclude; the old
+    // `git add -A -- ':!.codegraph'` exited 1 on an ignored path named by a
+    // pathspec, failing every commit whenever .codegraph existed.
+    writeFileSync(join(REPO, ".git/info/exclude"), ".codegraph\n");
+    symlinkSync(REPO, join(REPO, ".codegraph"));
+
+    const result = maybeVerifyAndCommit(handle, REPO, "done");
+    expect(result).toBe("done");
+    expect(commitCount()).toBe(before + 1);
+
+    const show = spawnSync(
+      "git",
+      ["-C", REPO, "show", "--pretty=format:", "--name-only", "HEAD"],
+      { encoding: "utf8" },
+    );
+    expect(show.stdout).toContain(fileName);
+    expect(show.stdout).not.toContain(".codegraph");
+
+    unlinkSync(join(REPO, ".codegraph"));
+    writeFileSync(join(REPO, ".git/info/exclude"), "");
+  });
 });
 
 describe("base-ref diff — committed work still surfaces", () => {
