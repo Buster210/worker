@@ -1,12 +1,20 @@
-import { spawn, spawnSync } from 'child_process';
-import { openSync, closeSync, writeSync, statSync } from 'fs';
-import { updateJob, getJob, finalizeJob, archiveSpec } from './state.ts';
-import { emitsJsonLog, QUIET_BACKENDS, type Backend } from './backends.ts';
-import { readSentinel } from './logParse.ts';
-import { killProcessTree } from './process.ts';
-import { FILE_CONFIG } from './config.ts';
+import { spawn, spawnSync } from "child_process";
+import { openSync, closeSync, writeSync, statSync } from "fs";
+import { updateJob, getJob, finalizeJob, archiveSpec } from "./state.ts";
+import { emitsJsonLog, QUIET_BACKENDS, type Backend } from "./backends.ts";
+import { readSentinel } from "./logParse.ts";
+import { killProcessTree } from "./process.ts";
+import { FILE_CONFIG } from "./config.ts";
 
-import { defaultTimeoutMs, workerEnv, watchdogMs, stallTimeoutMs, quietStallMs, graceMs, cpuThrottleArgv } from './env.ts';
+import {
+  defaultTimeoutMs,
+  workerEnv,
+  watchdogMs,
+  stallTimeoutMs,
+  quietStallMs,
+  graceMs,
+  cpuThrottleArgv,
+} from "./env.ts";
 
 export type RunResult = {
   status: string;
@@ -17,19 +25,30 @@ export type RunResult = {
   repo: string;
   log: string;
 };
-function markStallOutcome(handle: string, pid: number, logPath: string, backend: string): boolean {
-  killProcessTree(pid, 'SIGKILL');
+function markStallOutcome(
+  handle: string,
+  pid: number,
+  logPath: string,
+  backend: string,
+): boolean {
+  killProcessTree(pid, "SIGKILL");
   const { status } = readSentinel(logPath, emitsJsonLog(backend));
-  if (status !== null && status.startsWith('failed')) {
+  if (status !== null && status.startsWith("failed")) {
     return false;
   }
-  finalizeJob(handle, 'stalled');
+  finalizeJob(handle, "stalled");
   return true;
 }
 
 export function backendShellArgv(argv: string[]): string[] {
-  const shell = process.env.SHELL ?? '/bin/zsh';
-  return [...cpuThrottleArgv(), shell, '-c', '[ -n "$WORKER_RC" ] && [ -f "$WORKER_RC" ] && . "$WORKER_RC"; "$0" "$@"', ...argv];
+  const shell = process.env.SHELL ?? "/bin/zsh";
+  return [
+    ...cpuThrottleArgv(),
+    shell,
+    "-c",
+    '[ -n "$WORKER_RC" ] && [ -f "$WORKER_RC" ] && . "$WORKER_RC"; "$0" "$@"',
+    ...argv,
+  ];
 }
 
 function launchAndWait(
@@ -42,20 +61,25 @@ function launchAndWait(
   deadlineAt?: number,
 ): Promise<{ rc: number; timedOut: boolean; stalled: boolean }> {
   return new Promise((resolve) => {
-    const logFd = openSync(logPath, 'a');
+    const logFd = openSync(logPath, "a");
     const [cmd, ...args] = backendShellArgv(argv);
     const proc = spawn(cmd, args, {
       cwd: repo,
       env: workerEnv(),
-      stdio: ['ignore', logFd, logFd],
+      stdio: ["ignore", logFd, logFd],
       detached: true,
     });
     const startMs = Date.now();
-    const deadline = deadlineAt ?? (startMs + (timeoutMs ?? defaultTimeoutMs()));
+    const deadline = deadlineAt ?? startMs + (timeoutMs ?? defaultTimeoutMs());
 
     if (proc.pid) {
-      try { updateJob(handle, { worker_pid: proc.pid, deadline_at: deadline }); } catch (err) {
-        console.error('[worker] failed to update job with PID:', err instanceof Error ? err.message : err);
+      try {
+        updateJob(handle, { worker_pid: proc.pid, deadline_at: deadline });
+      } catch (err) {
+        console.error(
+          "[worker] failed to update job with PID:",
+          err instanceof Error ? err.message : err,
+        );
       }
     }
 
@@ -71,8 +95,12 @@ function launchAndWait(
       if (settled) return;
       settled = true;
       clearInterval(watchdog);
-      try { mon.dispose(); } catch {}
-      try { closeSync(logFd); } catch {}
+      try {
+        mon.dispose();
+      } catch {}
+      try {
+        closeSync(logFd);
+      } catch {}
       resolve({ rc: code, timedOut: timed, stalled: stalledJob });
     };
 
@@ -83,13 +111,10 @@ function launchAndWait(
       finish(124, false, stalled);
     };
 
-    // Hard backstop: if the deadline passes and nobody calls worker_extend within the
-    // grace window, terminal-kill (no freeze, no resume). deadline_at is read fresh so
-    // worker_extend pushes this out at runtime.
     const killAtGrace = () => {
       if (settled || exiting) return;
       exiting = true;
-      killProcessTree(proc.pid!, 'SIGKILL');
+      killProcessTree(proc.pid!, "SIGKILL");
       finish(124, true, false);
     };
 
@@ -97,26 +122,36 @@ function launchAndWait(
       if (settled || exiting) return;
       const now = Date.now();
       const deadline = getJob(handle)?.deadline_at;
-      if (deadline && now >= deadline + graceMs()) { killAtGrace(); return; }
+      if (deadline && now >= deadline + graceMs()) {
+        killAtGrace();
+        return;
+      }
 
-      if (mon.sig !== lastSig) { lastSig = mon.sig; lastActivityAt = mon.at; }
-      else if (now - lastActivityAt >= (QUIET_BACKENDS.has(backend) ? quietStallMs() : stallTimeoutMs())) {
+      if (mon.sig !== lastSig) {
+        lastSig = mon.sig;
+        lastActivityAt = mon.at;
+      } else if (
+        now - lastActivityAt >=
+        (QUIET_BACKENDS.has(backend) ? quietStallMs() : stallTimeoutMs())
+      ) {
         killOnStallAndFinish();
         return;
       }
     }, watchdogMs());
     watchdog.unref?.();
 
-    proc.on('exit', (code, signal) => {
+    proc.on("exit", (code, signal) => {
       exiting = true;
       rc = code ?? (signal ? 1 : 0);
       finish(rc, false, false);
     });
 
-    proc.on('error', (err) => {
+    proc.on("error", (err) => {
       const msg = `spawn error: ${err.message}`;
-      console.error('[worker] backend spawn failed:', msg);
-      try { writeSync(logFd, `\n${msg}\n`); } catch {}
+      console.error("[worker] backend spawn failed:", msg);
+      try {
+        writeSync(logFd, `\n${msg}\n`);
+      } catch {}
       finish(1, false, false);
     });
   });
@@ -132,32 +167,49 @@ export async function runWorker(
   timeoutMs?: number,
   deadlineAt?: number,
 ): Promise<RunResult> {
-  const { rc, timedOut, stalled } = await launchAndWait(argv, repo, handle, backend, logPath, timeoutMs, deadlineAt);
+  const { rc, timedOut, stalled } = await launchAndWait(
+    argv,
+    repo,
+    handle,
+    backend,
+    logPath,
+    timeoutMs,
+    deadlineAt,
+  );
   let status: string;
   if (stalled) {
-    status = 'stalled';
+    status = "stalled";
   } else {
     const natural = resolveStatus(backend, rc, logPath, timedOut);
     const gated = maybeVerifyAndCommit(handle, repo, natural);
     status = finalizeJob(handle, gated, { resume_token: resumeToken });
-    if (status === 'done') archiveSpec(handle);
+    if (status === "done") archiveSpec(handle);
   }
   return {
-    status, exit_code: rc, backend, handle,
-    resume_token: resumeToken, repo,
+    status,
+    exit_code: rc,
+    backend,
+    handle,
+    resume_token: resumeToken,
+    repo,
     log: logPath,
   };
 }
 
-// Shared status resolver — used by both runner.ts (live job finalization) and
-// maintenance.ts (orphan sweep's dead-worker branch).
-export function resolveStatus(backend: string, rc: number, logPath: string, timedOut: boolean): string {
-  if (timedOut) return 'timeout';
+export function resolveStatus(
+  backend: string,
+  rc: number,
+  logPath: string,
+  timedOut: boolean,
+): string {
+  if (timedOut) return "timeout";
   const { status } = readSentinel(logPath, emitsJsonLog(backend));
   if (status) return status;
-  if (backend === 'cmd') return rc === 0 ? 'done' : rc === 8 ? 'failed:max-turns' : 'failed';
-  if (backend === 'pool') return rc === 0 ? 'done' : rc === 4 ? 'failed:task' : 'failed';
-  return rc === 0 ? 'done' : 'failed';
+  if (backend === "cmd")
+    return rc === 0 ? "done" : rc === 8 ? "failed:max-turns" : "failed";
+  if (backend === "pool")
+    return rc === 0 ? "done" : rc === 4 ? "failed:task" : "failed";
+  return rc === 0 ? "done" : "failed";
 }
 
 type ActivityMonitor = {
@@ -172,23 +224,18 @@ type ActivityMonitor = {
 const _activityMonitors = new Map<string, ActivityMonitor>();
 
 function readLogStat(logPath: string): string {
-  try { const st = statSync(logPath); return `${st.mtimeMs}:${st.size}`; } catch { return ''; }
+  try {
+    const st = statSync(logPath);
+    return `${st.mtimeMs}:${st.size}`;
+  } catch {
+    return "";
+  }
 }
 
-// ponytail: poll-on-read, no fs.watch. The watchdog reads sig/at every WORKER_WATCHDOG_MS (5s),
-// each read runs poll() -> one statSync. fs.watch on the actively-appended worker log fired a
-// callback per write (Bun/macOS kqueue event storm -> a pegged core for the whole run) while the
-// watchdog never observes the sub-5s updates anyway. If a backend ever needs finer stall timing,
-// shrink WORKER_WATCHDOG_MS rather than re-adding a watcher.
-export function activitySig(repo: string, logPath: string, lastLog: string): { sig: string; log: string } {
-  const log = readLogStat(logPath);
-  if (log !== lastLog) return { sig: log, log };
-  const r = spawnSync('git', ['-C', repo, 'status', '--porcelain'], { encoding: 'utf8' });
-  const git = typeof r.stdout === 'string' ? r.stdout.trim() : '';
-  return { sig: `${log}\n${git}`, log };
-}
-
-export function startActivityMonitor(repo: string, logPath: string): ActivityMonitor {
+export function startActivityMonitor(
+  repo: string,
+  logPath: string,
+): ActivityMonitor {
   const key = `${repo}\0${logPath}`;
   let cachedLog = readLogStat(logPath);
   let cachedAt = Date.now();
@@ -197,12 +244,23 @@ export function startActivityMonitor(repo: string, logPath: string): ActivityMon
     if (Date.now() === lastPollAt) return;
     lastPollAt = Date.now();
     const fresh = readLogStat(logPath);
-    if (fresh && fresh !== cachedLog) { cachedLog = fresh; cachedAt = Date.now(); }
+    if (fresh && fresh !== cachedLog) {
+      cachedLog = fresh;
+      cachedAt = Date.now();
+    }
   };
   const mon: ActivityMonitor = {
-    get sig() { poll(); return cachedLog; },
-    get log() { return cachedLog; },
-    get at() { poll(); return cachedAt; },
+    get sig() {
+      poll();
+      return cachedLog;
+    },
+    get log() {
+      return cachedLog;
+    },
+    get at() {
+      poll();
+      return cachedAt;
+    },
     repo,
     logPath,
     dispose() {
@@ -214,67 +272,111 @@ export function startActivityMonitor(repo: string, logPath: string): ActivityMon
 }
 
 export function __resetActivityMonitors(): void {
-  for (const m of _activityMonitors.values()) { try { m.dispose(); } catch {} }
+  for (const m of _activityMonitors.values()) {
+    try {
+      m.dispose();
+    } catch {}
+  }
   _activityMonitors.clear();
 }
 
 function commitMessage(handle: string): string {
-  const task = getJob(handle)?.task ?? '';
-  const firstLine = task.split('\n')[0].trim();
-  return firstLine ? `worker: ${firstLine}`.slice(0, 72) : 'worker: automated change';
+  const task = getJob(handle)?.task ?? "";
+  const firstLine = task.split("\n")[0].trim();
+  return firstLine
+    ? `worker: ${firstLine}`.slice(0, 72)
+    : "worker: automated change";
 }
 
-function stageWorktree(worktree: string, handle: string): 'ok' | 'failed:commit' {
-  const add = spawnSync('git', ['-C', worktree, 'add', '-A', '--', ':!.codegraph'], { encoding: 'utf8', timeout: 30_000 });
+function stageWorktree(
+  worktree: string,
+  handle: string,
+): "ok" | "failed:commit" {
+  const add = spawnSync(
+    "git",
+    ["-C", worktree, "add", "-A", "--", ":!.codegraph"],
+    { encoding: "utf8", timeout: 30_000 },
+  );
   if (add.error) {
-    console.error(`[commit] git add failed for ${handle}: ${add.error.message}`);
-    return 'failed:commit';
+    console.error(
+      `[commit] git add failed for ${handle}: ${add.error.message}`,
+    );
+    return "failed:commit";
   }
   if (add.status !== 0) {
-    console.error(`[commit] git add failed for ${handle}: ${add.stderr?.trim() ?? ''}`);
-    return 'failed:commit';
+    console.error(
+      `[commit] git add failed for ${handle}: ${add.stderr?.trim() ?? ""}`,
+    );
+    return "failed:commit";
   }
-  return 'ok';
+  return "ok";
 }
 
-function hasStagedChanges(worktree: string): 'yes' | 'no' | 'failed:commit' {
-  const diff = spawnSync('git', ['-C', worktree, 'diff', '--cached', '--quiet'], { encoding: 'utf8', timeout: 30_000 });
+function hasStagedChanges(worktree: string): "yes" | "no" | "failed:commit" {
+  const diff = spawnSync(
+    "git",
+    ["-C", worktree, "diff", "--cached", "--quiet"],
+    { encoding: "utf8", timeout: 30_000 },
+  );
   if (diff.error) {
-    console.error(`[commit] git diff --cached --quiet failed: ${diff.error.message}`);
-    return 'failed:commit';
+    console.error(
+      `[commit] git diff --cached --quiet failed: ${diff.error.message}`,
+    );
+    return "failed:commit";
   }
-  return diff.status === 0 ? 'no' : 'yes';
+  return diff.status === 0 ? "no" : "yes";
 }
 
-function commitWork(worktree: string, handle: string): 'done' | 'failed:commit' | 'failed:no-changes' {
+function commitWork(
+  worktree: string,
+  handle: string,
+): "done" | "failed:commit" | "failed:no-changes" {
   const staged = stageWorktree(worktree, handle);
-  if (staged !== 'ok') return staged;
+  if (staged !== "ok") return staged;
   const stagedChanges = hasStagedChanges(worktree);
-  if (stagedChanges === 'failed:commit') return 'failed:commit';
-  if (stagedChanges === 'no') return 'failed:no-changes';
+  if (stagedChanges === "failed:commit") return "failed:commit";
+  if (stagedChanges === "no") return "failed:no-changes";
 
-  const commit = spawnSync('git', ['-C', worktree, 'commit', '-m', commitMessage(handle)], { encoding: 'utf8', timeout: 60_000 });
+  const commit = spawnSync(
+    "git",
+    ["-C", worktree, "commit", "-m", commitMessage(handle)],
+    { encoding: "utf8", timeout: 60_000 },
+  );
   if (commit.error) {
-    console.error(`[commit] git commit failed for ${handle}: ${commit.error.message}`);
-    return 'failed:commit';
+    console.error(
+      `[commit] git commit failed for ${handle}: ${commit.error.message}`,
+    );
+    return "failed:commit";
   }
   if (commit.status !== 0) {
-    console.error(`[commit] git commit failed for ${handle}: ${commit.stderr?.trim() ?? ''}`);
-    return 'failed:commit';
+    console.error(
+      `[commit] git commit failed for ${handle}: ${commit.stderr?.trim() ?? ""}`,
+    );
+    return "failed:commit";
   }
-  return 'done';
+  return "done";
 }
 
-export function maybeVerifyAndCommit(handle: string, worktree: string, natural: string): string {
-  if (natural !== 'done') return natural;
+export function maybeVerifyAndCommit(
+  handle: string,
+  worktree: string,
+  natural: string,
+): string {
+  if (natural !== "done") return natural;
 
   const cmd = process.env.WORKER_VERIFY_CMD ?? FILE_CONFIG.verifyCmd;
   if (cmd && cmd.length > 0) {
-    const shell = process.env.SHELL ?? '/bin/zsh';
-    const result = spawnSync(shell, ['-c', cmd], { cwd: worktree, timeout: 120_000, stdio: 'ignore' });
+    const shell = process.env.SHELL ?? "/bin/zsh";
+    const result = spawnSync(shell, ["-c", cmd], {
+      cwd: worktree,
+      timeout: 120_000,
+      stdio: "ignore",
+    });
     if (result.status !== 0 || result.error) {
-      console.error(`[commit] verify gate failed for ${handle}: exit ${result.status ?? 'error'}`);
-      return 'failed:verify';
+      console.error(
+        `[commit] verify gate failed for ${handle}: exit ${result.status ?? "error"}`,
+      );
+      return "failed:verify";
     }
   }
 

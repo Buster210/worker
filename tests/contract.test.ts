@@ -1,33 +1,48 @@
-import { describe, it, expect, beforeAll, afterEach, afterAll } from 'bun:test';
-import { spawn, spawnSync } from 'child_process';
-import { writeFileSync, readFileSync, rmSync, mkdirSync, mkdtempSync, openSync } from 'fs';
-import { join } from 'path';
-import { tmpdir } from 'os';
-
+import { describe, it, expect, beforeAll, afterEach, afterAll } from "bun:test";
+import { spawn, spawnSync } from "child_process";
+import {
+  writeFileSync,
+  readFileSync,
+  rmSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+} from "fs";
+import { join } from "path";
+import { tmpdir } from "os";
 
 const STATE_DIR = join(tmpdir(), `wcontract-state-${process.pid}`);
 process.env.WORKER_STATE_DIR = STATE_DIR;
 const PLANS_DIR = join(tmpdir(), `wcontract-plans-${process.pid}`);
 process.env.WORKER_PLANS_DIR = PLANS_DIR;
 
+process.env.SHELL = "/bin/bash";
+process.env.WORKER_RC = "";
+process.env.WORKER_LOGIN_SHELL = "0";
+import {
+  insertJob,
+  updateJob,
+  getJob,
+  getJobFresh,
+  logPath as stateLogPath,
+} from "../src/state.ts";
+import {
+  handleKill,
+  handleStatus,
+  handleResume,
+  handleRun,
+} from "../src/server.ts";
+import { isProcessAlive, listDescendants } from "../src/process.ts";
+import { workerEnv } from "../src/env.ts";
 
-process.env.SHELL = '/bin/bash';
-process.env.WORKER_RC = '';
-process.env.WORKER_LOGIN_SHELL = '0';
-import { insertJob, updateJob, getJob, getJobFresh, finalizeJob, logPath as stateLogPath } from '../src/state.ts';
-import { handleKill, handleStatus, handleResume, handleRun } from '../src/server.ts';
-import { isProcessAlive, listDescendants } from '../src/process.ts';
-import { workerEnv } from '../src/env.ts';
+const REPO = mkdtempSync(join(tmpdir(), "wcontract-repo-"));
+spawnSync("git", ["init", "-q"], { cwd: REPO });
 
-
-const REPO = mkdtempSync(join(tmpdir(), 'wcontract-repo-'));
-spawnSync('git', ['init', '-q'], { cwd: REPO });
-
-spawnSync('git', ['config', 'user.email', 'test@test.com'], { cwd: REPO });
-spawnSync('git', ['config', 'user.name', 'Test'], { cwd: REPO });
-writeFileSync(join(REPO, '.gitkeep'), '');
-spawnSync('git', ['add', '.'], { cwd: REPO });
-spawnSync('git', ['commit', '-m', 'init', '--no-gpg-sign'], { cwd: REPO });
+spawnSync("git", ["config", "user.email", "test@test.com"], { cwd: REPO });
+spawnSync("git", ["config", "user.name", "Test"], { cwd: REPO });
+writeFileSync(join(REPO, ".gitkeep"), "");
+spawnSync("git", ["add", "."], { cwd: REPO });
+spawnSync("git", ["commit", "-m", "init", "--no-gpg-sign"], { cwd: REPO });
 const tmpFiles: string[] = [];
 const frozenPids: number[] = [];
 const tmpDirs: string[] = [REPO];
@@ -41,15 +56,17 @@ function writeSpec(name: string, body: string): string {
   return name;
 }
 
-const STUB_DIR = mkdtempSync(join(tmpdir(), 'wcontract-stub-'));
+const STUB_DIR = mkdtempSync(join(tmpdir(), "wcontract-stub-"));
 tmpDirs.push(STUB_DIR);
 workerEnv().PATH = `${STUB_DIR}:${workerEnv().PATH}`;
 
+workerEnv().WORKER_RC = "";
 
-workerEnv().WORKER_RC = '';
-
-
-async function waitFor(pred: () => boolean, ceilingMs = 5_000, stepMs = 25): Promise<void> {
+async function waitFor(
+  pred: () => boolean,
+  ceilingMs = 5_000,
+  stepMs = 25,
+): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < ceilingMs) {
     if (pred()) return;
@@ -58,42 +75,64 @@ async function waitFor(pred: () => boolean, ceilingMs = 5_000, stepMs = 25): Pro
   throw new Error(`waitFor timed out after ${ceilingMs}ms`);
 }
 
-
 function fakeScript(body: string): string[] {
   const path = join(tmpdir(), `wcontract-${process.pid}-${seq++}.sh`);
   writeFileSync(path, `#!/usr/bin/env bash\n${body}\n`, { mode: 0o755 });
   tmpFiles.push(path);
-  return ['bash', path];
+  return ["bash", path];
 }
 
 function seedJob(handle: string): string {
   const lp = stateLogPath(handle, REPO);
-  insertJob({ handle, backend: 'cmd', sid: 'test', repo: REPO, log_path: lp });
+  insertJob({ handle, backend: "cmd", sid: "test", repo: REPO, log_path: lp });
   return lp;
 }
 
 function spawnDetached(body: string, lp: string): number {
   const [cmd, path] = fakeScript(body);
-  const fd = openSync(lp, 'a');
-  const proc = spawn(cmd, [path], { detached: true, stdio: ['ignore', fd, fd] });
+  const fd = openSync(lp, "a");
+  const proc = spawn(cmd, [path], {
+    detached: true,
+    stdio: ["ignore", fd, fd],
+  });
   proc.unref();
   return proc.pid!;
 }
 
-
 afterEach(() => {
-  for (const k of ['WORKER_POLL_MS', 'WORKER_RESUME_POLL_MS', 'WORKER_STALL_MS', 'WORKER_TIMEOUT_MS', 'WORKER_REAP_MS', 'WORKER_PLANS_DIR']) {
+  for (const k of [
+    "WORKER_POLL_MS",
+    "WORKER_RESUME_POLL_MS",
+    "WORKER_STALL_MS",
+    "WORKER_TIMEOUT_MS",
+    "WORKER_REAP_MS",
+    "WORKER_PLANS_DIR",
+  ]) {
     delete process.env[k];
   }
-  
+
   process.env.WORKER_PLANS_DIR = PLANS_DIR;
 });
 
 afterAll(() => {
-  for (const pid of frozenPids) { try { process.kill(-pid, 'SIGKILL'); } catch {} }
-  for (const f of tmpFiles) { try { rmSync(f, { force: true }); } catch {} }
-  for (const d of tmpDirs) { try { rmSync(d, { recursive: true, force: true }); } catch {} }
-  try { rmSync(STATE_DIR, { recursive: true, force: true }); } catch {}
+  for (const pid of frozenPids) {
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch {}
+  }
+  for (const f of tmpFiles) {
+    try {
+      rmSync(f, { force: true });
+    } catch {}
+  }
+  for (const d of tmpDirs) {
+    try {
+      rmSync(d, { recursive: true, force: true });
+    } catch {}
+  }
+  try {
+    rmSync(STATE_DIR, { recursive: true, force: true });
+  } catch {}
 });
 
 function makeStub(name: string, body: string) {
@@ -101,31 +140,27 @@ function makeStub(name: string, body: string) {
   writeFileSync(p, `#!/usr/bin/env bash\n${body}\n`, { mode: 0o755 });
 }
 
-
-describe('handleKill — hermetic', () => {
-  it('kills a running job: process dies, result contains handle', async () => {
+describe("handleKill — hermetic", () => {
+  it("kills a running job: process dies, result contains handle", async () => {
     const handle = `hk-live-${seq++}`;
     const lp = seedJob(handle);
-    const pid = spawnDetached('sleep 100', lp);
-    updateJob(handle, { worker_pid: pid, status: 'running' });
+    const pid = spawnDetached("sleep 100", lp);
+    updateJob(handle, { worker_pid: pid, status: "running" });
     await waitFor(() => isProcessAlive(pid));
 
     const result = handleKill({ handle });
-    expect(result).toContain('killed');
+    expect(result).toContain("killed");
     expect(result).toContain(handle);
 
-    
     await waitFor(() => !isProcessAlive(pid));
     expect(isProcessAlive(pid)).toBe(false);
-    
-    
   });
 
-  it('kills all descendants (no orphans) for a forking job', async () => {
+  it("kills all descendants (no orphans) for a forking job", async () => {
     const handle = `hk-orphan-${seq++}`;
     const lp = seedJob(handle);
-    const pid = spawnDetached('sleep 100 & sleep 100 & wait', lp);
-    updateJob(handle, { worker_pid: pid, status: 'running' });
+    const pid = spawnDetached("sleep 100 & sleep 100 & wait", lp);
+    updateJob(handle, { worker_pid: pid, status: "running" });
     await waitFor(() => listDescendants(pid).length >= 2);
 
     const descendants = listDescendants(pid);
@@ -141,155 +176,187 @@ describe('handleKill — hermetic', () => {
     }
   });
 
-  it('force-kills a stopped job with an alive frozen pid', async () => {
+  it("force-kills a stopped job with an alive frozen pid", async () => {
     const handle = `hk-stopped-${seq++}`;
     const lp = seedJob(handle);
-    const pid = spawnDetached('sleep 100', lp);
+    const pid = spawnDetached("sleep 100", lp);
     await waitFor(() => isProcessAlive(pid));
-    try { process.kill(pid, 'SIGSTOP'); } catch {}
-    updateJob(handle, { worker_pid: pid, status: 'stopped', stopped_at: new Date().toISOString() });
+    try {
+      process.kill(pid, "SIGSTOP");
+    } catch {}
+    updateJob(handle, {
+      worker_pid: pid,
+      status: "stopped",
+      stopped_at: new Date().toISOString(),
+    });
 
     const result = handleKill({ handle });
-    expect(result).toContain('killed');
+    expect(result).toContain("killed");
     expect(result).toContain(handle);
 
     await waitFor(() => !isProcessAlive(pid));
-    
-    
-    expect(getJob(handle)?.status).toBe('done');
+
+    expect(getJob(handle)?.status).toBe("done");
     frozenPids.push(pid);
   });
 
   it('returns "already <status>" for a terminal job without touching it', () => {
     const handle = `hk-done-${seq++}`;
     seedJob(handle);
-    updateJob(handle, { status: 'done' });
-    expect(handleKill({ handle })).toBe('already done');
+    updateJob(handle, { status: "done" });
+    expect(handleKill({ handle })).toBe("already done");
 
     const handle2 = `hk-failed-${seq++}`;
     seedJob(handle2);
-    updateJob(handle2, { status: 'failed' });
-    expect(handleKill({ handle: handle2 })).toBe('already failed');
+    updateJob(handle2, { status: "failed" });
+    expect(handleKill({ handle: handle2 })).toBe("already failed");
 
     const handle3 = `hk-timeout-${seq++}`;
     seedJob(handle3);
-    updateJob(handle3, { status: 'timeout' });
-    expect(handleKill({ handle: handle3 })).toBe('already timeout');
+    updateJob(handle3, { status: "timeout" });
+    expect(handleKill({ handle: handle3 })).toBe("already timeout");
   });
 
-  it('finalizes a running job whose pid is already dead (dead-pid finalizeJob path)', () => {
+  it("finalizes a running job whose pid is already dead (dead-pid finalizeJob path)", () => {
     const handle = `hk-deadpid-${seq++}`;
     seedJob(handle);
-    updateJob(handle, { status: 'running' });
-    
-    
-    writeFileSync(stateLogPath(handle, REPO), 'FAILED\n');
+    updateJob(handle, { status: "running" });
+
+    writeFileSync(stateLogPath(handle, REPO), "FAILED\n");
 
     const result = handleKill({ handle });
-    expect(result).toContain('killed');
+    expect(result).toContain("killed");
     expect(result).toContain(handle);
-    expect(result).toContain('(killed)'); 
-    expect(getJob(handle)?.status).toBe('killed');
+    expect(result).toContain("(killed)");
+    expect(getJob(handle)?.status).toBe("killed");
   });
 });
 
-describe('handleStatus — hermetic', () => {
-  it('live running job returns alive:true', async () => {
+describe("handleStatus — hermetic", () => {
+  it("live running job returns alive:true", async () => {
     const handle = `hs-live-${seq++}`;
     const lp = seedJob(handle);
-    const pid = spawnDetached('sleep 100', lp);
-    updateJob(handle, { worker_pid: pid, status: 'running' });
+    const pid = spawnDetached("sleep 100", lp);
+    updateJob(handle, { worker_pid: pid, status: "running" });
     await waitFor(() => isProcessAlive(pid));
 
     const s = handleStatus({ handle });
-    expect(s.status).toBe('running');
+    expect(s.status).toBe("running");
     expect(s.alive).toBe(true);
-    expect('started' in s).toBe(true);
+    expect("started" in s).toBe(true);
     frozenPids.push(pid);
   });
 
-  it('terminal job returns alive:false', () => {
+  it("terminal job returns alive:false", () => {
     const handle = `hs-term-${seq++}`;
     seedJob(handle);
-    updateJob(handle, { status: 'done' });
+    updateJob(handle, { status: "done" });
 
     const s = handleStatus({ handle });
-    expect(s.status).toBe('done');
+    expect(s.status).toBe("done");
     expect(s.alive).toBe(false);
   });
 
-  it('does not leak internal fields', () => {
+  it("does not leak internal fields", () => {
     const handle = `hs-noleak-${seq++}`;
     seedJob(handle);
-    updateJob(handle, { status: 'running', worker_pid: 12345, model: 'sonnet', task: 'test prompt' });
+    updateJob(handle, {
+      status: "running",
+      worker_pid: 12345,
+      model: "sonnet",
+      task: "test prompt",
+    });
 
     const s = handleStatus({ handle });
-    for (const k of ['handle', 'repo', 'task', 'backend', 'worker_pid', 'resume_token', 'log_path', 'kill_requested', 'sid', 'model']) {
+    for (const k of [
+      "handle",
+      "repo",
+      "task",
+      "backend",
+      "worker_pid",
+      "resume_token",
+      "log_path",
+      "kill_requested",
+      "sid",
+      "model",
+    ]) {
       expect(k in s).toBe(false);
     }
   });
 
-  it('throws for unknown handle', () => {
-    expect(() => handleStatus({ handle: 'nonexistent' })).toThrow(/No job found/);
+  it("throws for unknown handle", () => {
+    expect(() => handleStatus({ handle: "nonexistent" })).toThrow(
+      /No job found/,
+    );
   });
 });
 
-describe('handleResume — hermetic', () => {
-  
-  
-  it('throws for unknown handle', () => {
-    const ghostSpec = writeSpec('ghost-spec.md', 'ghost spec');
-    expect(() => handleResume({ handle: 'ghost', specFile: ghostSpec, dir: REPO })).toThrow(/No job found/);
+describe("handleResume — hermetic", () => {
+  it("throws for unknown handle", () => {
+    const ghostSpec = writeSpec("ghost-spec.md", "ghost spec");
+    expect(() =>
+      handleResume({ handle: "ghost", specFile: ghostSpec, dir: REPO }),
+    ).toThrow(/No job found/);
   });
 });
 
-
-describe('handleRun — via PATH stub', () => {
+describe("handleRun — via PATH stub", () => {
   beforeAll(() => {
-    makeStub('cmd', 'echo "DONE-$RANDOM-$$" > worker-output.txt; echo DONE; exit 0');
+    makeStub(
+      "cmd",
+      'echo "DONE-$RANDOM-$$" > worker-output.txt; echo DONE; exit 0',
+    );
   });
 
-  it('happy path: stub emits DONE, returns {handle, running}, poll → done', async () => {
-    process.env.WORKER_POLL_MS = '50';
-    process.env.WORKER_RESUME_POLL_MS = '50';
+  it("happy path: stub emits DONE, returns {handle, running}, poll → done", async () => {
+    process.env.WORKER_POLL_MS = "50";
+    process.env.WORKER_RESUME_POLL_MS = "50";
 
-    const specFile = writeSpec('happy-path.md', 'test spec');
-    const { handle, status } = handleRun({ backend: 'cmd', specFile, dir: REPO });
-    expect(status).toBe('running');
+    const specFile = writeSpec("happy-path.md", "test spec");
+    const { handle, status } = handleRun({
+      backend: "cmd",
+      specFile,
+      dir: REPO,
+    });
+    expect(status).toBe("running");
     expect(handle).toBeTruthy();
 
     const job = getJob(handle);
     expect(job).not.toBeNull();
-    expect(job!.status).toBe('running');
-    expect(job!.backend).toBe('cmd');
-    expect(job!.sid).toBeTruthy(); 
+    expect(job!.status).toBe("running");
+    expect(job!.backend).toBe("cmd");
+    expect(job!.sid).toBeTruthy();
     expect(job!.repo).toBe(REPO);
     expect(job!.log_path).toBeTruthy();
 
-    
     await waitFor(() => {
       const j = getJobFresh(handle);
       return j != null && /^(done|failed|killed|timeout)/.test(j.status);
     }, 8_000);
-    expect(getJobFresh(handle)?.status).toBe('done');
+    expect(getJobFresh(handle)?.status).toBe("done");
   });
 
-  it('assertRepo rejects a non-git directory', () => {
-    const nonGit = mkdtempSync(join(tmpdir(), 'wcontract-nongit-'));
+  it("assertRepo rejects a non-git directory", () => {
+    const nonGit = mkdtempSync(join(tmpdir(), "wcontract-nongit-"));
     tmpDirs.push(nonGit);
-    const specFile = writeSpec('non-git-test.md', 'test spec');
-    expect(() => handleRun({ backend: 'cmd', specFile, dir: nonGit })).toThrow(/Not a git repo/);
-    
+    const specFile = writeSpec("non-git-test.md", "test spec");
+    expect(() => handleRun({ backend: "cmd", specFile, dir: nonGit })).toThrow(
+      /Not a git repo/,
+    );
   });
 
-  it('failure: stub emits FAILED + exits nonzero → poll → failed', async () => {
-    makeStub('cmd', 'echo "FAILED: budget exceeded"; exit 1');
-    process.env.WORKER_POLL_MS = '50';
-    process.env.WORKER_RESUME_POLL_MS = '50';
+  it("failure: stub emits FAILED + exits nonzero → poll → failed", async () => {
+    makeStub("cmd", 'echo "FAILED: budget exceeded"; exit 1');
+    process.env.WORKER_POLL_MS = "50";
+    process.env.WORKER_RESUME_POLL_MS = "50";
 
-    const specFile = writeSpec('fail-test.md', 'fail test spec');
-    const { handle, status } = handleRun({ backend: 'cmd', specFile, dir: REPO });
-    expect(status).toBe('running');
+    const specFile = writeSpec("fail-test.md", "fail test spec");
+    const { handle, status } = handleRun({
+      backend: "cmd",
+      specFile,
+      dir: REPO,
+    });
+    expect(status).toBe("running");
 
     await waitFor(() => {
       const j = getJobFresh(handle);
@@ -299,173 +366,229 @@ describe('handleRun — via PATH stub', () => {
     expect(finalStatus).toMatch(/^failed/);
   });
 
-  it('parallel workers: launching B on the same repo does NOT kill A (both coexist)', async () => {
-    
-    makeStub('cmd', 'sleep 100');
-    process.env.WORKER_POLL_MS = '50';
-    process.env.WORKER_RESUME_POLL_MS = '50';
-    
-    process.env.WORKER_STALL_MS = '30000';
+  it("parallel workers: launching B on the same repo does NOT kill A (both coexist)", async () => {
+    makeStub("cmd", "sleep 100");
+    process.env.WORKER_POLL_MS = "50";
+    process.env.WORKER_RESUME_POLL_MS = "50";
 
-    const specA = writeSpec('parallel-a.md', 'parallel worker A spec');
-    const a = handleRun({ backend: 'cmd', specFile: specA, dir: REPO });
-    expect(a.status).toBe('running');
-    
-    await waitFor(() => { const j = getJobFresh(a.handle); return j != null && j.worker_pid > 0 && isProcessAlive(j.worker_pid); });
+    process.env.WORKER_STALL_MS = "30000";
+
+    const specA = writeSpec("parallel-a.md", "parallel worker A spec");
+    const a = handleRun({ backend: "cmd", specFile: specA, dir: REPO });
+    expect(a.status).toBe("running");
+
+    await waitFor(() => {
+      const j = getJobFresh(a.handle);
+      return j != null && j.worker_pid > 0 && isProcessAlive(j.worker_pid);
+    });
     const pidA = getJobFresh(a.handle)!.worker_pid;
     expect(pidA).toBeGreaterThan(0);
     expect(isProcessAlive(pidA)).toBe(true);
-    
-    expect(getJobFresh(a.handle)?.status).toBe('running');
 
-    
-    makeStub('cmd', 'echo "DONE-$RANDOM-$$" > worker-output.txt; echo DONE; exit 0');
-    const specB = writeSpec('parallel-b.md', 'parallel worker B spec');
-    const b = handleRun({ backend: 'cmd', specFile: specB, dir: REPO });
-    expect(b.status).toBe('running');
+    expect(getJobFresh(a.handle)?.status).toBe("running");
 
-    
+    makeStub(
+      "cmd",
+      'echo "DONE-$RANDOM-$$" > worker-output.txt; echo DONE; exit 0',
+    );
+    const specB = writeSpec("parallel-b.md", "parallel worker B spec");
+    const b = handleRun({ backend: "cmd", specFile: specB, dir: REPO });
+    expect(b.status).toBe("running");
+
     expect(isProcessAlive(pidA)).toBe(true);
-    expect(getJobFresh(a.handle)?.status).toBe('running');
+    expect(getJobFresh(a.handle)?.status).toBe("running");
 
-    
     await waitFor(() => {
       const j = getJobFresh(b.handle);
       return j != null && /^(done|failed|killed|timeout)/.test(j.status);
     }, 8_000);
-    expect(getJobFresh(b.handle)?.status).toBe('done');
+    expect(getJobFresh(b.handle)?.status).toBe("done");
 
-    
     const aStatus = getJobFresh(a.handle)?.status;
-    expect(aStatus).not.toBe('killed');
+    expect(aStatus).not.toBe("killed");
 
-    
     expect(getJob(a.handle)?.worktree_path).toBeTruthy();
     expect(getJob(b.handle)?.worktree_path).toBeTruthy();
-    expect(getJob(a.handle)?.worktree_path).not.toBe(getJob(b.handle)?.worktree_path);
+    expect(getJob(a.handle)?.worktree_path).not.toBe(
+      getJob(b.handle)?.worktree_path,
+    );
 
-    
     if (pidA > 0) frozenPids.push(pidA);
   });
 
-  it('parallel workers: two concurrent workers each get isolated worktrees on separate branches', async () => {
-    makeStub('cmd', 'echo "DONE-$RANDOM-$$" > worker-output.txt; echo DONE; exit 0');
-    process.env.WORKER_POLL_MS = '50';
-    process.env.WORKER_RESUME_POLL_MS = '50';
+  it("parallel workers: two concurrent workers each get isolated worktrees on separate branches", async () => {
+    makeStub(
+      "cmd",
+      'echo "DONE-$RANDOM-$$" > worker-output.txt; echo DONE; exit 0',
+    );
+    process.env.WORKER_POLL_MS = "50";
+    process.env.WORKER_RESUME_POLL_MS = "50";
 
-    const specC = writeSpec('parallel-c.md', 'parallel worker C spec');
-    const specD = writeSpec('parallel-d.md', 'parallel worker D spec');
-    const c = handleRun({ backend: 'cmd', specFile: specC, dir: REPO });
-    const d = handleRun({ backend: 'cmd', specFile: specD, dir: REPO });
+    const specC = writeSpec("parallel-c.md", "parallel worker C spec");
+    const specD = writeSpec("parallel-d.md", "parallel worker D spec");
+    const c = handleRun({ backend: "cmd", specFile: specC, dir: REPO });
+    const d = handleRun({ backend: "cmd", specFile: specD, dir: REPO });
 
-    expect(c.status).toBe('running');
-    expect(d.status).toBe('running');
+    expect(c.status).toBe("running");
+    expect(d.status).toBe("running");
     expect(c.handle).not.toBe(d.handle);
 
     const jobC = getJob(c.handle)!;
     const jobD = getJob(d.handle)!;
 
-    
     expect(jobC.worktree_path).toBeTruthy();
     expect(jobD.worktree_path).toBeTruthy();
     expect(jobC.worktree_path).not.toBe(jobD.worktree_path);
 
-    
     await waitFor(() => {
       const jC = getJobFresh(c.handle);
       const jD = getJobFresh(d.handle);
-      return jC != null && /^(done|failed|killed|timeout)/.test(jC.status)
-          && jD != null && /^(done|failed|killed|timeout)/.test(jD.status);
+      return (
+        jC != null &&
+        /^(done|failed|killed|timeout)/.test(jC.status) &&
+        jD != null &&
+        /^(done|failed|killed|timeout)/.test(jD.status)
+      );
     }, 12_000);
-    expect(getJobFresh(c.handle)?.status).toBe('done');
-    expect(getJobFresh(d.handle)?.status).toBe('done');
+    expect(getJobFresh(c.handle)?.status).toBe("done");
+    expect(getJobFresh(d.handle)?.status).toBe("done");
   });
 });
 
-describe('handleResume — via PATH stub (dead pid / failed retry)', () => {
+describe("handleResume — via PATH stub (dead pid / failed retry)", () => {
   beforeAll(() => {
-    makeStub('cmd', 'echo "DONE-$RANDOM-$$" > worker-output.txt; echo DONE; exit 0');
+    makeStub(
+      "cmd",
+      'echo "DONE-$RANDOM-$$" > worker-output.txt; echo DONE; exit 0',
+    );
   });
 
-  it('stopped job with dead pid → fresh re-run completes', async () => {
-    process.env.WORKER_POLL_MS = '50';
-    process.env.WORKER_RESUME_POLL_MS = '50';
-    makeStub('cmd', 'echo "DONE-$RANDOM-$$" > worker-output.txt; echo DONE; exit 0');
+  it("stopped job with dead pid → fresh re-run completes", async () => {
+    process.env.WORKER_POLL_MS = "50";
+    process.env.WORKER_RESUME_POLL_MS = "50";
+    makeStub(
+      "cmd",
+      'echo "DONE-$RANDOM-$$" > worker-output.txt; echo DONE; exit 0',
+    );
 
     const handle = `hr-deadpid-${seq++}`;
     const lp = stateLogPath(handle, REPO);
-    insertJob({ handle, backend: 'cmd', sid: 'test', repo: REPO, log_path: lp });
-    const deadPid = spawnSync('true').pid!;
-    updateJob(handle, { status: 'stopped', worker_pid: deadPid, stopped_at: new Date().toISOString() });
+    insertJob({
+      handle,
+      backend: "cmd",
+      sid: "test",
+      repo: REPO,
+      log_path: lp,
+    });
+    const deadPid = spawnSync("true").pid!;
+    updateJob(handle, {
+      status: "stopped",
+      worker_pid: deadPid,
+      stopped_at: new Date().toISOString(),
+    });
 
-    const specFile = writeSpec('resume-dead.md', 'resume dead spec');
-    const { handle: h, status: s1 } = handleResume({ handle, specFile, dir: REPO });
+    const specFile = writeSpec("resume-dead.md", "resume dead spec");
+    const { handle: h, status: s1 } = handleResume({
+      handle,
+      specFile,
+      dir: REPO,
+    });
     expect(h).toBe(handle);
-    expect(s1).toBe('running');
+    expect(s1).toBe("running");
 
-    
     await waitFor(() => {
       const j = getJobFresh(handle);
       return j != null && /^(done|failed|killed|timeout)/.test(j.status);
     }, 8_000);
 
     const job = getJobFresh(handle);
-    expect(job?.status).toBe('done');
-    expect(job!.worker_pid).toBeGreaterThan(0); 
+    expect(job?.status).toBe("done");
+    expect(job!.worker_pid).toBeGreaterThan(0);
     expect(job!.worker_pid).not.toBe(deadPid);
   });
 
-  it('failed job retry re-runs the worker but status stays failed (known gap)', async () => {
-    process.env.WORKER_POLL_MS = '50';
-    process.env.WORKER_RESUME_POLL_MS = '50';
-    makeStub('cmd', 'echo "DONE-$RANDOM-$$" > worker-output.txt; echo DONE; exit 0');
+  it("failed job retry re-runs the worker but status stays failed (known gap)", async () => {
+    process.env.WORKER_POLL_MS = "50";
+    process.env.WORKER_RESUME_POLL_MS = "50";
+    makeStub(
+      "cmd",
+      'echo "DONE-$RANDOM-$$" > worker-output.txt; echo DONE; exit 0',
+    );
 
     const handle = `hr-failed-retry-${seq++}`;
     const lp = stateLogPath(handle, REPO);
-    insertJob({ handle, backend: 'cmd', sid: 'test', repo: REPO, log_path: lp });
-    const deadPid = spawnSync('true').pid!;
-    updateJob(handle, { status: 'failed', worker_pid: deadPid });
+    insertJob({
+      handle,
+      backend: "cmd",
+      sid: "test",
+      repo: REPO,
+      log_path: lp,
+    });
+    const deadPid = spawnSync("true").pid!;
+    updateJob(handle, { status: "failed", worker_pid: deadPid });
 
-    const specFile = writeSpec('retry-failed.md', 'retry failed spec');
-    const { handle: h, status: s1 } = handleResume({ handle, specFile, dir: REPO });
+    const specFile = writeSpec("retry-failed.md", "retry failed spec");
+    const { handle: h, status: s1 } = handleResume({
+      handle,
+      specFile,
+      dir: REPO,
+    });
     expect(h).toBe(handle);
-    expect(s1).toBe('running');
+    expect(s1).toBe("running");
 
-    
     await waitFor(() => {
-      try { return readFileSync(lp, 'utf8').includes('DONE'); } catch { return false; }
+      try {
+        return readFileSync(lp, "utf8").includes("DONE");
+      } catch {
+        return false;
+      }
     }, 8_000);
     const job = getJobFresh(handle)!;
     expect(job.worker_pid).toBeGreaterThan(0);
-    expect(job.worker_pid).not.toBe(deadPid); 
+    expect(job.worker_pid).not.toBe(deadPid);
 
-    
-    expect(job.status).toBe('failed');
+    expect(job.status).toBe("failed");
   });
 
-  it('timeout job retry re-runs the worker but status stays timeout (known gap)', async () => {
-    
-    process.env.WORKER_POLL_MS = '50';
-    process.env.WORKER_RESUME_POLL_MS = '50';
-    makeStub('cmd', 'echo "DONE-$RANDOM-$$" > worker-output.txt; echo DONE; exit 0');
+  it("timeout job retry re-runs the worker but status stays timeout (known gap)", async () => {
+    process.env.WORKER_POLL_MS = "50";
+    process.env.WORKER_RESUME_POLL_MS = "50";
+    makeStub(
+      "cmd",
+      'echo "DONE-$RANDOM-$$" > worker-output.txt; echo DONE; exit 0',
+    );
 
     const handle = `hr-timeout-retry-${seq++}`;
     const lp = stateLogPath(handle, REPO);
-    insertJob({ handle, backend: 'cmd', sid: 'test', repo: REPO, log_path: lp });
-    const deadPid = spawnSync('true').pid!;
-    updateJob(handle, { status: 'timeout', worker_pid: deadPid });
+    insertJob({
+      handle,
+      backend: "cmd",
+      sid: "test",
+      repo: REPO,
+      log_path: lp,
+    });
+    const deadPid = spawnSync("true").pid!;
+    updateJob(handle, { status: "timeout", worker_pid: deadPid });
 
-    const specFile = writeSpec('retry-timeout.md', 'retry timeout spec');
-    const { handle: h, status: s1 } = handleResume({ handle, specFile, dir: REPO });
+    const specFile = writeSpec("retry-timeout.md", "retry timeout spec");
+    const { handle: h, status: s1 } = handleResume({
+      handle,
+      specFile,
+      dir: REPO,
+    });
     expect(h).toBe(handle);
-    expect(s1).toBe('running');
+    expect(s1).toBe("running");
 
     await waitFor(() => {
-      try { return readFileSync(lp, 'utf8').includes('DONE'); } catch { return false; }
+      try {
+        return readFileSync(lp, "utf8").includes("DONE");
+      } catch {
+        return false;
+      }
     }, 8_000);
     const job = getJobFresh(handle)!;
     expect(job.worker_pid).toBeGreaterThan(0);
-    
-    expect(job.status).toBe('timeout');
+
+    expect(job.status).toBe("timeout");
   });
 });

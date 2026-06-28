@@ -59,7 +59,7 @@ const { addWorktreeAsync, listWorktrees } = await import('../src/worktree.ts');
 const { terminalStatus, statusLine } = await import('../src/report.ts');
 const state = await import('../src/state.ts');
 const { __resetPidCache } = await import('../src/process.ts');
-const { __resetActivityMonitors } = await import('../src/monitor.ts');
+const { __resetActivityMonitors } = await import('../src/runner.ts');
 const { __resetSentinelCache } = await import('../src/logParse.ts');
 __resetPidCache(); __resetActivityMonitors(); __resetSentinelCache(); resetShutdownState();
 

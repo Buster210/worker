@@ -1,6 +1,6 @@
-import { readFileSync } from 'fs';
-import { join } from 'path';
-import { z } from 'zod/v4';
+import { readFileSync } from "fs";
+import { join } from "path";
+import { z } from "zod/v4";
 
 export type FileConfig = {
   ladder?: string[];
@@ -15,7 +15,10 @@ export type FileConfig = {
   cpuQos?: string;
 };
 
-const stringArrayCoerce = z.array(z.unknown()).transform(arr => arr.filter((e): e is string => typeof e === 'string')).pipe(z.array(z.string()));
+const stringArrayCoerce = z
+  .array(z.unknown())
+  .transform((arr) => arr.filter((e): e is string => typeof e === "string"))
+  .pipe(z.array(z.string()));
 const FileConfigSchema = z.object({
   ladder: stringArrayCoerce.optional(),
   skip: stringArrayCoerce.optional(),
@@ -30,15 +33,20 @@ const FileConfigSchema = z.object({
 });
 
 function loadFileConfig(pathOverride?: string): FileConfig {
-  const home = process.env.HOME ?? '';
-  const configPath = pathOverride ?? process.env.WORKER_CONFIG_PATH ?? join(home, '.claude', 'workers', 'config.json');
+  const home = process.env.HOME ?? "";
+  const configPath =
+    pathOverride ??
+    process.env.WORKER_CONFIG_PATH ??
+    join(home, ".claude", "workers", "config.json");
   let raw: unknown;
   try {
-    raw = JSON.parse(readFileSync(configPath, 'utf-8'));
+    raw = JSON.parse(readFileSync(configPath, "utf-8"));
   } catch (e: unknown) {
     const err = e as { code?: string; message?: string };
-    if (err?.code === 'ENOENT') return {};
-    console.error(`[config] failed to read config.json: ${err?.message ?? err}`);
+    if (err?.code === "ENOENT") return {};
+    console.error(
+      `[config] failed to read config.json: ${err?.message ?? err}`,
+    );
     return {};
   }
   const result = FileConfigSchema.safeParse(raw);

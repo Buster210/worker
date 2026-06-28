@@ -3,11 +3,14 @@
   "version": "0.3.0",
   "type": "module",
   "bin": {
-    "worker": "./bin/worker",
-    "worker-report": "./src/report.ts"
+    "worker": "./dist/server.js",
+    "worker-report": "./dist/report.js"
   },
   "scripts": {
     "dev": "bun run --watch src/server.ts",
+    "build": "bun build --target=bun --minify --outdir=dist src/server.ts && bun build --target=bun --minify --outdir=dist src/reaper.ts && bun build --target=bun --minify --outdir=dist src/report.ts",
+    "start": "bun run dist/server.js",
+    "report": "bun run dist/report.js",
     "typecheck": "bunx tsgo --noEmit",
     "test": "bun test --timeout 90000",
     "test:integration": "bun test tests/per-backend.test.ts --timeout 90000"

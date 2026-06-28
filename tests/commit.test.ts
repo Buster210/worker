@@ -1,94 +1,124 @@
-import { describe, it, expect, afterAll, beforeEach, afterEach } from 'bun:test';
-import { spawnSync } from 'child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync, realpathSync, symlinkSync, unlinkSync } from 'fs';
-import { join } from 'path';
-import { tmpdir } from 'os';
-
+import {
+  describe,
+  it,
+  expect,
+  afterAll,
+  beforeEach,
+  afterEach,
+} from "bun:test";
+import { spawnSync } from "child_process";
+import {
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+  realpathSync,
+  symlinkSync,
+  unlinkSync,
+} from "fs";
+import { join } from "path";
+import { tmpdir } from "os";
 
 const STATE_DIR_RAW = join(tmpdir(), `wcommit-state-${process.pid}`);
 mkdirSync(STATE_DIR_RAW, { recursive: true });
 const STATE_DIR = realpathSync(STATE_DIR_RAW);
 process.env.WORKER_STATE_DIR = STATE_DIR;
 
-import { maybeVerifyAndCommit, resolveStatus } from '../src/runner.ts';
-import { insertJob, updateJob, finalizeJob, getJobFresh } from '../src/state.ts';
-import { renderReport } from '../src/report.ts';
+import { maybeVerifyAndCommit, resolveStatus } from "../src/runner.ts";
+import {
+  insertJob,
+  updateJob,
+  finalizeJob,
+  getJobFresh,
+} from "../src/state.ts";
+import { renderReport } from "../src/report.ts";
 
-
-const REPO_RAW = mkdtempSync(join(tmpdir(), 'wcommit-repo-'));
+const REPO_RAW = mkdtempSync(join(tmpdir(), "wcommit-repo-"));
 const REPO = realpathSync(REPO_RAW);
 
 function git(...args: string[]) {
-  return spawnSync('git', args, { cwd: REPO, encoding: 'utf8' });
+  return spawnSync("git", args, { cwd: REPO, encoding: "utf8" });
 }
 
-git('init', '-q');
-git('config', 'user.email', 'test@test.com');
-git('config', 'user.name', 'Test');
-writeFileSync(join(REPO, 'README.md'), 'init\n');
-git('add', '.');
-git('commit', '-m', 'init', '--no-gpg-sign');
+git("init", "-q");
+git("config", "user.email", "test@test.com");
+git("config", "user.name", "Test");
+writeFileSync(join(REPO, "README.md"), "init\n");
+git("add", ".");
+git("commit", "-m", "init", "--no-gpg-sign");
 
 const tmpDirs: string[] = [REPO, STATE_DIR];
 
 afterAll(() => {
-  for (const d of tmpDirs) { try { rmSync(d, { recursive: true, force: true }); } catch {} }
+  for (const d of tmpDirs) {
+    try {
+      rmSync(d, { recursive: true, force: true });
+    } catch {}
+  }
 });
 
-
 let seq = 0;
-function seedJob(task = 'test task'): string {
+function seedJob(task = "test task"): string {
   const handle = `commit-${process.pid}-${seq++}`;
-  insertJob({ handle, backend: 'cmd', sid: 'test', repo: REPO, log_path: '/tmp/commit-test.log', task });
+  insertJob({
+    handle,
+    backend: "cmd",
+    sid: "test",
+    repo: REPO,
+    log_path: "/tmp/commit-test.log",
+    task,
+  });
   return handle;
 }
 
-
 function commitCount(dir: string = REPO): number {
-  const r = spawnSync('git', ['-C', dir, 'rev-list', '--count', 'HEAD'], { encoding: 'utf8' });
+  const r = spawnSync("git", ["-C", dir, "rev-list", "--count", "HEAD"], {
+    encoding: "utf8",
+  });
   return parseInt(r.stdout.trim(), 10);
 }
 
-
 function isClean(dir: string = REPO): boolean {
-  const r = spawnSync('git', ['-C', dir, 'status', '--porcelain'], { encoding: 'utf8' });
-  return r.stdout.trim() === '';
+  const r = spawnSync("git", ["-C", dir, "status", "--porcelain"], {
+    encoding: "utf8",
+  });
+  return r.stdout.trim() === "";
 }
-
 
 function baseSha(dir: string = REPO): string {
-  return spawnSync('git', ['-C', dir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+  return spawnSync("git", ["-C", dir, "rev-parse", "HEAD"], {
+    encoding: "utf8",
+  }).stdout.trim();
 }
 
-
-describe('maybeVerifyAndCommit — pass-through on non-done', () => {
+describe("maybeVerifyAndCommit — pass-through on non-done", () => {
   it('returns "failed" unchanged, makes no commit', () => {
     const handle = seedJob();
     const before = commitCount();
-    
-    writeFileSync(join(REPO, `dirty-${seq}.txt`), 'x\n');
-    const result = maybeVerifyAndCommit(handle, REPO, 'failed');
-    expect(result).toBe('failed');
+
+    writeFileSync(join(REPO, `dirty-${seq}.txt`), "x\n");
+    const result = maybeVerifyAndCommit(handle, REPO, "failed");
+    expect(result).toBe("failed");
     expect(commitCount()).toBe(before);
   });
 
   it('returns "timeout" unchanged, makes no commit', () => {
     const handle = seedJob();
     const before = commitCount();
-    writeFileSync(join(REPO, `dirty-${seq}.txt`), 'x\n');
-    const result = maybeVerifyAndCommit(handle, REPO, 'timeout');
-    expect(result).toBe('timeout');
+    writeFileSync(join(REPO, `dirty-${seq}.txt`), "x\n");
+    const result = maybeVerifyAndCommit(handle, REPO, "timeout");
+    expect(result).toBe("timeout");
     expect(commitCount()).toBe(before);
   });
 });
 
-describe('maybeVerifyAndCommit — commits on done', () => {
+describe("maybeVerifyAndCommit — commits on done", () => {
   it('with a dirty tree: makes exactly ONE commit, returns "done", working tree is clean', () => {
     const handle = seedJob();
     const before = commitCount();
-    writeFileSync(join(REPO, `change-${seq}.txt`), 'hello\n');
-    const result = maybeVerifyAndCommit(handle, REPO, 'done');
-    expect(result).toBe('done');
+    writeFileSync(join(REPO, `change-${seq}.txt`), "hello\n");
+    const result = maybeVerifyAndCommit(handle, REPO, "done");
+    expect(result).toBe("done");
     expect(commitCount()).toBe(before + 1);
     expect(isClean()).toBe(true);
   });
@@ -96,38 +126,40 @@ describe('maybeVerifyAndCommit — commits on done', () => {
   it('with nothing to commit (already clean): returns "failed:no-changes" and makes no commit', () => {
     const before = commitCount();
     const handle = seedJob();
-    const result = maybeVerifyAndCommit(handle, REPO, 'done');
-    expect(result).toBe('failed:no-changes');
+    const result = maybeVerifyAndCommit(handle, REPO, "done");
+    expect(result).toBe("failed:no-changes");
     expect(commitCount()).toBe(before);
   });
 });
 
-describe('maybeVerifyAndCommit — WORKER_VERIFY_CMD gate', () => {
+describe("maybeVerifyAndCommit — WORKER_VERIFY_CMD gate", () => {
   let origVerifyCmd: string | undefined;
 
-  beforeEach(() => { origVerifyCmd = process.env.WORKER_VERIFY_CMD; });
+  beforeEach(() => {
+    origVerifyCmd = process.env.WORKER_VERIFY_CMD;
+  });
   afterEach(() => {
     if (origVerifyCmd === undefined) delete process.env.WORKER_VERIFY_CMD;
     else process.env.WORKER_VERIFY_CMD = origVerifyCmd;
   });
 
   it('WORKER_VERIFY_CMD="exit 1" on done → returns "failed:verify", NO commit', () => {
-    process.env.WORKER_VERIFY_CMD = 'exit 1';
+    process.env.WORKER_VERIFY_CMD = "exit 1";
     const handle = seedJob();
     const before = commitCount();
-    writeFileSync(join(REPO, `verify-fail-${seq}.txt`), 'x\n');
-    const result = maybeVerifyAndCommit(handle, REPO, 'done');
-    expect(result).toBe('failed:verify');
+    writeFileSync(join(REPO, `verify-fail-${seq}.txt`), "x\n");
+    const result = maybeVerifyAndCommit(handle, REPO, "done");
+    expect(result).toBe("failed:verify");
     expect(commitCount()).toBe(before);
   });
 
   it('WORKER_VERIFY_CMD="true" on done → commits, returns "done"', () => {
-    process.env.WORKER_VERIFY_CMD = 'true';
+    process.env.WORKER_VERIFY_CMD = "true";
     const handle = seedJob();
     const before = commitCount();
-    writeFileSync(join(REPO, `verify-pass-${seq}.txt`), 'y\n');
-    const result = maybeVerifyAndCommit(handle, REPO, 'done');
-    expect(result).toBe('done');
+    writeFileSync(join(REPO, `verify-pass-${seq}.txt`), "y\n");
+    const result = maybeVerifyAndCommit(handle, REPO, "done");
+    expect(result).toBe("done");
     expect(commitCount()).toBe(before + 1);
   });
 
@@ -135,119 +167,141 @@ describe('maybeVerifyAndCommit — WORKER_VERIFY_CMD gate', () => {
     delete process.env.WORKER_VERIFY_CMD;
     const handle = seedJob();
     const before = commitCount();
-    writeFileSync(join(REPO, `verify-unset-${seq}.txt`), 'z\n');
-    const result = maybeVerifyAndCommit(handle, REPO, 'done');
-    expect(result).toBe('done');
+    writeFileSync(join(REPO, `verify-unset-${seq}.txt`), "z\n");
+    const result = maybeVerifyAndCommit(handle, REPO, "done");
+    expect(result).toBe("done");
     expect(commitCount()).toBe(before + 1);
   });
 });
 
-describe('maybeVerifyAndCommit — excludes .codegraph', () => {
-  it('does not commit the .codegraph symlink when real changes exist', () => {
-    const handle = seedJob('codegraph exclusion test');
+describe("maybeVerifyAndCommit — excludes .codegraph", () => {
+  it("does not commit the .codegraph symlink when real changes exist", () => {
+    const handle = seedJob("codegraph exclusion test");
     const before = commitCount();
     const fileName = `codegraph-${seq}.txt`;
-    writeFileSync(join(REPO, fileName), 'real change\n');
-    symlinkSync(REPO, join(REPO, '.codegraph'));
+    writeFileSync(join(REPO, fileName), "real change\n");
+    symlinkSync(REPO, join(REPO, ".codegraph"));
 
-    const result = maybeVerifyAndCommit(handle, REPO, 'done');
-    expect(result).toBe('done');
+    const result = maybeVerifyAndCommit(handle, REPO, "done");
+    expect(result).toBe("done");
     expect(commitCount()).toBe(before + 1);
 
-    const show = spawnSync('git', ['-C', REPO, 'show', '--pretty=format:', '--name-only', 'HEAD'], { encoding: 'utf8' });
+    const show = spawnSync(
+      "git",
+      ["-C", REPO, "show", "--pretty=format:", "--name-only", "HEAD"],
+      { encoding: "utf8" },
+    );
     expect(show.stdout).toContain(fileName);
-    expect(show.stdout).not.toContain('.codegraph');
+    expect(show.stdout).not.toContain(".codegraph");
 
-    unlinkSync(join(REPO, '.codegraph'));
+    unlinkSync(join(REPO, ".codegraph"));
   });
 });
 
-describe('base-ref diff — committed work still surfaces', () => {
-  it('plain git diff is empty after commit but base-ref diff shows the change', () => {
-    
+describe("base-ref diff — committed work still surfaces", () => {
+  it("plain git diff is empty after commit but base-ref diff shows the change", () => {
     const base = baseSha();
-    const handle = seedJob('base-ref test');
-    
+    const handle = seedJob("base-ref test");
+
     const fileName = `base-ref-${seq}.txt`;
-    writeFileSync(join(REPO, fileName), 'committed content\n');
-    const result = maybeVerifyAndCommit(handle, REPO, 'done');
-    expect(result).toBe('done');
+    writeFileSync(join(REPO, fileName), "committed content\n");
+    const result = maybeVerifyAndCommit(handle, REPO, "done");
+    expect(result).toBe("done");
     expect(isClean()).toBe(true);
 
-    
-    const plainDiff = spawnSync('git', ['-C', REPO, 'diff'], { encoding: 'utf8' });
-    expect(plainDiff.stdout.trim()).toBe('');
+    const plainDiff = spawnSync("git", ["-C", REPO, "diff"], {
+      encoding: "utf8",
+    });
+    expect(plainDiff.stdout.trim()).toBe("");
 
-    
-    const baseDiff = spawnSync('git', ['-C', REPO, 'diff', base], { encoding: 'utf8' });
+    const baseDiff = spawnSync("git", ["-C", REPO, "diff", base], {
+      encoding: "utf8",
+    });
     expect(baseDiff.stdout).toContain(fileName);
-    expect(baseDiff.stdout).toContain('committed content');
+    expect(baseDiff.stdout).toContain("committed content");
   });
 
-  it('renderReport with base_sha on a done job passes base_sha to the diff fn', () => {
+  it("renderReport with base_sha on a done job passes base_sha to the diff fn", () => {
     const base = baseSha();
 
-    
     const handle = `commit-render-${process.pid}-${seq++}`;
-    insertJob({ handle, backend: 'cmd', sid: 'test', repo: REPO, log_path: '/tmp/x.log', task: 'render base_sha test', base_sha: base });
-    updateJob(handle, { status: 'done', finished: new Date().toISOString(), worktree_path: REPO, base_sha: base });
+    insertJob({
+      handle,
+      backend: "cmd",
+      sid: "test",
+      repo: REPO,
+      log_path: "/tmp/x.log",
+      task: "render base_sha test",
+      base_sha: base,
+    });
+    updateJob(handle, {
+      status: "done",
+      finished: new Date().toISOString(),
+      worktree_path: REPO,
+      base_sha: base,
+    });
 
-    
-    let capturedBaseSha: string | undefined = 'NOT_CALLED';
+    let capturedBaseSha: string | undefined = "NOT_CALLED";
     renderReport(handle, `/any/${handle}/.lock`, (_repo, sha) => {
       capturedBaseSha = sha;
-      return 'DIFFBODY';
+      return "DIFFBODY";
     });
     expect(capturedBaseSha).toBe(base);
   });
 });
 
-
-describe('integration — wired completion sequence commits on a real worktree', () => {
-  it('resolveStatus done → maybeVerifyAndCommit → finalizeJob lands one commit, base-ref diff shows it', () => {
-    
-    const WT = realpathSync(mkdtempSync(join(tmpdir(), 'wcommit-wt-')));
+describe("integration — wired completion sequence commits on a real worktree", () => {
+  it("resolveStatus done → maybeVerifyAndCommit → finalizeJob lands one commit, base-ref diff shows it", () => {
+    const WT = realpathSync(mkdtempSync(join(tmpdir(), "wcommit-wt-")));
     tmpDirs.push(WT);
-    const g = (...a: string[]) => spawnSync('git', ['-C', WT, ...a], { encoding: 'utf8' });
-    g('init', '-q');
-    g('config', 'user.email', 'test@test.com');
-    g('config', 'user.name', 'Test');
-    writeFileSync(join(WT, 'README.md'), 'init\n');
-    g('add', '.');
-    g('commit', '-m', 'init', '--no-gpg-sign');
+    const g = (...a: string[]) =>
+      spawnSync("git", ["-C", WT, ...a], { encoding: "utf8" });
+    g("init", "-q");
+    g("config", "user.email", "test@test.com");
+    g("config", "user.name", "Test");
+    writeFileSync(join(WT, "README.md"), "init\n");
+    g("add", ".");
+    g("commit", "-m", "init", "--no-gpg-sign");
 
-    
-    const base = g('rev-parse', 'HEAD').stdout.trim();
+    const base = g("rev-parse", "HEAD").stdout.trim();
 
-    
-    const emptyLog = join(WT, 'run.log');
-    writeFileSync(emptyLog, '');
+    const emptyLog = join(WT, "run.log");
+    writeFileSync(emptyLog, "");
 
     const handle = `commit-integ-${process.pid}-${seq++}`;
-    insertJob({ handle, backend: 'cmd', sid: 'test', repo: WT, worktree_path: WT, base_sha: base, log_path: emptyLog, task: 'integration wired commit' });
+    insertJob({
+      handle,
+      backend: "cmd",
+      sid: "test",
+      repo: WT,
+      worktree_path: WT,
+      base_sha: base,
+      log_path: emptyLog,
+      task: "integration wired commit",
+    });
 
-    
-    writeFileSync(join(WT, 'feature.txt'), 'real work product\n');
-    
+    writeFileSync(join(WT, "feature.txt"), "real work product\n");
+
     const before = commitCount(WT);
 
-    const natural = resolveStatus('cmd', 0, emptyLog, false);
-    expect(natural).toBe('done');
+    const natural = resolveStatus("cmd", 0, emptyLog, false);
+    expect(natural).toBe("done");
     const gated = maybeVerifyAndCommit(handle, WT, natural);
-    const status = finalizeJob(handle, gated, { resume_token: '' });
+    const status = finalizeJob(handle, gated, { resume_token: "" });
 
-    
-    expect(status).toBe('done');
+    expect(status).toBe("done");
     expect(commitCount(WT)).toBe(before + 1);
     expect(isClean(WT)).toBe(true);
 
-    
-    expect(spawnSync('git', ['-C', WT, 'diff'], { encoding: 'utf8' }).stdout.trim()).toBe('');
-    const baseDiff = spawnSync('git', ['-C', WT, 'diff', base], { encoding: 'utf8' });
-    expect(baseDiff.stdout).toContain('feature.txt');
-    expect(baseDiff.stdout).toContain('real work product');
+    expect(
+      spawnSync("git", ["-C", WT, "diff"], { encoding: "utf8" }).stdout.trim(),
+    ).toBe("");
+    const baseDiff = spawnSync("git", ["-C", WT, "diff", base], {
+      encoding: "utf8",
+    });
+    expect(baseDiff.stdout).toContain("feature.txt");
+    expect(baseDiff.stdout).toContain("real work product");
 
-    
     expect(getJobFresh(handle)?.base_sha).toBe(base);
   });
 });

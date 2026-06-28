@@ -1,33 +1,59 @@
-import { appendLadder, chainLockPath, createChainLock, removeChainLock, removeChainMeta, getJob, saveChainMeta, loadChainMeta } from './state.ts';
-import { LADDER, type Backend } from './backends.ts';
-import { type RunResult } from './runner.ts';
-import { launch, SERVER_STARTED } from './lifecycle.ts';
-import { defaultTimeoutMs } from './env.ts';
-import { type SeedContext } from './backends.ts';
-import { randomUUID } from 'crypto';
+import {
+  appendLadder,
+  chainLockPath,
+  createChainLock,
+  removeChainLock,
+  removeChainMeta,
+  getJob,
+  saveChainMeta,
+  loadChainMeta,
+} from "./state.ts";
+import { LADDER, type Backend } from "./backends.ts";
+import { type RunResult } from "./runner.ts";
+import { launch, SERVER_STARTED } from "./lifecycle.ts";
+import { defaultTimeoutMs } from "./env.ts";
+import { type SeedContext } from "./backends.ts";
+import { randomUUID } from "crypto";
 
-type LadderResult = { handle: string; status: string; workdir: string } | { status: 'exhausted'; note: string };
+type LadderResult =
+  | { handle: string; status: string; workdir: string }
+  | { status: "exhausted"; note: string };
 
-export type LadderDrivers = {
-  // seed carries only the PRIOR rung's context for the continuation preamble — the prior work itself
-  // already lives in the shared worktree (reuse), so there is no copy.
+type LadderDrivers = {
   runRung: (backend: Backend, seed?: SeedContext) => Promise<RunResult>;
 };
 
-// deps.launch is a test seam — production callers omit it and get the real launch. Lets a test
-// drive handleLadder with a stub launcher (no real backend spawn, no global module mock).
-export function handleLadder(args: { mcpSid: string; prompt: string; dir: string; timeout?: number; complex?: boolean; specFile?: string }, deps: { launch?: typeof launch } = {}): LadderResult {
+export function handleLadder(
+  args: {
+    mcpSid: string;
+    prompt: string;
+    dir: string;
+    timeout?: number;
+    complex?: boolean;
+    specFile?: string;
+  },
+  deps: { launch?: typeof launch } = {},
+): LadderResult {
   const { mcpSid, prompt, dir, complex, specFile } = args;
   const launchFn = deps.launch ?? launch;
   const chainId = randomUUID();
-  const chainDeadlineAt = Date.now() + (args.timeout ? args.timeout * 1000 : defaultTimeoutMs());
+  const chainDeadlineAt =
+    Date.now() + (args.timeout ? args.timeout * 1000 : defaultTimeoutMs());
 
-  if (LADDER.length === 0) return { status: 'exhausted', note: 'no workers available' };
+  if (LADDER.length === 0)
+    return { status: "exhausted", note: "no workers available" };
 
   createChainLock(chainId, process.pid, SERVER_STARTED);
   saveChainMeta(chainId, { deadlineAt: chainDeadlineAt });
-  const chainHandle = randomUUID(); // full UUID — safe for all backends including claude --session-id
-  const first = launchFn(LADDER[0], prompt, dir, { mcpSid, complex, deadlineAt: chainDeadlineAt, completionLock: chainLockPath(chainId), handle: chainHandle, specFile });
+  const chainHandle = randomUUID();
+  const first = launchFn(LADDER[0], prompt, dir, {
+    mcpSid,
+    complex,
+    deadlineAt: chainDeadlineAt,
+    completionLock: chainLockPath(chainId),
+    handle: chainHandle,
+    specFile,
+  });
   const drivers: LadderDrivers = {
     // Every rung after the first reuses the shared chain handle (one job.json) and the first rung's
     // worktree + base_sha: the prior rung's work already lives in that tree, so the report
@@ -39,9 +65,13 @@ export function handleLadder(args: { mcpSid: string; prompt: string; dir: string
     runRung: (backend, seed) => {
       const firstJob = getJob(first.handle);
       if (!firstJob || !firstJob.worktree_path) {
-        console.error(`[ladder] reuse worktree missing for chain ${chainId} (first handle ${first.handle}); rung ${backend} runs in a fresh tree, prior work not carried`);
+        console.error(
+          `[ladder] reuse worktree missing for chain ${chainId} (first handle ${first.handle}); rung ${backend} runs in a fresh tree, prior work not carried`,
+        );
       } else if (!firstJob.base_sha) {
-        console.error(`[ladder] reuse base_sha missing for chain ${chainId}; report diff for rung ${backend} anchored to current HEAD, may omit committed work`);
+        console.error(
+          `[ladder] reuse base_sha missing for chain ${chainId}; report diff for rung ${backend} anchored to current HEAD, may omit committed work`,
+        );
       }
       return launchFn(backend, prompt, dir, {
         mcpSid,
@@ -57,15 +87,28 @@ export function handleLadder(args: { mcpSid: string; prompt: string; dir: string
     },
   };
 
-  const chainPromise = runLadderChain(chainId, first.promise, drivers, chainDeadlineAt)
+  const chainPromise = runLadderChain(
+    chainId,
+    first.promise,
+    drivers,
+    chainDeadlineAt,
+  )
     .catch((): RunResult => ({
-      status: 'failed', exit_code: 1, backend: LADDER[0], handle: chainHandle,
-      resume_token: chainHandle, repo: dir, log: '',
+      status: "failed",
+      exit_code: 1,
+      backend: LADDER[0],
+      handle: chainHandle,
+      resume_token: chainHandle,
+      repo: dir,
+      log: "",
     }))
-    .finally(() => { removeChainLock(chainId); removeChainMeta(chainId); });
+    .finally(() => {
+      removeChainLock(chainId);
+      removeChainMeta(chainId);
+    });
 
   void chainPromise;
-  return { handle: chainHandle, status: 'running', workdir: first.workdir };
+  return { handle: chainHandle, status: "running", workdir: first.workdir };
 }
 
 export async function runLadderChain(
@@ -80,30 +123,48 @@ export async function runLadderChain(
   appendLadder(chainId, turn++, LADDER[i], result.status);
 
   for (;;) {
-    // timeout is terminal: deadline+grace expired with no extend → no retry, no climb.
-    if (result.status === 'done' || result.status === 'killed' || result.status === 'timeout') return result;
+    if (
+      result.status === "done" ||
+      result.status === "killed" ||
+      result.status === "timeout"
+    )
+      return result;
 
-    if (result.status === 'stalled') {
-      // one fresh re-run of the SAME backend, reusing the chain's shared worktree (prior work is
-      // already in it — handleLadder threads reuseWorktree/reuseBaseSha into each rung)
-      if (Date.now() >= effectiveChainDeadline(chainId, chainDeadlineAt)) return { ...result, status: 'timeout' };
+    if (result.status === "stalled") {
+      if (Date.now() >= effectiveChainDeadline(chainId, chainDeadlineAt))
+        return { ...result, status: "timeout" };
 
-      result = await drivers.runRung(LADDER[i], { priorBackend: LADDER[i], priorStatus: result.status });
+      result = await drivers.runRung(LADDER[i], {
+        priorBackend: LADDER[i],
+        priorStatus: result.status,
+      });
       appendLadder(chainId, turn++, LADDER[i], result.status);
-      if (result.status === 'done' || result.status === 'killed' || result.status === 'timeout') return result;
+      if (
+        result.status === "done" ||
+        result.status === "killed" ||
+        result.status === "timeout"
+      )
+        return result;
     }
 
     i++;
-    if (i >= LADDER.length) return { ...result, status: 'exhausted' };
-    if (Date.now() >= effectiveChainDeadline(chainId, chainDeadlineAt)) return { ...result, status: 'timeout' };
+    if (i >= LADDER.length) return { ...result, status: "exhausted" };
+    if (Date.now() >= effectiveChainDeadline(chainId, chainDeadlineAt))
+      return { ...result, status: "timeout" };
 
-    result = await drivers.runRung(LADDER[i], { priorBackend: LADDER[i - 1], priorStatus: result.status });
+    result = await drivers.runRung(LADDER[i], {
+      priorBackend: LADDER[i - 1],
+      priorStatus: result.status,
+    });
     appendLadder(chainId, turn++, LADDER[i], result.status);
   }
 }
 
 // The effective chain deadline reflects worker_extend bumps, which handleExtend writes to the
 // .chain.meta sidecar. Fall back to the launch-time value if the sidecar is missing/unreadable.
-export function effectiveChainDeadline(chainId: string, fallback: number): number {
+export function effectiveChainDeadline(
+  chainId: string,
+  fallback: number,
+): number {
   return loadChainMeta(chainId)?.deadlineAt ?? fallback;
 }

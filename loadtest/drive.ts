@@ -38,7 +38,7 @@ console.log(`load: N=${N} poll=${process.env.WORKER_POLL_MS}ms resume_poll=${pro
 
 const { launch, resetShutdownState } = await import('../src/lifecycle.ts');
 const { __resetPidCache } = await import('../src/process.ts');
-const { __resetActivityMonitors } = await import('../src/monitor.ts');
+const { __resetActivityMonitors } = await import('../src/runner.ts');
 const { __resetSentinelCache } = await import('../src/logParse.ts');
 
 __resetPidCache();

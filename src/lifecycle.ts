@@ -1,43 +1,57 @@
-import { randomUUID } from 'crypto';
-import { spawn, spawnSync } from 'child_process';
-import { readFileSync, unlinkSync, writeFileSync } from 'fs';
-import { join } from 'path';
-import { killProcessTree, getProcessStartTime } from './process.ts';
+import { randomUUID } from "crypto";
+import { spawn, spawnSync } from "child_process";
+import { readFileSync, unlinkSync, writeFileSync } from "fs";
+import { join } from "path";
+import { killProcessTree, getProcessStartTime } from "./process.ts";
 import {
-  handleDirUncached, insertJob, getJob, updateJob, logPath as workerLogPath, finalizeJob, reaperPidPath,
+  handleDirUncached,
+  insertJob,
+  getJob,
+  updateJob,
+  logPath as workerLogPath,
+  finalizeJob,
+  reaperPidPath,
   isInPlaceOwner,
-} from './state.ts';
-import { addWorktreeAsync, clearStaleIndexLock } from './worktree.ts';
-import { buildSpec, buildRunArgv, buildResumeArgv, getResumeToken, type Backend } from './backends.ts';
-import { runWorker, type RunResult } from './runner.ts';
-import { loginShellEnvAsync } from './env.ts';
-import { isProcessAlive } from './process.ts';
-import { buildContinuationPreamble, type SeedContext } from './backends.ts';
-import { killAndFinalizeJobs } from './daemon.ts';
+} from "./state.ts";
+import { addWorktreeAsync, clearStaleIndexLock } from "./worktree.ts";
+import {
+  buildSpec,
+  buildRunArgv,
+  buildResumeArgv,
+  getResumeToken,
+  type Backend,
+} from "./backends.ts";
+import { runWorker, type RunResult } from "./runner.ts";
+import { loginShellEnvAsync } from "./env.ts";
+import { isProcessAlive } from "./process.ts";
+import { buildContinuationPreamble, type SeedContext } from "./backends.ts";
+import { killAndFinalizeJobs } from "./daemon.ts";
 
-// --- Server lifecycle state ---
-// Use the OS-reported process start (ps etime), not module-import time. server_started is the
-// pid-reuse guard: isProcessAlive() matches it against `ps` start time with a 60s skew window.
-// new Date() at import lags real start whenever this module is imported late (e.g. a big test
-// run importing it ~minutes in), pushing skew past 60s so the server's own job reads as dead.
-export const SERVER_STARTED = getProcessStartTime(process.pid) ?? new Date().toISOString();
-const SERVER_SID = process.env.CLAUDE_CODE_SESSION_ID ?? '';
+export const SERVER_STARTED =
+  getProcessStartTime(process.pid) ?? new Date().toISOString();
+const SERVER_SID = process.env.CLAUDE_CODE_SESSION_ID ?? "";
 const launchedHandles = new Set<string>();
 
-export function trackLaunched(handle: string) { launchedHandles.add(handle); }
-function untrackLaunched(handle: string) { launchedHandles.delete(handle); }
-// --- External reaper (detached background orphan sweeper) ---
+export function trackLaunched(handle: string) {
+  launchedHandles.add(handle);
+}
+function untrackLaunched(handle: string) {
+  launchedHandles.delete(handle);
+}
 let _reaperPid: number | undefined;
 let _reaperOwned = false;
 
 function readReaperPid(pidPath: string): number | null {
   try {
-    const parsed = Number(readFileSync(pidPath, 'utf8').trim());
+    const parsed = Number(readFileSync(pidPath, "utf8").trim());
     return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
   } catch (err) {
     // ENOENT is normal: no reaper has been spawned yet on a fresh start.
-    if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
-      console.error('[worker] failed to read reaper pid:', err instanceof Error ? err.message : err);
+    if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
+      console.error(
+        "[worker] failed to read reaper pid:",
+        err instanceof Error ? err.message : err,
+      );
     }
     return null;
   }
@@ -46,7 +60,7 @@ function readReaperPid(pidPath: string): number | null {
 export function spawnReaper(): void {
   try {
     if (_reaperPid && isProcessAlive(_reaperPid)) return;
-    const reaperPath = new URL('./reaper.ts', import.meta.url).pathname;
+    const reaperPath = new URL("./reaper.ts", import.meta.url).pathname;
     const pidPath = reaperPidPath();
     const existing = readReaperPid(pidPath);
     if (existing && isProcessAlive(existing)) {
@@ -54,68 +68,98 @@ export function spawnReaper(): void {
       _reaperOwned = false;
       return;
     }
-    try { unlinkSync(pidPath); } catch {}
-    const child = spawn('bun', ['run', reaperPath], {
+    try {
+      unlinkSync(pidPath);
+    } catch {}
+    const child = spawn("bun", ["run", reaperPath], {
       detached: true,
-      stdio: 'ignore',
+      stdio: "ignore",
     });
     child.unref();
     _reaperPid = child.pid;
     _reaperOwned = true;
     if (child.pid) {
-      try { writeFileSync(pidPath, `${child.pid}\n`); } catch {}
+      try {
+        writeFileSync(pidPath, `${child.pid}\n`);
+      } catch {}
     }
   } catch (err) {
-    console.error('[worker] failed to spawn reaper:', err instanceof Error ? err.message : err);
+    console.error(
+      "[worker] failed to spawn reaper:",
+      err instanceof Error ? err.message : err,
+    );
   }
 }
-// --- Repo guard ---
 const _repoChecked = new Set<string>();
+
 export function assertRepo(dir: string) {
   if (_repoChecked.has(dir)) return;
   try {
-    const result = spawnSync('git', ['rev-parse', '--is-inside-work-tree'], { cwd: dir, stdio: 'ignore' });
-    if (result.status !== 0) throw new Error('not a git repo');
+    const result = spawnSync("git", ["rev-parse", "--is-inside-work-tree"], {
+      cwd: dir,
+      stdio: "ignore",
+    });
+    if (result.status !== 0) throw new Error("not a git repo");
+  } catch {
+    throw new Error(`Not a git repo: ${dir}`);
   }
-  catch { throw new Error(`Not a git repo: ${dir}`); }
   _repoChecked.add(dir);
 }
 
-// Single source for backend-aware process kill. markRequested sets kill_requested
-// (forceKillJob path); shutdown passes false so jobs stay resumable.
-function killByBackend(job: { handle: string; backend: string; worker_pid: number }, markRequested: boolean): void {
+function killByBackend(
+  job: { handle: string; backend: string; worker_pid: number },
+  markRequested: boolean,
+): void {
   if (markRequested) updateJob(job.handle, { kill_requested: true });
   if (job.worker_pid > 0) {
-    killProcessTree(job.worker_pid, 'SIGKILL');
+    killProcessTree(job.worker_pid, "SIGKILL");
   }
 }
 
-export function forceKillJob(job: { handle: string; backend: string; worker_pid: number; log_path: string }): void {
+export function forceKillJob(job: {
+  handle: string;
+  backend: string;
+  worker_pid: number;
+  log_path: string;
+}): void {
   killByBackend(job, true);
 }
 
 function newHandle(backend: Backend): string {
   const id = randomUUID();
-  return backend === 'claude' ? id : `w-${id.slice(0, 8)}`;
+  return backend === "claude" ? id : `w-${id.slice(0, 8)}`;
 }
 
-type LaunchResult = { handle: string; promise: Promise<RunResult>; workdir: string };
+type LaunchResult = {
+  handle: string;
+  promise: Promise<RunResult>;
+  workdir: string;
+};
 
-// Finalize a job as failed when its run promise rejects, then rethrow.
-function failOnError(handle: string, p: Promise<RunResult>): Promise<RunResult> {
+function failOnError(
+  handle: string,
+  p: Promise<RunResult>,
+): Promise<RunResult> {
   return p.catch((err: unknown) => {
-    finalizeJob(handle, 'failed');
+    finalizeJob(handle, "failed");
     throw err;
   });
 }
 
-function gitRevParse(dir: string, ...args: string[]): Promise<string | undefined> {
-  return new Promise(resolve => {
+function gitRevParse(
+  dir: string,
+  ...args: string[]
+): Promise<string | undefined> {
+  return new Promise((resolve) => {
     const chunks: Buffer[] = [];
-    const p = spawn('git', ['-C', dir, 'rev-parse', ...args], { stdio: ['ignore', 'pipe', 'ignore'] });
-    p.stdout?.on('data', (d: Buffer) => chunks.push(d));
-    p.on('close', () => resolve(Buffer.concat(chunks).toString().trim() || undefined));
-    p.on('error', () => resolve(undefined));
+    const p = spawn("git", ["-C", dir, "rev-parse", ...args], {
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    p.stdout?.on("data", (d: Buffer) => chunks.push(d));
+    p.on("close", () =>
+      resolve(Buffer.concat(chunks).toString().trim() || undefined),
+    );
+    p.on("error", () => resolve(undefined));
   });
 }
 
@@ -123,7 +167,20 @@ export function launch(
   backend: Backend,
   prompt: string,
   dir: string,
-  opts: { mcpSid: string; model?: string; complex?: boolean; extraArgs?: string[]; timeoutMs?: number; deadlineAt?: number; completionLock?: string; seed?: SeedContext; reuseWorktree?: string; reuseBaseSha?: string; handle?: string; specFile?: string },
+  opts: {
+    mcpSid: string;
+    model?: string;
+    complex?: boolean;
+    extraArgs?: string[];
+    timeoutMs?: number;
+    deadlineAt?: number;
+    completionLock?: string;
+    seed?: SeedContext;
+    reuseWorktree?: string;
+    reuseBaseSha?: string;
+    handle?: string;
+    specFile?: string;
+  },
 ): LaunchResult {
   const handle = opts.handle ?? newHandle(backend);
   trackLaunched(handle);
@@ -135,10 +192,27 @@ export function launch(
     spec = buildContinuationPreamble(opts.seed) + spec;
   }
 
-  const treePath = join(handleDirUncached(handle, dir), 'tree');
-  const claudeModel = opts.complex ? 'sonnet' : 'haiku';
-  const modelToUse = backend === 'claude' ? (opts.model ?? claudeModel) : undefined;
-  insertJob({ handle, backend, sid: opts.mcpSid, repo: dir, worktree_path: reuse ?? treePath, base_sha: opts.reuseBaseSha, model: modelToUse, task: prompt, log_path: lp, completion_lock: opts.completionLock, server_pid: process.pid, server_started: SERVER_STARTED, server_sid: SERVER_SID, deadline_at: opts.deadlineAt, spec_file: opts.specFile });
+  const treePath = join(handleDirUncached(handle, dir), "tree");
+  const claudeModel = opts.complex ? "sonnet" : "haiku";
+  const modelToUse =
+    backend === "claude" ? (opts.model ?? claudeModel) : undefined;
+  insertJob({
+    handle,
+    backend,
+    sid: opts.mcpSid,
+    repo: dir,
+    worktree_path: reuse ?? treePath,
+    base_sha: opts.reuseBaseSha,
+    model: modelToUse,
+    task: prompt,
+    log_path: lp,
+    completion_lock: opts.completionLock,
+    server_pid: process.pid,
+    server_started: SERVER_STARTED,
+    server_sid: SERVER_SID,
+    deadline_at: opts.deadlineAt,
+    spec_file: opts.specFile,
+  });
 
   // The job is now 'running' on disk; spawn the orphan reaper (idempotent) so a SIGKILL of
   // this server still cleans up the worker. It self-exits once no running jobs remain, so an
@@ -149,44 +223,68 @@ export function launch(
   const wt = reuse ?? (inPlace ? dir : treePath);
   if (inPlace) updateJob(handle, { worktree_path: dir });
 
-  const promise: Promise<RunResult> = failOnError(handle, (async () => {
-    try {
-      if (reuse) {
-        clearStaleIndexLock(reuse);
-        await loginShellEnvAsync();
-      } else if (inPlace) {
-        const [, base_sha, branch] = await Promise.all([
-          loginShellEnvAsync(),
-          gitRevParse(dir, 'HEAD'),
-          (await gitRevParse(dir, '--abbrev-ref', 'HEAD')) ?? 'HEAD',
-        ]);
+  const promise: Promise<RunResult> = failOnError(
+    handle,
+    (async () => {
+      try {
+        if (reuse) {
+          clearStaleIndexLock(reuse);
+          await loginShellEnvAsync();
+        } else if (inPlace) {
+          const [, base_sha, branch] = await Promise.all([
+            loginShellEnvAsync(),
+            gitRevParse(dir, "HEAD"),
+            (await gitRevParse(dir, "--abbrev-ref", "HEAD")) ?? "HEAD",
+          ]);
 
-        if (base_sha) updateJob(handle, { base_sha });
-        updateJob(handle, { branch });
-      } else {
-        const [createdWt, , base_sha] = await Promise.all([
-          addWorktreeAsync(dir, handle),
-          loginShellEnvAsync(),
-          gitRevParse(dir, 'HEAD'),
-        ]);
-        if (createdWt !== wt) throw new Error(`worktree path mismatch for ${handle}`);
-        if (base_sha) updateJob(handle, { base_sha });
-        updateJob(handle, { branch: `worker/${handle}` });
+          if (base_sha) updateJob(handle, { base_sha });
+          updateJob(handle, { branch });
+        } else {
+          const [createdWt, , base_sha] = await Promise.all([
+            addWorktreeAsync(dir, handle),
+            loginShellEnvAsync(),
+            gitRevParse(dir, "HEAD"),
+          ]);
+          if (createdWt !== wt)
+            throw new Error(`worktree path mismatch for ${handle}`);
+          if (base_sha) updateJob(handle, { base_sha });
+          updateJob(handle, { branch: `worker/${handle}` });
+        }
+      } catch (err) {
+        untrackLaunched(handle);
+        throw err;
       }
-    } catch (err) {
-      untrackLaunched(handle);
-      throw err;
-    }
 
-    const argv = buildRunArgv(backend, spec, wt, handle, modelToUse, opts.extraArgs);
-    const initToken = backend === 'opencode' ? '' : getResumeToken(backend, handle, lp);
-    const result = await runWorker(argv, wt, handle, backend, lp, initToken, opts.timeoutMs, opts.deadlineAt);
-    if (backend === 'opencode') {
-      const tok = getResumeToken('opencode', handle, lp);
-      if (tok) { result.resume_token = tok; updateJob(handle, { resume_token: tok }); }
-    }
-    return result;
-  })()).finally(() => untrackLaunched(handle));
+      const argv = buildRunArgv(
+        backend,
+        spec,
+        wt,
+        handle,
+        modelToUse,
+        opts.extraArgs,
+      );
+      const initToken =
+        backend === "opencode" ? "" : getResumeToken(backend, handle, lp);
+      const result = await runWorker(
+        argv,
+        wt,
+        handle,
+        backend,
+        lp,
+        initToken,
+        opts.timeoutMs,
+        opts.deadlineAt,
+      );
+      if (backend === "opencode") {
+        const tok = getResumeToken("opencode", handle, lp);
+        if (tok) {
+          result.resume_token = tok;
+          updateJob(handle, { resume_token: tok });
+        }
+      }
+      return result;
+    })(),
+  ).finally(() => untrackLaunched(handle));
 
   return { handle, promise, workdir: wt };
 }
@@ -195,26 +293,44 @@ export async function shutdown(): Promise<void> {
   _shuttingDown = true;
 
   if (_reaperOwned && _reaperPid) {
-    try { process.kill(_reaperPid, 'SIGTERM'); } catch (err) {
-      console.error('[worker] failed to kill reaper:', err instanceof Error ? err.message : err);
+    try {
+      process.kill(_reaperPid, "SIGTERM");
+    } catch (err) {
+      console.error(
+        "[worker] failed to kill reaper:",
+        err instanceof Error ? err.message : err,
+      );
     }
   }
 
   const jobs: NonNullable<ReturnType<typeof getJob>>[] = [];
   for (const handle of launchedHandles) {
     const job = getJob(handle);
-    if (!job || (job.status !== 'running' && job.status !== 'stopped')) continue;
+    if (!job || (job.status !== "running" && job.status !== "stopped"))
+      continue;
     jobs.push(job);
   }
   launchedHandles.clear();
 
-  killAndFinalizeJobs(jobs, 'failed');
+  killAndFinalizeJobs(jobs, "failed");
   process.exit(0);
 }
 let _shuttingDown = false;
-export function resetShutdownState(): void { _shuttingDown = false; launchedHandles.clear(); _reaperPid = undefined; _reaperOwned = false; }
+export function resetShutdownState(): void {
+  _shuttingDown = false;
+  launchedHandles.clear();
+  _reaperPid = undefined;
+  _reaperOwned = false;
+}
 
-export function resumeLaunch(args: { handle: string; prompt: string; dir: string; timeout?: number; extraArgs?: string[]; specFile?: string }): { handle: string; promise: Promise<RunResult>; workdir: string } {
+export function resumeLaunch(args: {
+  handle: string;
+  prompt: string;
+  dir: string;
+  timeout?: number;
+  extraArgs?: string[];
+  specFile?: string;
+}): { handle: string; promise: Promise<RunResult>; workdir: string } {
   const { handle, prompt, dir, timeout, extraArgs, specFile } = args;
   const job = getJob(handle);
   if (!job) throw new Error(`No job found for handle: ${handle}`);
@@ -225,12 +341,28 @@ export function resumeLaunch(args: { handle: string; prompt: string; dir: string
   const be = job.backend as Backend;
   const lp = workerLogPath(handle);
   let spec = buildSpec(prompt);
-  if (be === 'cmd') {
-    spec = `A prior attempt already ran in this repo — inspect the working tree, determine what is already done, and complete only the remainder.\n\n` + spec;
+  if (be === "cmd") {
+    spec =
+      `A prior attempt already ran in this repo — inspect the working tree, determine what is already done, and complete only the remainder.\n\n` +
+      spec;
   }
-  const argv = buildResumeArgv(be, spec, wtDir, job.resume_token, job.model, extraArgs);
+  const argv = buildResumeArgv(
+    be,
+    spec,
+    wtDir,
+    job.resume_token,
+    job.model,
+    extraArgs,
+  );
   if (specFile) updateJob(handle, { spec_file: specFile });
-  const p = runWorker(argv, wtDir, handle, be, lp,
-    job.resume_token, timeout ? timeout * 1000 : undefined);
+  const p = runWorker(
+    argv,
+    wtDir,
+    handle,
+    be,
+    lp,
+    job.resume_token,
+    timeout ? timeout * 1000 : undefined,
+  );
   return { handle, promise: failOnError(handle, p), workdir: wtDir };
 }

@@ -22,7 +22,7 @@ writeFileSync(join(REPO, 'README.md'), '# x\n');
 spawnSync('git', ['-C', REPO, 'add', 'README.md']);
 spawnSync('git', ['-C', REPO, 'commit', '-q', '-m', 'init']);
 
-const { startActivityMonitor, __resetActivityMonitors } = await import('../src/monitor.ts');
+const { startActivityMonitor, __resetActivityMonitors } = await import('../src/runner.ts');
 const { runWorker } = await import('../src/runner.ts');
 import * as stateMod from '../src/state.ts';
 const insertJob = stateMod.insertJob;
