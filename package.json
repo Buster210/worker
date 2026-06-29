@@ -1,19 +1,33 @@
 {
   "name": "worker-mcp",
   "version": "0.3.0",
+  "description": "MCP server that delegates coding tasks to background agents in isolated git worktrees",
   "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/user/worker-mcp.git"
+  },
+  "keywords": ["mcp", "claude", "agent", "worker", "background-tasks"],
   "bin": {
     "worker": "./dist/server.js",
-    "worker-report": "./dist/report.js"
+    "worker-report": "./dist/report.js",
+    "worker-install": "./dist/install.js",
+    "worker-uninstall": "./dist/uninstall.js"
   },
+  "files": ["dist", "README.md", "LICENSE"],
   "scripts": {
     "dev": "bun run --watch src/server.ts",
-    "build": "bun build --target=bun --minify --outdir=dist src/server.ts && bun build --target=bun --minify --outdir=dist src/reaper.ts && bun build --target=bun --minify --outdir=dist src/report.ts",
+    "build": "bun build --target=bun --minify --outdir=dist src/server.ts src/reaper.ts src/report.ts src/install.ts src/uninstall.ts",
     "start": "bun run dist/server.js",
     "report": "bun run dist/report.js",
     "typecheck": "bunx tsgo --noEmit",
     "test": "bun test --timeout 90000",
-    "test:integration": "bun test tests/per-backend.test.ts --timeout 90000"
+    "test:integration": "bun test tests/per-backend.test.ts --timeout 90000",
+    "prepublishOnly": "bun run build && bun test"
+  },
+  "engines": {
+    "bun": ">=1.0"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",

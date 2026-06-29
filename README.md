@@ -2,19 +2,49 @@
 
 MCP server (Bun + `@modelcontextprotocol/sdk`) that delegates coding tasks to background agents — Claude, Codex, OpenCode, OMP, or a generic pool — each in an isolated git worktree.
 
-## Quick start
+## Installation
+
+### From source
 
 ```bash
+git clone https://github.com/user/worker-mcp.git
+cd worker-mcp
 bun install
-bun run dev          # watch mode — MCP server on stdio
+bun run build
 ```
 
-Or build for distribution:
+### Setup Claude Code
 
 ```bash
-bun run build        # dist/server.js, dist/report.js, dist/reaper.js
-bun run start        # run built server
+bun run dist/install.js
 ```
+
+This installs the daemon lifecycle hooks and MCP configuration. Claude Code will automatically start the daemon on session start and stop it when the last session ends.
+
+### Uninstall
+
+```bash
+bun run dist/uninstall.js
+```
+
+## How it works
+
+```
+server.ts (MCP, session routing)
+  → chain.ts:handleLadder (retry-once-then-climb)
+    → lifecycle.ts:launch (worktree, spawn, deadline)
+      → runner.ts:runWorker (stall/timeout watchdog)
+        → runner.ts:maybeVerifyAndCommit (verify gate → git add + commit)
+  → daemon.ts (lockfile, SessionTracker, self-termination)
+  → maintenance.ts (sweep stale jobs, reap stopped workers)
+```
+
+1. A spec file (`~/.claude/plans/<name>`) describes the task.
+2. The daemon (`server.ts`) routes to the best backend via `worker_ladder`.
+3. Each backend spawns in an isolated git worktree with stall/timeout watchdogs.
+4. On success, the worker auto-commits; on failure, the ladder climbs to the next backend.
+
+Concurrent workers each get their own worktree (`worker/<handle>` branch). The first worker uses the repo in-place.
 
 ## MCP tools
 
@@ -30,48 +60,21 @@ bun run start        # run built server
 | `worker_doctor` | Health check — names broken workers, or reports all-fine. |
 | `worker_cleanup` | Drop transcript (`run.log`) after diff review. |
 
-## How it works
-
-```
-caller → MCP server (server.ts)
-           → chain.ts: handleLadder (retry-once-then-climb)
-               → lifecycle.ts: launch (worktree, spawn, deadline)
-                   → runner.ts: runWorker (stall/timeout watchdog)
-                       → runner.ts: maybeVerifyAndCommit (verify gate → git add + commit)
-           → daemon.ts (lockfile, session tracking, self-termination)
-           → maintenance.ts (sweep stale jobs, reap stopped workers)
-```
-
-1. A spec file (`~/.claude/plans/<name>`) describes the task.
-2. `worker_ladder` picks the highest-priority authed backend from the ladder and spawns the agent in a git worktree (or the repo itself if idle).
-3. A watchdog monitors the log for stalls and timeouts.
-4. On success, the worker stages and commits changes (gated by `verifyCmd` if configured).
-5. `worker-report <handle>` (CLI) waits for completion and shows the diff.
-
-Concurrent workers each get their own worktree (`worker/<handle>` branch). The first worker uses the repo in-place.
-
 ## Configuration
 
 `~/.claude/workers/config.json` (all fields optional):
 
 ```jsonc
 {
-  // Backend priority, highest first
-  "ladder": ["codex", "cmd", "pool", "omp", "opencode", "claude"],
-  // Backends to remove from the ladder
+  "ladder": ["omp", "claude", "codex", "opencode", "pool"],
   "skip": [],
-  // Shell command run before commit; non-zero aborts commit
-  "verifyCmd": "",
-  // Worker state dir (default ~/.claude/workers)
-  "stateDir": "",
-  // Spec-file dir (default ~/.claude/plans)
-  "plansDir": "",
-  // Finished-job retention (ms, 0 = default)
-  "retainMs": 0,
-  // Shell rc file sourced for spawn env
-  "rc": "",
-  // Source login shell to capture env for spawns
-  "loginShell": true
+  "verifyCmd": "bun test",
+  "stateDir": "~/.claude/workers",
+  "retainMs": 86400000,
+  "loginShell": "/bin/zsh",
+  "cpuQos": 0.8,
+  "gpgMode": "agent",
+  "gpgKeygrip": ""
 }
 ```
 
@@ -83,30 +86,22 @@ All follow `envMs("WORKER_<NAME>", default)` in `env.ts`:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `WORKER_TIMEOUT_MS` | 600000 | Hard timeout per worker (10 min) |
-| `WORKER_STALL_MS` | 60000 | Stall detection for thinking backends |
-| `WORKER_STALL_MS_QUIET` | 240000 | Stall detection for quiet backends (e.g. Codex) |
-| `WORKER_WATCHDOG_MS` | 5000 | Watchdog poll interval |
-| `WORKER_REAP_MS` | 900000 | Reap age for stopped workers |
-| `WORKER_GRACE_MS` | 60000 | Grace period before hard kill |
-| `WORKER_NEAR_EXPIRY_MS` | 30000 | Near-deadline threshold |
-| `WORKER_AUTH_PROBE_MS` | 2000 | Auth probe timeout |
-| `WORKER_MAX_TURNS` | 10000 | Max agent turns |
-| `WORKER_SKIP_AUTH_GATE` | — | Set to `1` to skip auth probe (tests/ops) |
-| `WORKER_GPG_MODE` | — | `loopback`, `agent`, or `cache` |
-| `WORKER_CONFIG_PATH` | — | Override config.json path |
+| `WORKER_TIMEOUT_MS` | 300000 | Max job lifetime |
+| `WORKER_STALL_MS` | 60000 | No-log stall threshold |
+| `WORKER_STALL_MS_QUIET` | 240000 | Stall threshold for quiet backends |
+| `WORKER_STATE_DIR` | `~/.claude/workers` | State directory |
+| `WORKER_SKIP_AUTH_GATE` | 0 | Skip auth probe (tests/ops) |
+| `WORKER_GPG_MODE` | `agent` | GPG signing mode |
 
 ## Report CLI
 
 ```bash
-bun run src/report.ts <handle>     # wait for worker, show result + diff
-bun run dist/report.js <handle>    # same, built version
+bun run dist/report.js <handle>    # wait for worker, show result + diff
 ```
 
 ## Build
 
 ```bash
-bun run dev          # watch mode
 bun run build        # bundle to dist/
 bun run typecheck    # tsgo --noEmit
 bun test             # 355 tests
