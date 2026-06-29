@@ -12,6 +12,7 @@ import {
   finalizeJob,
   reaperPidPath,
   isInPlaceOwner,
+  type StashState,
 } from "./state.ts";
 import { addWorktreeAsync, clearStaleIndexLock } from "./worktree.ts";
 import {
@@ -23,7 +24,7 @@ import {
 } from "./backends.ts";
 import { runWorker, dirtyPaths, type RunResult } from "./runner.ts";
 import { loginShellEnvAsync } from "./env.ts";
-import { isProcessAlive } from "./process.ts";
+import { isProcessAlive, spawnAsync } from "./process.ts";
 import { buildContinuationPreamble, type SeedContext } from "./backends.ts";
 import { killAndFinalizeJobs } from "./daemon.ts";
 
@@ -152,7 +153,8 @@ function gitRevParse(
 ): Promise<string | undefined> {
   return new Promise((resolve) => {
     const chunks: Buffer[] = [];
-    const p = spawn("git", ["-C", dir, "rev-parse", ...args], {
+    const p = spawn("git", ["rev-parse", ...args], {
+      cwd: dir,
       stdio: ["ignore", "pipe", "ignore"],
     });
     p.stdout?.on("data", (d: Buffer) => chunks.push(d));
@@ -161,6 +163,14 @@ function gitRevParse(
     );
     p.on("error", () => resolve(undefined));
   });
+}
+
+function appendStashNotice(spec: string, sha?: string): string {
+  if (!sha) return spec;
+  return (
+    spec +
+    `\n\nMANDATORY FIRST STEP — before reading any other file or writing any code: the repo had uncommitted user changes at hire time, preserved in git stash commit ${sha}. Run \`git show ${sha}\` (or \`git diff ${sha}^ ${sha}\`) and state in one line which parts, if any, relate to your task. Any related part MUST be reused: apply those exact hunks (e.g. \`git checkout ${sha} -- <path>\` for whole files, or copy the hunks) — do NOT reimplement work that already exists there. Unrelated parts: ignore completely. NEVER git stash pop/drop/blind-apply the whole stash and never delete it — the server restores it after you finish.`
+  );
 }
 
 export function launch(
@@ -178,6 +188,8 @@ export function launch(
     seed?: SeedContext;
     reuseWorktree?: string;
     reuseBaseSha?: string;
+    stashSha?: string;
+    stashState?: StashState;
     handle?: string;
     specFile?: string;
   },
@@ -203,6 +215,8 @@ export function launch(
     repo: dir,
     worktree_path: reuse ?? treePath,
     base_sha: opts.reuseBaseSha,
+    stash_sha: opts.stashSha,
+    stash_state: opts.stashState,
     model: modelToUse,
     task: prompt,
     log_path: lp,
@@ -219,8 +233,8 @@ export function launch(
   // idle server with zero workers runs no reaper.
   spawnReaper();
 
-  const inPlace = reuse ? false : isInPlaceOwner(handle, dir);
-  const wt = reuse ?? (inPlace ? dir : treePath);
+  let inPlace = reuse ? false : isInPlaceOwner(handle, dir);
+  let wt = reuse ?? (inPlace ? dir : treePath);
   if (inPlace) updateJob(handle, { worktree_path: dir });
 
   const promise: Promise<RunResult> = failOnError(
@@ -230,10 +244,13 @@ export function launch(
         if (reuse) {
           clearStaleIndexLock(reuse);
           await loginShellEnvAsync();
+          // Chain climb reuses rung 1's in-place tree with the stash still live, but
+          // this rung is a fresh process — re-issue the notice so it doesn't blind
+          // pop/drop the user's dirt it was never told about.
+          if (opts.stashState === "stashed" && opts.stashSha)
+            spec = appendStashNotice(spec, opts.stashSha);
         } else if (inPlace) {
-          // Snapshot the user's pre-existing dirt before the worker touches anything,
-          // so the commit stages only what the worker adds (not stray untracked files).
-          const preexisting_paths = await dirtyPaths(dir);
+          const dirty = await dirtyPaths(dir);
           const [, base_sha, branch] = await Promise.all([
             loginShellEnvAsync(),
             gitRevParse(dir, "HEAD"),
@@ -241,7 +258,41 @@ export function launch(
           ]);
 
           if (base_sha) updateJob(handle, { base_sha });
-          updateJob(handle, { branch, preexisting_paths });
+          updateJob(handle, { branch });
+          if (dirty.length > 0) {
+            const message = `worker/${handle} preexisting ${new Date().toISOString()}`;
+            const stash = await spawnAsync(
+              "git",
+              ["stash", "push", "-u", "-m", message],
+              { cwd: dir, timeoutMs: 30_000 },
+            );
+            if (stash.error || stash.status !== 0) {
+              console.error(
+                `[stash] preexisting dirt stash failed for ${handle}: ${stash.error?.message ?? stash.stderr?.trim() ?? `exit ${stash.status}`}; falling back to isolated worktree`,
+              );
+              inPlace = false;
+              wt = treePath;
+              updateJob(handle, { worktree_path: wt });
+              const [createdWt, , fallbackBaseSha] = await Promise.all([
+                addWorktreeAsync(dir, handle),
+                loginShellEnvAsync(),
+                gitRevParse(dir, "HEAD"),
+              ]);
+              if (createdWt !== wt)
+                throw new Error(`worktree path mismatch for ${handle}`);
+              if (fallbackBaseSha) updateJob(handle, { base_sha: fallbackBaseSha });
+              updateJob(handle, { branch: `worker/${handle}` });
+            } else {
+              const stashSha = await gitRevParse(dir, "refs/stash");
+              if (stashSha) {
+                updateJob(handle, {
+                  stash_sha: stashSha,
+                  stash_state: "stashed",
+                });
+                spec = appendStashNotice(spec, stashSha);
+              }
+            }
+          }
         } else {
           const [createdWt, , base_sha] = await Promise.all([
             addWorktreeAsync(dir, handle),
@@ -344,6 +395,9 @@ export function resumeLaunch(args: {
   const be = job.backend as Backend;
   const lp = workerLogPath(handle);
   let spec = buildSpec(prompt);
+  if (job.stash_state === "stashed" && job.stash_sha) {
+    spec = appendStashNotice(spec, job.stash_sha);
+  }
   if (be === "cmd") {
     spec =
       `A prior attempt already ran in this repo — inspect the working tree, determine what is already done, and complete only the remainder.\n\n` +

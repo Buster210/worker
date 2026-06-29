@@ -5,8 +5,10 @@ import {
   removeChainLock,
   removeChainMeta,
   getJob,
+  archiveSpec,
   saveChainMeta,
   loadChainMeta,
+  restoreJobStash,
 } from "./state.ts";
 import { LADDER, type Backend } from "./backends.ts";
 import { type RunResult } from "./runner.ts";
@@ -81,6 +83,8 @@ export function handleLadder(
         completionLock: chainLockPath(chainId),
         reuseWorktree: firstJob?.worktree_path,
         reuseBaseSha: firstJob?.base_sha,
+        stashSha: firstJob?.stash_sha,
+        stashState: firstJob?.stash_state,
         seed,
         specFile,
       }).promise;
@@ -92,6 +96,7 @@ export function handleLadder(
     first.promise,
     drivers,
     chainDeadlineAt,
+    chainHandle,
   )
     .catch((): RunResult => ({
       status: "failed",
@@ -116,6 +121,7 @@ export async function runLadderChain(
   firstPromise: Promise<RunResult>,
   drivers: LadderDrivers,
   chainDeadlineAt: number,
+  chainHandle = chainId,
 ): Promise<RunResult> {
   let i = 0;
   let turn = 1;
@@ -127,8 +133,13 @@ export async function runLadderChain(
       result.status === "done" ||
       result.status === "killed" ||
       result.status === "timeout"
-    )
+    ) {
+      if (result.status === "done") {
+        archiveSpec(chainHandle);
+        await restoreJobStash(chainHandle);
+      }
       return result;
+    }
 
     if (result.status === "stalled") {
       if (Date.now() >= effectiveChainDeadline(chainId, chainDeadlineAt))
@@ -143,8 +154,13 @@ export async function runLadderChain(
         result.status === "done" ||
         result.status === "killed" ||
         result.status === "timeout"
-      )
+      ) {
+        if (result.status === "done") {
+          archiveSpec(chainHandle);
+          await restoreJobStash(chainHandle);
+        }
         return result;
+      }
     }
 
     i++;
@@ -157,6 +173,11 @@ export async function runLadderChain(
       priorStatus: result.status,
     });
     appendLadder(chainId, turn++, LADDER[i], result.status);
+    if (result.status === "done") {
+      archiveSpec(chainHandle);
+      await restoreJobStash(chainHandle);
+      return result;
+    }
   }
 }
 

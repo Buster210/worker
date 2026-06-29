@@ -101,6 +101,17 @@ describe("handleStatus", () => {
       expect(k in s).toBe(false);
     }
   });
+  it("surfaces outstanding stash state", () => {
+    const handle = seedJob("running");
+    updateJob(handle, {
+      stash_sha: "abc123def456",
+      stash_state: "stashed",
+    });
+    const s = handleStatus({ handle });
+    expect(s.stash).toBe(
+      "stash abc123def456 preserved — restore: git stash apply abc123def456",
+    );
+  });
   it("throws when the handle is unknown", () => {
     expect(() => handleStatus({ handle: "nope" })).toThrow(/No job found/);
   });
@@ -160,6 +171,17 @@ describe("handleList", () => {
       "status",
       "task",
     ]);
+  });
+  it("surfaces outstanding stash on list rows", () => {
+    const h = seedJob("running");
+    updateJob(h, {
+      stash_sha: "abc123def456",
+      stash_state: "stashed",
+    });
+    const row = handleList({}).find((r) => r.handle === h)!;
+    expect(row.stash).toBe(
+      "stash abc123def456 preserved — restore: git stash apply abc123def456",
+    );
   });
 
   it("orders by started desc and honors limit", () => {

@@ -18,6 +18,7 @@ import {
   pruneTranscript,
   getLadderHistory,
   workersDir,
+  stashSummary,
 } from "./state.ts";
 import { LADDER, ALL_BACKENDS, type Backend } from "./backends.ts";
 import { backendShellArgv } from "./runner.ts";
@@ -143,8 +144,16 @@ export function handleStatus(args: {
   const cl = job.completion_lock ?? "";
   if (cl.endsWith(".chain.lock")) {
     const running = existsSync(cl);
-    if (running)
-      return { status: "running", alive: true, started: job.started };
+    if (running) {
+      const result: Record<string, unknown> = {
+        status: "running",
+        alive: true,
+        started: job.started,
+      };
+      const stash = stashSummary(job);
+      if (stash) result.stash = stash;
+      return result;
+    }
     const status = terminalStatus(handle, cl);
     const result: Record<string, unknown> = {
       status,
@@ -155,6 +164,8 @@ export function handleStatus(args: {
       const sid = basename(cl).replace(/\.chain\.lock$/, "");
       result.rungs = getLadderHistory(sid);
     }
+    const stash = stashSummary(job);
+    if (stash) result.stash = stash;
     return result;
   }
   let alive = false;
@@ -164,7 +175,10 @@ export function handleStatus(args: {
   ) {
     alive = isProcessAlive(job.worker_pid, job.started);
   }
-  return { status: job.status, alive, started: job.started };
+  const result: Record<string, unknown> = { status: job.status, alive, started: job.started };
+  const stash = stashSummary(job);
+  if (stash) result.stash = stash;
+  return result;
 }
 
 export async function handleDoctor(args: {
@@ -203,6 +217,7 @@ export function handleList(args: {
       repo: j.repo,
       task: j.task,
       started: j.started,
+      ...(stashSummary(j) ? { stash: stashSummary(j) } : {}),
     }));
 }
 

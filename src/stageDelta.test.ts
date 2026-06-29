@@ -34,14 +34,3 @@ test("dirtyPaths lists untracked + modified, skips rename origin", async () => {
     rmSync(d, { recursive: true, force: true });
   }
 });
-
-test("fresh delta excludes the pre-existing snapshot and .codegraph", () => {
-  const current = ["a.ts", "b.ts", "squash-proposal.md", ".codegraph"];
-  const preexisting = new Set(["squash-proposal.md"]);
-  const isCodegraph = (p: string) =>
-    p === ".codegraph" || p.startsWith(".codegraph/");
-  const fresh = current.filter(
-    (p) => !isCodegraph(p) && !preexisting.has(p),
-  );
-  expect(fresh).toEqual(["a.ts", "b.ts"]);
-});

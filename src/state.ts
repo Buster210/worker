@@ -12,6 +12,7 @@ import {
 import { join, basename } from "path";
 import { FILE_CONFIG } from "./config.ts";
 import { isProcessAlive } from "./process.ts";
+import { spawnAsync } from "./process.ts";
 
 const _ensuredDirs = new Set<string>();
 export function workersDir(): string {
@@ -237,10 +238,22 @@ export type Job = {
   created_at?: number;
   branch?: string;
   spec_file?: string;
-  // Paths already dirty/untracked when an in-place worker launched — excluded from
-  // its commit so it stages only what it changed, not the user's pre-existing work.
-  preexisting_paths?: string[];
+  stash_sha?: string;
+  stash_state?: StashState;
 };
+
+export type StashState = "stashed" | "restored" | "conflict";
+
+export function stashSummary(job: {
+  stash_sha?: string;
+  stash_state?: StashState;
+} | null | undefined): string | undefined {
+  if (!job?.stash_sha) return undefined;
+  if (job.stash_state === "restored") return undefined;
+  if (job.stash_state === "conflict")
+    return `stash ${job.stash_sha} conflict — restore: git stash apply ${job.stash_sha}`;
+  return `stash ${job.stash_sha} preserved — restore: git stash apply ${job.stash_sha}`;
+}
 
 export function insertJob(j: {
   handle: string;
@@ -262,6 +275,8 @@ export function insertJob(j: {
   created_at?: number;
   branch?: string;
   spec_file?: string;
+  stash_sha?: string;
+  stash_state?: StashState;
 }) {
   const job: Job = {
     handle: j.handle,
@@ -285,6 +300,8 @@ export function insertJob(j: {
     created_at: j.created_at ?? Date.now(),
     branch: j.branch,
     spec_file: j.spec_file,
+    stash_sha: j.stash_sha,
+    stash_state: j.stash_state,
   };
   mkdirSync(handleDir(j.handle, j.repo), { recursive: true });
   _jobs.set(job.handle, job);
@@ -367,6 +384,79 @@ export function finalizeJob(
   });
   removeLock(handle);
   return final;
+}
+
+export async function restoreJobStash(
+  handle: string,
+): Promise<"restored" | "conflict" | "skipped"> {
+  const job = getJob(handle);
+  if (!job?.stash_sha || job.stash_state !== "stashed") return "skipped";
+  const repo = job.worktree_path ?? job.repo;
+  const sha = job.stash_sha;
+  const apply = await spawnAsync(
+    "git",
+    ["-C", repo, "stash", "apply", sha],
+    { timeoutMs: 30_000 },
+  );
+  if (apply.error || apply.status !== 0) {
+    console.error(
+      `[stash] apply failed for ${handle}: ${apply.error?.message ?? apply.stderr?.trim() ?? `exit ${apply.status}`}`,
+    );
+    await spawnAsync("git", ["-C", repo, "reset", "--hard", "HEAD"], {
+      timeoutMs: 30_000,
+    });
+    await spawnAsync("git", ["-C", repo, "clean", "-fd"], {
+      timeoutMs: 30_000,
+    });
+    updateJob(handle, { stash_state: "conflict" });
+    return "conflict";
+  }
+
+  // Drop ONLY our entry by reflog index — deleting refs/stash wholesale
+  // (update-ref -d) erases the reflog that holds the user's other stashes.
+  // Verify the sha at the index right before dropping: a concurrent stash
+  // push/drop shifts indices, and a blind drop would then remove someone
+  // else's entry. Mismatch/failure → one retry with a fresh list.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const list = await spawnAsync(
+      "git",
+      ["-C", repo, "stash", "list", "--format=%H"],
+      { timeoutMs: 30_000 },
+    );
+    const idx = (list.stdout ?? "").trim().split("\n").indexOf(sha);
+    if (idx < 0) {
+      console.error(
+        `[stash] entry ${sha} not in stash list for ${handle}; skipping drop`,
+      );
+      break;
+    }
+    const at = await spawnAsync(
+      "git",
+      ["-C", repo, "rev-parse", "-q", "--verify", `stash@{${idx}}`],
+      { timeoutMs: 30_000 },
+    );
+    if (at.status !== 0 || (at.stdout ?? "").trim() !== sha) {
+      if (attempt === 0) continue;
+      console.error(
+        `[stash] index ${idx} no longer holds ${sha} for ${handle}; skipping drop`,
+      );
+      break;
+    }
+    const drop = await spawnAsync(
+      "git",
+      ["-C", repo, "stash", "drop", `stash@{${idx}}`],
+      { timeoutMs: 30_000 },
+    );
+    if (drop.error || drop.status !== 0) {
+      if (attempt === 0) continue;
+      console.error(
+        `[stash] drop failed for ${handle}: ${drop.error?.message ?? drop.stderr?.trim() ?? `exit ${drop.status}`}`,
+      );
+    }
+    break;
+  }
+  updateJob(handle, { stash_state: "restored" });
+  return "restored";
 }
 
 // Stat-keyed memo for job.json reads. The periodic sweeps (reaper every 10s,

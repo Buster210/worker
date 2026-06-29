@@ -130,6 +130,18 @@ describe("maybeVerifyAndCommit — commits on done", () => {
     expect(result).toBe("failed:no-changes");
     expect(commitCount()).toBe(before);
   });
+
+  it("backend self-committed (tree clean but HEAD moved past baseSha): returns \"done\", makes no extra commit", async () => {
+    const startSha = baseSha();
+    const handle = seedJob();
+    writeFileSync(join(REPO, `self-committed-${seq}.txt`), "x\n");
+    git("add", ".");
+    git("commit", "-m", "backend self-commit", "--no-gpg-sign");
+    const before = commitCount();
+    const result = await maybeVerifyAndCommit(handle, REPO, "done", startSha);
+    expect(result).toBe("done");
+    expect(commitCount()).toBe(before);
+  });
 });
 
 describe("maybeVerifyAndCommit — WORKER_VERIFY_CMD gate", () => {

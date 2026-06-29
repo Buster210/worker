@@ -2,7 +2,12 @@
 import { existsSync, statSync } from "fs";
 import { basename } from "path";
 import { spawnSync } from "child_process";
-import { getJobFresh, getLadderHistory, lockPath } from "./state.ts";
+import {
+  getJobFresh,
+  getLadderHistory,
+  lockPath,
+  stashSummary,
+} from "./state.ts";
 import { nearExpiryMs, graceMs } from "./env.ts";
 
 export function terminalStatus(handle: string, lockPath: string): string {
@@ -64,23 +69,25 @@ export function renderReport(
   diff: (repo: string, baseSha?: string) => string = gitDiff,
 ): string {
   const status = terminalStatus(handle, lockPath);
+  const job = getJobFresh(handle);
+  const stash = stashSummary(job);
   let ladderRuns: LadderRun[] | undefined;
   if (status === "exhausted" && lockPath.endsWith(".chain.lock")) {
     const sid = basename(lockPath).replace(/\.chain\.lock$/, "");
     ladderRuns = getLadderHistory(sid);
   }
-  if (!wantsDiff(status)) return statusLine(status);
-  const job = getJobFresh(handle);
+  if (!wantsDiff(status))
+    return stash ? `${statusLine(status)}\n${stash}` : statusLine(status);
   const line = statusLine(status, job?.branch, job?.base_sha, ladderRuns);
   if (!job?.repo)
-    return `${line}\n\n(diff unavailable: unknown handle ${handle})`;
+    return `${line}${stash ? `\n${stash}` : ""}\n\n(diff unavailable: unknown handle ${handle})`;
   const diffDir = job.worktree_path ?? job.repo;
   const body = diff(diffDir, job.base_sha);
   const warn =
     status === "done" && body === "(no tracked changes)"
       ? "\n\nWARNING: completed but worktree has no changes vs base — work may be missing."
       : "";
-  return `${line}\nworktree: ${diffDir}\nbranch: ${job.branch ?? `worker/${handle}`}\n\n${body}${warn}`;
+  return `${line}${stash ? `\n${stash}` : ""}\nworktree: ${diffDir}\nbranch: ${job.branch ?? `worker/${handle}`}\n\n${body}${warn}`;
 }
 
 function ownerDead(serverPid: number): boolean {

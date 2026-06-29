@@ -60,6 +60,8 @@ export function sweepStaleJobs(opts?: { fresh?: boolean }) {
         killProcessTree(job.worker_pid, "SIGKILL");
         finalizeJob(job.handle, "failed", { resume_token: job.resume_token });
       } else {
+        // No stash restore here: sentinel "done" doesn't prove the commit
+        // landed (server may have died pre-commit) — keep + surface instead.
         const status = resolveStatus(job.backend, 0, job.log_path, false);
         finalizeJob(
           job.handle,

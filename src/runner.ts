@@ -17,6 +17,7 @@ import {
   finalizeJob,
   archiveSpec,
   workersDir,
+  restoreJobStash,
 } from "./state.ts";
 import { emitsJsonLog, QUIET_BACKENDS, type Backend } from "./backends.ts";
 import { readSentinel } from "./logParse.ts";
@@ -184,6 +185,7 @@ export async function runWorker(
   timeoutMs?: number,
   deadlineAt?: number,
 ): Promise<RunResult> {
+  const job = getJob(handle);
   const { rc, timedOut, stalled } = await launchAndWait(
     argv,
     repo,
@@ -198,9 +200,15 @@ export async function runWorker(
     status = "stalled";
   } else {
     const natural = resolveStatus(backend, rc, logPath, timedOut);
-    const gated = await maybeVerifyAndCommit(handle, repo, natural);
+    const gated = await maybeVerifyAndCommit(handle, repo, natural, job?.base_sha);
     status = finalizeJob(handle, gated, { resume_token: resumeToken });
-    if (status === "done") archiveSpec(handle);
+    // Defer to the chain's own restore only while the chain still drives
+    // (lock file present) — a resumed job from a finished chain restores here.
+    const cl = job?.completion_lock ?? "";
+    if (status === "done" && !(cl.endsWith(".chain.lock") && existsSync(cl))) {
+      archiveSpec(handle);
+      await restoreJobStash(handle);
+    }
   }
   return {
     status,
@@ -420,35 +428,11 @@ export async function dirtyPaths(worktree: string): Promise<string[]> {
   return paths;
 }
 
-function isCodegraph(path: string): boolean {
-  return path === ".codegraph" || path.startsWith(".codegraph/");
-}
-
 async function stageWorktree(
   worktree: string,
   handle: string,
 ): Promise<"ok" | "failed:commit"> {
-  const job = getJob(handle);
-  // In-place workers share the user's real tree, so `git add -A` would sweep up
-  // pre-existing dirt. Stage only paths that appeared since launch. Isolated
-  // worktree workers start clean at HEAD, so -A is correct (and the fallback when
-  // no snapshot exists preserves the old behavior).
-  const inPlace = !!job && job.worktree_path === job.repo;
-  let addArgs: string[];
-  if (inPlace) {
-    const preexisting = new Set(job?.preexisting_paths ?? []);
-    const fresh = (await dirtyPaths(worktree)).filter(
-      (p) => !isCodegraph(p) && !preexisting.has(p),
-    );
-    if (fresh.length === 0) return "ok";
-    addArgs = ["-C", worktree, "add", "--", ...fresh];
-  } else {
-    // A `:!.codegraph` exclude pathspec makes `git add` exit 1 whenever
-    // .codegraph exists and is ignored — git errors on an ignored path named by
-    // a pathspec. Stage everything (git silently skips ignored paths), then
-    // unstage .codegraph below to also drop it in the untracked-not-ignored case.
-    addArgs = ["-C", worktree, "add", "-A"];
-  }
+  const addArgs = ["-C", worktree, "add", "-A"];
 
   const add = await spawnAsync("git", addArgs, { timeoutMs: 30_000 });
   if (add.error) {
@@ -463,11 +447,9 @@ async function stageWorktree(
     );
     return "failed:commit";
   }
-  if (!inPlace) {
-    await spawnAsync("git", ["-C", worktree, "reset", "-q", "--", ".codegraph"], {
-      timeoutMs: 30_000,
-    });
-  }
+  await spawnAsync("git", ["-C", worktree, "reset", "-q", "--", ".codegraph"], {
+    timeoutMs: 30_000,
+  });
   return "ok";
 }
 
@@ -488,15 +470,32 @@ async function hasStagedChanges(
   return diff.status === 0 ? "no" : "yes";
 }
 
+async function headMovedSince(
+  worktree: string,
+  baseSha: string | undefined,
+): Promise<boolean> {
+  if (!baseSha) return false;
+  const head = await spawnAsync("git", ["-C", worktree, "rev-parse", "HEAD"], {
+    timeoutMs: 30_000,
+  });
+  return head.status === 0 && head.stdout?.trim() !== baseSha;
+}
+
 async function commitWork(
   worktree: string,
   handle: string,
+  baseSha: string | undefined,
 ): Promise<"done" | "failed:commit" | "failed:no-changes"> {
   const staged = await stageWorktree(worktree, handle);
   if (staged !== "ok") return staged;
   const stagedChanges = await hasStagedChanges(worktree);
   if (stagedChanges === "failed:commit") return "failed:commit";
-  if (stagedChanges === "no") return "failed:no-changes";
+  if (stagedChanges === "no") {
+    // Backend may have committed its own work mid-turn (e.g. cmd/Command
+    // Code auto-commits) — nothing left to stage isn't the same as no work done.
+    if (await headMovedSince(worktree, baseSha)) return "done";
+    return "failed:no-changes";
+  }
 
   const mode = resolveGpgMode();
   const args = ["-C", worktree];
@@ -532,6 +531,7 @@ export async function maybeVerifyAndCommit(
   handle: string,
   worktree: string,
   natural: string,
+  baseSha?: string,
 ): Promise<string> {
   if (natural !== "done") return natural;
 
@@ -551,5 +551,5 @@ export async function maybeVerifyAndCommit(
     }
   }
 
-  return commitWork(worktree, handle);
+  return commitWork(worktree, handle, baseSha);
 }

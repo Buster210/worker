@@ -162,4 +162,50 @@ describe("chain handle share — one handle, one job.json, live reconciliation",
     expect(getJobFresh(chainHandle)!.status).toBe("killed");
     expect(terminalStatus(chainHandle, chainLockPath(sid))).toBe("killed");
   });
+
+  it("threads stash fields into the reused rung after a failure", async () => {
+    __resetStateForTest();
+    const chainHandle = "99999999-aaaa-bbbb-cccc-dddddddddddd";
+    const sid = `chain-stash-${process.pid}`;
+    const repo = "/tmp/test-repo";
+    const seen: Array<{ stashSha?: string; stashState?: string }> = [];
+
+    const stubLaunch = ((backend: string, _prompt: string, dir: string, opts: any) => {
+      seen.push({ stashSha: opts.stashSha, stashState: opts.stashState });
+      const isFirst = seen.length === 1;
+      insertJob({
+        handle: opts.handle ?? chainHandle,
+        backend,
+        sid,
+        repo,
+        log_path: `/tmp/${backend}-${seen.length}.log`,
+        worktree_path: dir,
+        base_sha: "base",
+        stash_sha: isFirst ? "stash-1" : opts.stashSha,
+        stash_state: isFirst ? "stashed" : opts.stashState,
+      });
+      return {
+        handle: opts.handle ?? chainHandle,
+        promise: Promise.resolve({
+          status: seen.length === 1 ? "failed" : "timeout",
+          exit_code: 1,
+          backend,
+          handle: opts.handle ?? chainHandle,
+          resume_token: "",
+          repo: dir,
+          log: "",
+        }),
+        workdir: dir,
+      };
+    }) as unknown as NonNullable<Parameters<typeof handleLadder>[1]>["launch"];
+
+    handleLadder(
+      { mcpSid: "m", prompt: "p", dir: repo },
+      { launch: stubLaunch },
+    );
+    await Bun.sleep(20);
+
+    expect(seen[1]?.stashSha).toBe("stash-1");
+    expect(seen[1]?.stashState).toBe("stashed");
+  });
 });

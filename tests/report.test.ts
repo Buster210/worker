@@ -170,6 +170,16 @@ describe("wantsDiff", () => {
       `${ptr}\nworktree: /repo/x\nbranch: worker/${handle}\n\n(no tracked changes)\n\nWARNING: completed but worktree has no changes vs base — work may be missing.`,
     );
   });
+  it("surfaces an outstanding stash in the report", () => {
+    const { handle, lockPath } = seedRun("done");
+    updateJob(handle, {
+      stash_sha: "abc123def456",
+      stash_state: "stashed",
+    });
+    expect(renderReport(handle, lockPath, () => "DIFF")).toContain(
+      "stash abc123def456 preserved — restore: git stash apply abc123def456",
+    );
+  });
   it("stopped → single line, diff fn never invoked", () => {
     const { handle, lockPath } = seedRun("stopped");
     let called = false;
