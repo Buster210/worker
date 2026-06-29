@@ -11,6 +11,8 @@ import {
   isBareSpecName,
   retainMs,
   removeJobFromCache,
+  readJobFileCached,
+  pruneJobFileCache,
 } from "./state.ts";
 import { isProcessAlive, killProcessTree } from "./process.ts";
 import { resolveStatus } from "./runner.ts";
@@ -144,6 +146,7 @@ const TERMINAL_SWEEP_RE = /^(done|failed|timeout|killed|stalled)/;
 export function sweepStaleWorkerDirs(): void {
   const root = workersDir();
   const skipSet = new Set(FILE_CONFIG.skip ?? []);
+  const visited = new Set<string>();
   let cleaned = 0;
 
   let projectDirs: string[];
@@ -169,32 +172,32 @@ export function sweepStaleWorkerDirs(): void {
 
     for (const handle of handleDirs) {
       const dirPath = join(root, proj, handle);
-      let jobJson: Record<string, unknown> | null = null;
-      try {
-        jobJson = JSON.parse(readFileSync(join(dirPath, "job.json"), "utf8"));
-      } catch {
-        /* no job.json → truly stale, clean below */
-      }
+      // Stat-keyed memo: unchanged job.json (the common case — terminal jobs
+      // never rewrite) skips the read+parse entirely. Missing/unparsable → null,
+      // same as the old catch path.
+      const jobJsonPath = join(dirPath, "job.json");
+      visited.add(jobJsonPath);
+      const jobJson = readJobFileCached(jobJsonPath);
 
-      const status = (jobJson?.status as string) ?? "";
+      const status = jobJson?.status ?? "";
 
       if (status && TERMINAL_SWEEP_RE.test(status)) {
         // User-inspectable mid-flight kills — preserve for debugging.
         if (status.startsWith("killed:")) continue;
-        const backend = (jobJson?.backend as string) ?? "";
+        const backend = jobJson?.backend ?? "";
         if (skipSet.has(handle) || skipSet.has(backend)) continue;
-        const ownerPid = (jobJson?.server_pid as number) ?? 0;
-        const ownerStarted = (jobJson?.server_started as string) ?? "";
+        const ownerPid = jobJson?.server_pid ?? 0;
+        const ownerStarted = jobJson?.server_started ?? "";
         if (
           ownerPid > 0 &&
           ownerPid !== SELF_PID &&
           isProcessAlive(ownerPid, ownerStarted)
         )
           continue;
-        const finishedAt = Date.parse((jobJson?.finished as string) ?? "");
+        const finishedAt = Date.parse(jobJson?.finished ?? "");
         if (!Number.isFinite(finishedAt)) continue;
         if (Date.now() - finishedAt < retainMs()) continue;
-        const specFile = (jobJson?.spec_file as string) ?? "";
+        const specFile = jobJson?.spec_file ?? "";
         if (specFile && isBareSpecName(specFile)) {
           try {
             unlinkSync(join(plansWorkerDir(), specFile));
@@ -215,6 +218,10 @@ export function sweepStaleWorkerDirs(): void {
       cleaned++;
     }
   }
+
+  // This sweep is the daemon's only periodic full scan, so it must also drop
+  // memo entries for dirs that no longer exist (including ones it just removed).
+  pruneJobFileCache(visited);
 
   if (cleaned > 0)
     console.error(

@@ -7,6 +7,7 @@ import {
   unlinkSync,
   renameSync,
   existsSync,
+  statSync,
 } from "fs";
 import { join, basename } from "path";
 import { FILE_CONFIG } from "./config.ts";
@@ -357,16 +358,56 @@ export function finalizeJob(
   updateJob(handle, {
     status: final,
     finished: new Date().toISOString(),
+    // Terminal jobs don't need the full spec text (resume re-reads the spec
+    // file; commit messages only ever used the first line). Keeping just the
+    // first line stops finished jobs bloating the job cache, job.json, and the
+    // scan memo for the whole retention window. worker_list shows this line.
+    task: (job.task ?? "").split("\n")[0].slice(0, 200),
     ...extra,
   });
   removeLock(handle);
   return final;
 }
 
+// Stat-keyed memo for job.json reads. The periodic sweeps (reaper every 10s,
+// daemon every 60s) re-scan every handle dir; re-parsing files whose stat is
+// unchanged is pure waste. Writes go through tmp+rename (new ino/mtime), so an
+// unchanged (ino, mtime, size) key means unchanged content — this stays as
+// fresh as a direct read.
+type JobFileEntry = { key: string; job: Job | null };
+const _jobFileCache = new Map<string, JobFileEntry>();
+
+export function readJobFileCached(path: string): Job | null {
+  let key: string;
+  try {
+    const st = statSync(path);
+    key = `${st.ino}:${st.mtimeMs}:${st.size}`;
+  } catch {
+    _jobFileCache.delete(path);
+    return null;
+  }
+  const hit = _jobFileCache.get(path);
+  if (hit && hit.key === key) return hit.job;
+  let job: Job | null = null;
+  try {
+    job = JSON.parse(readFileSync(path, "utf8")) as Job;
+  } catch {}
+  _jobFileCache.set(path, { key, job });
+  return job;
+}
+
+/** Drop memo entries for job.json paths a full scan no longer sees (deleted dirs). */
+export function pruneJobFileCache(visited: Set<string>): void {
+  for (const path of _jobFileCache.keys()) {
+    if (!visited.has(path)) _jobFileCache.delete(path);
+  }
+}
+
 function scanAllJobs(): Job[] {
   try {
     const root = workersDir();
-    return readdirSync(root, { withFileTypes: true })
+    const visited = new Set<string>();
+    const jobs = readdirSync(root, { withFileTypes: true })
       .filter(
         (d) => d.isDirectory() && d.name !== "ladder" && d.name !== "tmux",
       )
@@ -375,19 +416,17 @@ function scanAllJobs(): Job[] {
           return readdirSync(join(root, d.name), { withFileTypes: true })
             .filter((h) => h.isDirectory())
             .map((h) => {
-              try {
-                return JSON.parse(
-                  readFileSync(join(root, d.name, h.name, "job.json"), "utf8"),
-                );
-              } catch {
-                return null;
-              }
+              const path = join(root, d.name, h.name, "job.json");
+              visited.add(path);
+              return readJobFileCached(path);
             });
         } catch {
           return [];
         }
       })
       .filter((j): j is Job => j != null);
+    pruneJobFileCache(visited);
+    return jobs;
   } catch {
     return [];
   }
@@ -461,6 +500,7 @@ export function __resetStateForTest(): void {
   _jobsBootstrapped = false;
   _handleDirCache.clear();
   _ensuredDirs.clear();
+  _jobFileCache.clear();
 }
 
 export function appendLadder(
