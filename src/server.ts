@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod/v4";
 import { randomUUID } from "crypto";
-import { existsSync, appendFileSync, writeFileSync, statSync, renameSync } from "fs";
+import { existsSync, appendFileSync, writeFileSync } from "fs";
 import { localISO } from "./time.ts";
 import http from "http";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
