@@ -1,3 +1,4 @@
+import { localISO } from "./time.ts";
 import { randomUUID } from "crypto";
 import { spawn, spawnSync } from "child_process";
 import { readFileSync, unlinkSync, writeFileSync } from "fs";
@@ -29,7 +30,7 @@ import { buildContinuationPreamble, type SeedContext } from "./backends.ts";
 import { killAndFinalizeJobs } from "./daemon.ts";
 
 export const SERVER_STARTED =
-  getProcessStartTime(process.pid) ?? new Date().toISOString();
+  getProcessStartTime(process.pid) ?? localISO();
 const SERVER_SID = process.env.CLAUDE_CODE_SESSION_ID ?? "";
 const launchedHandles = new Set<string>();
 
@@ -260,7 +261,7 @@ export function launch(
           if (base_sha) updateJob(handle, { base_sha });
           updateJob(handle, { branch });
           if (dirty.length > 0) {
-            const message = `worker/${handle} preexisting ${new Date().toISOString()}`;
+            const message = `worker/${handle} preexisting ${localISO()}`;
             const stash = await spawnAsync(
               "git",
               ["stash", "push", "-u", "-m", message],

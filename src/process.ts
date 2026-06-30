@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from "child_process";
+import { localISO } from "./time.ts";
 
 // spawnSync-shaped async runner for the daemon's hot paths — a spawnSync there
 // blocks the event loop (MCP requests, sibling workers' watchdogs) for the whole
@@ -224,7 +225,7 @@ export function getProcessStartTime(pid: number): string | null {
     if (result.status !== 0) return null;
     const elapsedSec = parseEtimeSeconds(result.stdout);
     if (elapsedSec === null) return null;
-    return new Date(Date.now() - elapsedSec * 1000).toISOString();
+    return localISO(new Date(Date.now() - elapsedSec * 1000));
   } catch {
     return null;
   }

@@ -10,6 +10,7 @@ import {
   statSync,
 } from "fs";
 import { join, basename } from "path";
+import { localISO } from "./time.ts";
 import { FILE_CONFIG } from "./config.ts";
 import { isProcessAlive } from "./process.ts";
 import { spawnAsync } from "./process.ts";
@@ -285,7 +286,7 @@ export function insertJob(j: {
     worker_pid: j.worker_pid ?? 0,
     resume_token: j.resume_token ?? "",
     repo: j.repo,
-    started: new Date().toISOString(),
+    started: localISO(),
     status: "running",
     model: j.model ?? "",
     task: j.task ?? "",
@@ -374,7 +375,7 @@ export function finalizeJob(
         : naturalStatus;
   updateJob(handle, {
     status: final,
-    finished: new Date().toISOString(),
+    finished: localISO(),
     // Terminal jobs don't need the full spec text (resume re-reads the spec
     // file; commit messages only ever used the first line). Keeping just the
     // first line stops finished jobs bloating the job cache, job.json, and the
@@ -603,7 +604,7 @@ export function appendLadder(
   try {
     appendFileSync(
       ladderPath(sid),
-      JSON.stringify({ turn, worker, result, ts: new Date().toISOString() }) +
+      JSON.stringify({ turn, worker, result, ts: localISO() }) +
         "\n",
     );
   } catch (err) {

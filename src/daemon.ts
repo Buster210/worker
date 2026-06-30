@@ -9,6 +9,7 @@ import {
 } from "fs";
 import { join } from "path";
 import { homedir } from "os";
+import { localISO } from "./time.ts";
 import { isProcessAlive } from "./process.ts";
 import { getAllRunningJobsFresh, finalizeJob, workersDir } from "./state.ts";
 import type { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -29,7 +30,7 @@ function ensureLockDir(): void {
 
 export function acquireLock(pid: number, port: number): boolean {
   ensureLockDir();
-  const lock: DaemonLock = { pid, port, started_at: new Date().toISOString() };
+  const lock: DaemonLock = { pid, port, started_at: localISO() };
   try {
     const fd = openSync(lockPath(), "wx"); // exclusive create — fails if exists
     writeFileSync(fd, JSON.stringify(lock));
