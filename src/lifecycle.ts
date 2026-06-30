@@ -143,6 +143,7 @@ function failOnError(
   p: Promise<RunResult>,
 ): Promise<RunResult> {
   return p.catch((err: unknown) => {
+    console.error(`[worker] launch failed: ${handle.slice(0, 8)} — ${err instanceof Error ? err.message : err}`);
     finalizeJob(handle, "failed");
     throw err;
   });

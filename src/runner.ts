@@ -210,6 +210,7 @@ export async function runWorker(
       await restoreJobStash(handle);
     }
   }
+  console.error(`[worker] done: ${backend} ${handle.slice(0, 8)} → ${status}`);
   return {
     status,
     exit_code: rc,

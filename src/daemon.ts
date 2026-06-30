@@ -178,6 +178,7 @@ export function killAndFinalizeJobs(
   const pids = jobs.filter((j) => j.worker_pid > 0).map((j) => j.worker_pid);
   if (pids.length > 0) killProcessTrees(pids, "SIGKILL");
   for (const job of jobs) {
+    console.error(`[daemon] shutdown: finalizing ${job.handle.slice(0, 8)} → ${status}`);
     finalizeJob(job.handle, status, { resume_token: job.resume_token });
   }
 }

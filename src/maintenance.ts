@@ -79,6 +79,7 @@ export function sweepStaleJobs(opts?: { fresh?: boolean }) {
       }
     }
   }
+  if (jobs.length > 0) console.error(`[maintenance] sweep: ${jobs.length} stale job(s) scanned`);
 }
 
 export function reapStoppedJobs() {

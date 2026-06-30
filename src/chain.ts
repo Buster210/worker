@@ -42,8 +42,10 @@ export function handleLadder(
   const chainDeadlineAt =
     Date.now() + (args.timeout ? args.timeout * 1000 : defaultTimeoutMs());
 
-  if (LADDER.length === 0)
+  if (LADDER.length === 0) {
+    console.error("[ladder] exhausted: no backends available");
     return { status: "exhausted", note: "no workers available" };
+  }
 
   createChainLock(chainId, process.pid, SERVER_STARTED);
   saveChainMeta(chainId, { deadlineAt: chainDeadlineAt });
@@ -98,15 +100,18 @@ export function handleLadder(
     chainDeadlineAt,
     chainHandle,
   )
-    .catch((): RunResult => ({
-      status: "failed",
-      exit_code: 1,
-      backend: LADDER[0],
-      handle: chainHandle,
-      resume_token: chainHandle,
-      repo: dir,
-      log: "",
-    }))
+    .catch((err: unknown): RunResult => {
+      console.error(`[ladder] chain error: ${err instanceof Error ? err.message : err}`);
+      return {
+        status: "failed",
+        exit_code: 1,
+        backend: LADDER[0],
+        handle: chainHandle,
+        resume_token: chainHandle,
+        repo: dir,
+        log: "",
+      };
+    })
     .finally(() => {
       removeChainLock(chainId);
       removeChainMeta(chainId);

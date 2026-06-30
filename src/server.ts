@@ -3,7 +3,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod/v4";
 import { randomUUID } from "crypto";
-import { existsSync, appendFileSync, statSync, renameSync } from "fs";
+import { existsSync, appendFileSync, writeFileSync, statSync, renameSync } from "fs";
+import { localISO } from "./time.ts";
 import http from "http";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import {
@@ -509,7 +510,13 @@ function teeStderrToLog(): void {
       )
       .join(" ");
     try {
-      appendFileSync(logFile, `${new Date().toLocaleString()} ${text}\n`);
+      const line = `${localISO()} ${text}\n`;
+      if (!_logInitialized) {
+        writeFileSync(LOG_FILE, line);
+        _logInitialized = true;
+      } else {
+        appendFileSync(LOG_FILE, line);
+      }
     } catch {}
   };
 }
