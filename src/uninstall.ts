@@ -1,4 +1,11 @@
-import { unlinkSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import {
+  unlinkSync,
+  readFileSync,
+  writeFileSync,
+  existsSync,
+  readdirSync,
+  rmdirSync,
+} from "node:fs";
 import { join } from "node:path";
 
 function removeFromSettings(home: string) {
@@ -44,6 +51,15 @@ export function uninstall() {
 
   for (const hook of hooks) {
     if (existsSync(hook)) unlinkSync(hook);
+  }
+  for (const dir of [
+    join(home, ".claude/hooks/session-start"),
+    join(home, ".claude/hooks/session-end"),
+    join(home, ".claude/hooks"),
+  ]) {
+    try {
+      if (existsSync(dir) && readdirSync(dir).length === 0) rmdirSync(dir);
+    } catch {}
   }
 
   removeFromSettings(home);

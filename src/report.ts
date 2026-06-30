@@ -9,18 +9,9 @@ import {
   stashSummary,
 } from "./state.ts";
 import { nearExpiryMs, graceMs } from "./env.ts";
+import { terminalStatus } from "./jobStatus.ts";
 
-export function terminalStatus(handle: string, lockPath: string): string {
-  if (lockPath.endsWith(".chain.lock")) {
-    // With the shared chain handle, getJobFresh reflects the active/terminal rung's live status.
-    // Terminal winning rung (done/killed/timeout) → trust the live job; all-rungs-failed → exhausted.
-    const status = getJobFresh(handle)?.status;
-    if (status === "done" || status === "killed" || status === "timeout")
-      return status;
-    return "exhausted";
-  }
-  return getJobFresh(handle)?.status ?? "failed";
-}
+export { terminalStatus };
 
 export type LadderRun = { turn: number; worker: string; result: string };
 

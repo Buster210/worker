@@ -4,10 +4,17 @@ MCP server (Bun + `@modelcontextprotocol/sdk`) that delegates coding tasks to ba
 
 ## Installation
 
+### Prerequisites
+
+- Bun 1 or newer
+- git
+- At least one installed and authenticated backend CLI: `claude`, `codex`, `opencode`, `omp`, `pool`, or `cmd`
+- The daemon prunes backends you do not have
+
 ### From source
 
 ```bash
-git clone https://github.com/user/worker-mcp.git
+git clone https://github.com/buster210/worker-mcp.git
 cd worker-mcp
 bun install
 bun run build
@@ -20,6 +27,10 @@ bun run dist/install.js
 ```
 
 This installs the daemon lifecycle hooks and MCP configuration. Claude Code will automatically start the daemon on session start and stop it when the last session ends.
+
+### Platform
+
+macOS and Linux only. Windows is unsupported.
 
 ### Uninstall
 

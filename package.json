@@ -4,11 +4,8 @@
   "description": "MCP server that delegates coding tasks to background agents in isolated git worktrees",
   "type": "module",
   "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/user/worker-mcp.git"
-  },
   "keywords": ["mcp", "claude", "agent", "worker", "background-tasks"],
+  "repository": { "type": "git", "url": "git+https://github.com/buster210/worker-mcp.git" },
   "bin": {
     "worker": "./dist/server.js",
     "worker-report": "./dist/report.js",

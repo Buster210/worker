@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import * as childProcess from "child_process";
 import {
   buildSpec,
   buildRunArgv,
@@ -13,7 +14,7 @@ import {
 import { stallTimeoutMs, quietStallMs } from "../src/env.ts";
 import { handleDirUncached } from "../src/state.ts";
 import { join } from "path";
-import { mkdtempSync, rmSync } from "fs";
+import { mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 
 describe("buildSpec", () => {
@@ -406,6 +407,43 @@ describe("computeLadder", () => {
     } finally {
       if (orig === undefined) delete process.env.WORKER_SKIP_AUTH_GATE;
       else process.env.WORKER_SKIP_AUTH_GATE = orig;
+    }
+  });
+
+  it("drops a backend when its CLI is missing", () => {
+    const binDir = mkdtempSync(join(tmpdir(), "backends-path-"));
+    for (const name of ["cmd", "codex", "claude", "omp", "pool"]) {
+      writeFileSync(join(binDir, name), "#!/bin/sh\nexit 0\n", {
+        mode: 0o755,
+      });
+    }
+    const script = `
+process.env.WORKER_SKIP_AUTH_GATE = "";
+const { computeLadder } = await import("./src/backends.ts");
+console.log(JSON.stringify({
+  def: computeLadder({}),
+  custom: computeLadder({ ladder: ["opencode", "claude"] }),
+}));
+`;
+    const result = childProcess.spawnSync(process.execPath, ["-e", script], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        PATH: binDir,
+        WORKER_SKIP_AUTH_GATE: "",
+      },
+      encoding: "utf8",
+    });
+    try {
+      expect(result.status).toBe(0);
+      const parsed = JSON.parse(result.stdout.trim()) as {
+        def: Backend[];
+        custom: Backend[];
+      };
+      expect(parsed.def).toEqual(["codex", "cmd", "pool", "omp", "claude"]);
+      expect(parsed.custom).toEqual(["claude", "codex", "cmd", "pool", "omp"]);
+    } finally {
+      rmSync(binDir, { recursive: true, force: true });
     }
   });
 });

@@ -39,7 +39,7 @@ import {
   spawnReaper,
 } from "./lifecycle.ts";
 import { handleLadder } from "./chain.ts";
-import { terminalStatus } from "./report.ts";
+import { terminalStatus } from "./jobStatus.ts";
 import {
   acquireLock,
   readLock,

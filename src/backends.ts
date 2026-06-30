@@ -34,19 +34,39 @@ function probeAuth(be: "cmd" | "codex"): boolean {
   return r.status === 0;
 }
 
-// Default auth check used by the live LADDER. Short-circuits to true (skip probing)
-// when WORKER_SKIP_AUTH_GATE=1 (tests + ops kill-switch). Only cmd/codex are probed.
+function backendSpawnBinary(be: Exclude<Backend, "cmd" | "codex">): string {
+  switch (be) {
+    case "claude":
+      return "claude";
+    case "opencode":
+      return "opencode";
+    case "omp":
+      return "omp";
+    case "pool":
+      return "pool";
+  }
+}
+
+function probeSpawnable(binary: string): boolean {
+  const r = spawnSync(binary, ["--help"], {
+    timeout: authProbeMs(),
+    stdio: ["ignore", "ignore", "ignore"],
+  });
+  return !r.error || (r.error as NodeJS.ErrnoException).code !== "ENOENT";
+}
+
 function defaultIsAuthed(be: Backend): boolean {
   if (process.env.WORKER_SKIP_AUTH_GATE === "1") return true;
-  if (be !== "cmd" && be !== "codex") return true;
-  return probeAuth(be);
+  if (be === "cmd" || be === "codex") return probeAuth(be);
+  return probeSpawnable(backendSpawnBinary(be));
 }
 
 export function computeLadder(
   cfgOrIsAuthed: FileConfig | ((be: Backend) => boolean) = FILE_CONFIG,
 ): Backend[] {
-  const isAuthed: (be: Backend) => boolean =
-    typeof cfgOrIsAuthed === "function" ? cfgOrIsAuthed : defaultIsAuthed;
+  const isAuthedOverride =
+    typeof cfgOrIsAuthed === "function" ? cfgOrIsAuthed : undefined;
+  const isAuthed: (be: Backend) => boolean = isAuthedOverride ?? defaultIsAuthed;
   const cfg: FileConfig =
     typeof cfgOrIsAuthed === "function" ? FILE_CONFIG : cfgOrIsAuthed;
   const validSet = new Set<string>(ALL_BACKENDS);
@@ -58,8 +78,16 @@ export function computeLadder(
     if (typeof be === "string" && validSet.has(be)) skipSet.add(be);
   }
 
-  const keep = (be: Backend) =>
-    !skipSet.has(be) && ((be !== "cmd" && be !== "codex") || isAuthed(be));
+  // cmd/codex: auth-gated, routed through isAuthed (injectable in tests to mock
+  // auth-probe results). claude/omp/opencode/pool: no auth concept. In production
+  // (no override) they probe CLI presence via defaultIsAuthed, so a missing binary
+  // is dropped; under a test override they are kept unconditionally, because the
+  // injected mock is meant to govern only cmd/codex and test envs lack these CLIs.
+  const keep = (be: Backend) => {
+    if (skipSet.has(be)) return false;
+    if (be === "cmd" || be === "codex") return isAuthed(be);
+    return isAuthedOverride ? true : defaultIsAuthed(be);
+  };
   const defaultOrder: Backend[] = ALL_BACKENDS.filter(keep);
 
   const raw = cfg.ladder;
@@ -87,7 +115,7 @@ export function computeLadder(
 
 export const LADDER: Backend[] = computeLadder();
 
-const PREAMBLE = `You are a senior coding worker. Deliver mature, pragmatic, production-grade code. Work in order: (1) understand the task; touch only what it requires. (2) Plan in place only; do NOT enter plan mode. Take the laziest solution that works — does it need to exist (YAGNI)? → stdlib → native feature → already-installed dep → one line → minimal code; stop at the first rung that holds. No speculative abstraction, no boilerplate-for-later; deletion over addition; shortest working diff. (3) Implement. (4) Test, run, and verify. (5) Review the result against every requirement in the spec and confirm the deliverables exist as saved files. Only then signal DONE; otherwise FAILED:<reason>. Do NOT commit — the harness makes the atomic commit on green. Priorities: correctness > security > clarity > performance > brevity. Full standards: ~/.claude/skills/coding-standards/SKILL.md.`;
+const PREAMBLE = `You are a senior coding worker. Deliver mature, pragmatic, production-grade code. Work in order: (1) understand the task; touch only what it requires. (2) Plan in place only; do NOT enter plan mode. Take the laziest solution that works — does it need to exist (YAGNI)? → stdlib → native feature → already-installed dep → one line → minimal code; stop at the first rung that holds. No speculative abstraction, no boilerplate-for-later; deletion over addition; shortest working diff. (3) Implement. (4) Test, run, and verify. (5) Review the result against every requirement in the spec and confirm the deliverables exist as saved files. Only then signal DONE; otherwise FAILED:<reason>. Do NOT commit — the harness makes the atomic commit on green. Priorities: correctness > security > clarity > performance > brevity.`;
 const CONTRACT = `\nMake only the changes the task requires. Stop when done. Final reply = ONE line: "DONE" or "FAILED:<reason>". Nothing else.`;
 
 export function buildSpec(userPrompt: string): string {
