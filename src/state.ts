@@ -245,6 +245,10 @@ export type Job = {
 
 export type StashState = "stashed" | "restored" | "conflict";
 
+export function sidFromChainLock(lockPath: string): string {
+  return basename(lockPath).replace(/\.chain\.lock$/, "");
+}
+
 export function stashSummary(job: {
   stash_sha?: string;
   stash_state?: StashState;

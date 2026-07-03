@@ -1,4 +1,4 @@
-import { basename, join } from "path";
+import { join } from "path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod/v4";
@@ -20,6 +20,7 @@ import {
   getLadderHistory,
   workersDir,
   stashSummary,
+  sidFromChainLock,
 } from "./state.ts";
 import { LADDER, ALL_BACKENDS, type Backend } from "./backends.ts";
 import { backendShellArgv } from "./runner.ts";
@@ -145,24 +146,10 @@ export function handleStatus(args: {
   const cl = job.completion_lock ?? "";
   if (cl.endsWith(".chain.lock")) {
     const running = existsSync(cl);
-    if (running) {
-      const result: Record<string, unknown> = {
-        status: "running",
-        alive: true,
-        started: job.started,
-      };
-      const stash = stashSummary(job);
-      if (stash) result.stash = stash;
-      return result;
-    }
-    const status = terminalStatus(handle, cl);
-    const result: Record<string, unknown> = {
-      status,
-      alive: false,
-      started: job.started,
-    };
-    if (status === "exhausted") {
-      const sid = basename(cl).replace(/\.chain\.lock$/, "");
+    const status = running ? "running" : terminalStatus(handle, cl);
+    const result: Record<string, unknown> = { status, alive: running, started: job.started };
+    if (!running && status === "exhausted") {
+      const sid = sidFromChainLock(cl);
       result.rungs = getLadderHistory(sid);
     }
     const stash = stashSummary(job);
@@ -212,14 +199,17 @@ export function handleList(args: {
     .filter((j) => !status || j.status === status)
     .sort((a, b) => (b.started ?? "").localeCompare(a.started ?? ""))
     .slice(0, limit)
-    .map((j) => ({
-      handle: j.handle,
-      status: j.status,
-      repo: j.repo,
-      task: j.task,
-      started: j.started,
-      ...(stashSummary(j) ? { stash: stashSummary(j) } : {}),
-    }));
+    .map((j) => {
+      const stash = stashSummary(j);
+      return {
+        handle: j.handle,
+        status: j.status,
+        repo: j.repo,
+        task: j.task,
+        started: j.started,
+        ...(stash ? { stash } : {}),
+      };
+    });
 }
 
 export function handleExtend(args: { handle: string; seconds: number }): {
@@ -243,8 +233,7 @@ export function handleExtend(args: { handle: string; seconds: number }): {
   const isChainHandle = completionLock.endsWith(".chain.lock");
 
   if (isChainHandle) {
-    const filename = completionLock.split("/").pop() ?? "";
-    const sid = filename.replace(".chain.lock", "");
+    const sid = sidFromChainLock(completionLock);
     const chainMeta = sid ? loadChainMeta(sid) : null;
     if (!chainMeta)
       throw new Error(`Chain ${handle} has no active deadline to extend`);
@@ -283,7 +272,7 @@ Other tools self-describe: \`worker_extend\` \`worker_resume\` \`worker_kill\` \
 
 export function createWorkerServer(): McpServer {
   const s = new McpServer(
-    { name: "worker", version: "0.3.0" },
+    { name: "worker", version: "0.4.0" },
     { instructions: WORKER_INSTRUCTIONS },
   );
 

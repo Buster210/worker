@@ -1,6 +1,6 @@
 {
   "name": "worker-mcp",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "MCP server that delegates coding tasks to background agents in isolated git worktrees",
   "type": "module",
   "license": "MIT",

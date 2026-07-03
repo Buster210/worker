@@ -1,12 +1,12 @@
 #!/usr/bin/env bun
 import { existsSync, statSync } from "fs";
-import { basename } from "path";
 import { spawnSync } from "child_process";
 import {
   getJobFresh,
   getLadderHistory,
   lockPath,
   stashSummary,
+  sidFromChainLock,
 } from "./state.ts";
 import { nearExpiryMs, graceMs } from "./env.ts";
 import { terminalStatus } from "./jobStatus.ts";
@@ -64,7 +64,7 @@ export function renderReport(
   const stash = stashSummary(job);
   let ladderRuns: LadderRun[] | undefined;
   if (status === "exhausted" && lockPath.endsWith(".chain.lock")) {
-    const sid = basename(lockPath).replace(/\.chain\.lock$/, "");
+    const sid = sidFromChainLock(lockPath);
     ladderRuns = getLadderHistory(sid);
   }
   if (!wantsDiff(status))

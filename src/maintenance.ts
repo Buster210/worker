@@ -108,6 +108,12 @@ export function reapStoppedJobs() {
 
 export function sweepChainLocks(): void {
   const ladderDir = join(workersDir(), "ladder");
+  const removeChainPair = (lf: string) => {
+    unlinkSync(lf);
+    try {
+      unlinkSync(lf.replace(/\.chain\.lock$/, ".chain.meta"));
+    } catch {}
+  };
   let entries: string[];
   try {
     entries = readdirSync(ladderDir);
@@ -124,23 +130,16 @@ export function sweepChainLocks(): void {
         const pid = Number(pidStr);
         if (Number.isFinite(pid) && pid > 0) {
           if (!isProcessAlive(pid, started || undefined)) {
-            unlinkSync(lockFile);
-            try {
-              unlinkSync(lockFile.replace(/\.chain\.lock$/, ".chain.meta"));
-            } catch {}
+            removeChainPair(lockFile);
           }
           continue;
         }
       }
       const mtime = statSync(lockFile).mtimeMs;
       if (Date.now() - mtime > reapAgeMs()) {
-        unlinkSync(lockFile);
-        try {
-          unlinkSync(lockFile.replace(/\.chain\.lock$/, ".chain.meta"));
-        } catch {}
+        removeChainPair(lockFile);
       }
-    } catch {
-    }
+    } catch {}
   }
 }
 
